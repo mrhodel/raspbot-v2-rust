@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# Models (large binary files — download separately)
+models/*.onnx
+models/checkpoints/
+
+# Logs and runtime output
+logs/
+*.log
+
+# Converted/temp files
+/tmp/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LibreOffice lock files
+.~lock.*#
+
+# Python virtualenv
+.venv/
