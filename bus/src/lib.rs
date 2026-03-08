@@ -16,10 +16,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use core_types::{
-    CameraFrame, CmdVel, DepthMap, EventMarker, ExploredStats, FeatureFrame,
-    FrontierChoice, GrayFrame, GridDelta, ImuSample, KeyframeEvent,
-    MotorCommand, Orientation, Pose2D, PseudoLidarScan, SafetyState, TrackSet,
-    UltrasonicReading, VisualDelta,
+    BridgeStatus, CameraFrame, CmdVel, DepthMap, EventMarker, ExecutiveState,
+    ExploredStats, FeatureFrame, Frontier, FrontierChoice, GrayFrame, GridDelta,
+    HealthMetrics, ImuSample, KeyframeEvent, MotorCommand, Orientation, Pose2D,
+    PseudoLidarScan, SafetyState, TrackSet, UltrasonicReading, VisualDelta,
 };
 
 // Convenience alias – all Arc-wrapped to keep broadcast clone cheap.
@@ -59,6 +59,14 @@ pub struct Bus {
     // ── Mapping (broadcast) ───────────────────────────────────────────────
     pub map_grid_delta:       broadcast::Sender<GridDelta>,
     pub map_explored_stats:   broadcast::Sender<ExploredStats>,
+    pub map_frontiers:        broadcast::Sender<Vec<Frontier>>,
+
+    // ── Executive (watch) ─────────────────────────────────────────────────
+    pub executive_state:      watch::Sender<ExecutiveState>,
+
+    // ── Health / bridge (broadcast) ───────────────────────────────────────
+    pub health_runtime:       broadcast::Sender<HealthMetrics>,
+    pub ui_bridge_status:     broadcast::Sender<BridgeStatus>,
 
     // ── Decision / planning / control (mpsc senders stored here) ─────────
     pub decision_frontier:    mpsc::Sender<FrontierChoice>,
@@ -81,9 +89,10 @@ pub struct BusReceivers {
 
 /// Watch receivers for latest-state topics. Clone as needed.
 pub struct BusWatchRx {
-    pub imu_orientation: watch::Receiver<Orientation>,
-    pub slam_pose2d:     watch::Receiver<Pose2D>,
-    pub safety_state:    watch::Receiver<SafetyState>,
+    pub imu_orientation:  watch::Receiver<Orientation>,
+    pub slam_pose2d:      watch::Receiver<Pose2D>,
+    pub safety_state:     watch::Receiver<SafetyState>,
+    pub executive_state:  watch::Receiver<ExecutiveState>,
 }
 
 impl Bus {
@@ -102,10 +111,14 @@ impl Bus {
         let (tx_keyframe,   _) = broadcast::channel(cap);
         let (tx_grid,       _) = broadcast::channel(cap);
         let (tx_explored,   _) = broadcast::channel(cap);
+        let (tx_frontiers,  _) = broadcast::channel(cap);
+        let (tx_health,     _) = broadcast::channel(cap);
+        let (tx_bridge_st,  _) = broadcast::channel(cap);
 
-        let (tx_orientation, rx_orientation) = watch::channel(Orientation::default());
-        let (tx_pose2d,      rx_pose2d)      = watch::channel(Pose2D::default());
-        let (tx_safety,      rx_safety)      = watch::channel(SafetyState::default());
+        let (tx_orientation,   rx_orientation)  = watch::channel(Orientation::default());
+        let (tx_pose2d,        rx_pose2d)       = watch::channel(Pose2D::default());
+        let (tx_safety,        rx_safety)       = watch::channel(SafetyState::default());
+        let (tx_exec_state,    rx_exec_state)   = watch::channel(ExecutiveState::default());
 
         let (tx_decision,  rx_decision)  = mpsc::channel(cap);
         let (tx_path,      rx_path)      = mpsc::channel(cap);
@@ -129,6 +142,10 @@ impl Bus {
             slam_keyframe_event: tx_keyframe,
             map_grid_delta:      tx_grid,
             map_explored_stats:  tx_explored,
+            map_frontiers:       tx_frontiers,
+            executive_state:     tx_exec_state,
+            health_runtime:      tx_health,
+            ui_bridge_status:    tx_bridge_st,
             decision_frontier:   tx_decision,
             planner_path:        tx_path,
             controller_cmd_vel:  tx_cmdvel,
@@ -145,9 +162,10 @@ impl Bus {
         };
 
         let watch_rx = BusWatchRx {
-            imu_orientation: rx_orientation,
-            slam_pose2d:     rx_pose2d,
-            safety_state:    rx_safety,
+            imu_orientation:  rx_orientation,
+            slam_pose2d:      rx_pose2d,
+            safety_state:     rx_safety,
+            executive_state:  rx_exec_state,
         };
 
         (bus, rx, watch_rx)

@@ -15,10 +15,12 @@ use tracing::{error, info};
 
 use bus::Bus;
 use config::RobotConfig;
+use executive::Executive;
 use hal::{Camera, Imu, StubCamera, StubGimbal, StubImu, StubMotorController, StubUltrasonic};
 use micro_slam::ImuDeadReckon;
 use perception::{DepthInference, EventGate, PseudoLidarExtractor};
 use telemetry::TelemetryWriter;
+use ui_bridge::{UiBridgeConfig, start as start_ui_bridge};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Bus ───────────────────────────────────────────────────────────────────
     let (bus, _rx, _watch_rx) = Bus::new(bus::CAP);
-    let bus = Arc::new(bus);   // re-wrap after destructuring
+    // Bus::new() already returns Arc<Bus>; do not wrap again.
     info!("Message bus created");
 
     // ── Telemetry ─────────────────────────────────────────────────────────────
@@ -63,6 +65,13 @@ async fn main() -> anyhow::Result<()> {
     // ── Micro-SLAM ────────────────────────────────────────────────────────────
     let mut slam = ImuDeadReckon::new();
     info!("Micro-SLAM initialised (IMU dead-reckoning stub)");
+
+    // ── Executive ─────────────────────────────────────────────────────────────
+    let _exec = Executive::new(Arc::clone(&bus));
+    info!("Executive initialised (state: Idle)");
+
+    // ── UI Bridge ─────────────────────────────────────────────────────────────
+    start_ui_bridge(Arc::clone(&bus), UiBridgeConfig::default()).await?;
 
     // ── Spawn camera task ─────────────────────────────────────────────────────
     let bus_cam = Arc::clone(&bus);

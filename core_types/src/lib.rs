@@ -247,6 +247,84 @@ pub enum FrontierChoice {
     RandomValid,
 }
 
+// ── Executive ─────────────────────────────────────────────────────────────────
+
+/// High-level robot executive state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ExecutiveState {
+    Idle,
+    Calibrating,
+    Exploring,
+    Recovering,
+    SafetyStopped,
+    Fault { reason: String },
+}
+
+impl Default for ExecutiveState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+// ── Health / observability ────────────────────────────────────────────────────
+
+/// Runtime health snapshot published periodically.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HealthMetrics {
+    pub t_ms: Ms,
+    pub cpu_pct: f32,
+    pub mem_used_mb: u32,
+    /// Loop timing jitter — difference from nominal period (ms).
+    pub task_jitter_ms: f32,
+}
+
+// ── UI bridge ─────────────────────────────────────────────────────────────────
+
+/// Status snapshot published by the WebSocket bridge.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BridgeStatus {
+    pub t_ms: Ms,
+    pub connected_clients: u32,
+    pub bytes_sent_total: u64,
+    pub last_send_ok: bool,
+}
+
+// ── Calibration ───────────────────────────────────────────────────────────────
+
+/// Saved calibration parameters (camera intrinsics + IMU bias + extrinsics).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibData {
+    // Camera intrinsics (pinhole model)
+    pub camera_fx: f32,
+    pub camera_fy: f32,
+    pub camera_cx: f32,
+    pub camera_cy: f32,
+    // IMU bias estimates
+    pub imu_gyro_bias: [f32; 3],  // [x, y, z] rad/s
+    pub imu_accel_bias: [f32; 3], // [x, y, z] m/s²
+    // Camera-to-base extrinsics [tx_m, ty_m, tz_m, rx_rad, ry_rad, rz_rad]
+    pub camera_to_base: [f32; 6],
+    /// Validated camera tilt angle (rad, positive = tilted down).
+    pub camera_tilt_rad: f32,
+}
+
+impl Default for CalibData {
+    fn default() -> Self {
+        Self {
+            // 110° H-FOV camera, 640×480 — approximate pinhole intrinsics
+            camera_fx: 410.0,
+            camera_fy: 410.0,
+            camera_cx: 320.0,
+            camera_cy: 240.0,
+            imu_gyro_bias:  [0.0; 3],
+            imu_accel_bias: [0.0; 3],
+            // Camera ~10cm above base, facing forward with no tilt
+            camera_to_base: [0.0, 0.0, 0.10, 0.0, 0.0, 0.0],
+            camera_tilt_rad: 0.0,
+        }
+    }
+}
+
 // ── Telemetry ─────────────────────────────────────────────────────────────────
 
 /// A structured event marker logged to telemetry.
@@ -262,5 +340,7 @@ pub enum EventMarker {
     KeyframeInserted { id: u32 },
     PlannerFailed,
     RecoveryTriggered,
+    CalibrationCompleted { mode: String },
+    ExecutiveTransition { from: String, to: String },
     Custom(String),
 }

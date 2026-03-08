@@ -3,6 +3,9 @@ members = [
     "config",
     "core_types",
     "bus",
+    "calibration",
+    "executive",
+    "ui_bridge",
     "hal",
     "perception",
     "micro_slam",
@@ -26,11 +29,16 @@ serde_yaml   = "0.9"
 anyhow       = "1"
 tracing      = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-async-trait  = "0.1"
+async-trait          = "0.1"
+tokio-tungstenite    = { version = "0.24" }
+futures-util         = "0.3"
 
 # workspace crates (path deps shared across members)
 core_types   = { path = "core_types" }
 bus          = { path = "bus" }
+calibration  = { path = "calibration" }
+executive    = { path = "executive" }
+ui_bridge    = { path = "ui_bridge" }
 config       = { path = "config" }
 telemetry    = { path = "telemetry" }
 hal          = { path = "hal" }

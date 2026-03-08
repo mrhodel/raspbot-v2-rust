@@ -1,0 +1,12 @@
+[package]
+name = "calibration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_types  = { workspace = true }
+config      = { workspace = true }
+anyhow      = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tracing     = { workspace = true }
