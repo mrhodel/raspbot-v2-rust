@@ -1,0 +1,9 @@
+[package]
+name = "sim_vision"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_types = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }

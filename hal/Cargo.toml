@@ -1,0 +1,12 @@
+[package]
+name = "hal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_types  = { workspace = true }
+config      = { workspace = true }
+async-trait = { workspace = true }
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }

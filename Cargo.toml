@@ -1,0 +1,45 @@
+[workspace]
+members = [
+    "config",
+    "core_types",
+    "bus",
+    "hal",
+    "perception",
+    "micro_slam",
+    "mapping",
+    "exploration_rl",
+    "planning",
+    "control",
+    "safety",
+    "sim_fast",
+    "sim_vision",
+    "telemetry",
+    "runtime",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio        = { version = "1",   features = ["full"] }
+serde        = { version = "1",   features = ["derive"] }
+serde_json   = "1"
+serde_yaml   = "0.9"
+anyhow       = "1"
+tracing      = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait  = "0.1"
+
+# workspace crates (path deps shared across members)
+core_types   = { path = "core_types" }
+bus          = { path = "bus" }
+config       = { path = "config" }
+telemetry    = { path = "telemetry" }
+hal          = { path = "hal" }
+perception   = { path = "perception" }
+micro_slam   = { path = "micro_slam" }
+mapping      = { path = "mapping" }
+planning     = { path = "planning" }
+control      = { path = "control" }
+safety       = { path = "safety" }
+exploration_rl = { path = "exploration_rl" }
+sim_fast     = { path = "sim_fast" }
+sim_vision   = { path = "sim_vision" }

@@ -27,3 +27,9 @@ Thumbs.db
 
 # Python virtualenv
 .venv/
+
+# Claude session data
+.claude/
+
+# ODT source files (not tracked)
+*.odt

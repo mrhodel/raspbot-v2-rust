@@ -1,0 +1,26 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "robot"
+path = "src/main.rs"
+
+[dependencies]
+core_types         = { workspace = true }
+bus                = { workspace = true }
+config             = { workspace = true }
+telemetry          = { workspace = true }
+hal                = { workspace = true }
+perception         = { workspace = true }
+micro_slam         = { workspace = true }
+mapping            = { workspace = true }
+planning           = { workspace = true }
+control            = { workspace = true }
+safety             = { workspace = true }
+exploration_rl     = { workspace = true }
+tokio              = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

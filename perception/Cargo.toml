@@ -1,0 +1,11 @@
+[package]
+name = "perception"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core_types  = { workspace = true }
+bus         = { workspace = true }
+anyhow      = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
