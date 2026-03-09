@@ -27,7 +27,7 @@ const M_FR: u8 = 2;
 const M_RR: u8 = 3;
 
 // Speed used for all tests (duty cycle out of 100)
-const TEST_SPEED: i8 = 50;
+const TEST_SPEED: i8 = 20;
 // How long each move runs
 const MOVE_S: u64 = 1;
 // Pause between tests
