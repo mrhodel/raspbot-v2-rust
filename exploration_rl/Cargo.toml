@@ -5,5 +5,9 @@ edition = "2021"
 
 [dependencies]
 core_types = { workspace = true }
+bus        = { workspace = true }
+mapping    = { workspace = true }
+sim_fast   = { workspace = true }
+tokio      = { workspace = true }
 anyhow     = { workspace = true }
 tracing    = { workspace = true }

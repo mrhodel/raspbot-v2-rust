@@ -39,6 +39,7 @@ use planning::AStarPlanner;
 use safety::SafetyMonitor;
 use telemetry::TelemetryWriter;
 use ui_bridge::{UiBridgeConfig, start as start_ui_bridge};
+use exploration_rl::spawn_selector_task;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -98,6 +99,10 @@ async fn main() -> anyhow::Result<()> {
 
     // ── UI Bridge ─────────────────────────────────────────────────────────────
     start_ui_bridge(Arc::clone(&bus), UiBridgeConfig::default()).await?;
+
+    // ── Frontier selector (exploration_rl) ────────────────────────────────────
+    // Classical heuristic by default; ONNX policy loaded if model file exists.
+    spawn_selector_task(Arc::clone(&bus)).await;
 
     // ── Camera task ───────────────────────────────────────────────────────────
     let bus_cam  = Arc::clone(&bus);

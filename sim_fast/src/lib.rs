@@ -1,7 +1,426 @@
-//! Fast 2-D grid simulator for RL training.
+//! Fast 2-D simulator for RL training.
 //!
-//! TODO (Phase 10): lightweight simulator with procedural maze environments,
-//! synthetic pseudo-lidar from raycasting, and simulated IMU.
-//! See requirements_v3.md development phase 10.
+//! Generates procedural maze environments, simulates mecanum-wheel physics,
+//! and produces synthetic pseudo-lidar + IMU observations at each step.
+//!
+//! # Design
+//! - Synchronous (no async) — the RL training loop calls `step()` in a tight
+//!   inner loop; async overhead would be wasted here.
+//! - No external RNG dependency — uses an inline XorShift64 PRNG.
+//! - Grid: 10 m × 10 m at 5 cm/cell = 200 × 200 cells.
+//! - Maze: random rectangular obstacles with cleared border corridors.
+//! - Pseudo-lidar: 48 rays, ±55° (110° H-FOV), 3 m max range, 1 cm step.
+//! - Physics: dt = 0.1 s; 6 discrete actions matching real HAL action space.
+//!
+//! # Usage
+//! ```ignore
+//! let mut sim = FastSim::new(42);      // deterministic seed
+//! let obs = sim.reset();               // generate new maze, place robot
+//! let obs = sim.step(Action::Forward as u8);
+//! if obs.done { let obs = sim.reset(); }
+//! ```
 
-pub struct FastSim; // stub
+use core_types::{ImuSample, LidarRay, Pose2D, PseudoLidarScan};
+use tracing::debug;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// Grid cell side length (metres). Matches real mapping resolution.
+pub const RESOLUTION_M: f32 = 0.05;
+
+/// Arena side length in cells.
+const GRID_CELLS: usize = 200;
+
+/// Arena side length in metres (GRID_CELLS × RESOLUTION_M).
+pub const ARENA_M: f32 = GRID_CELLS as f32 * RESOLUTION_M;
+
+/// Robot collision radius (metres). Raspbot V2 is ~25 cm long.
+const ROBOT_RADIUS_M: f32 = 0.15;
+
+/// Simulation time step (seconds).
+const DT_S: f32 = 0.1;
+
+/// Number of pseudo-lidar rays.
+const NUM_RAYS: usize = 48;
+
+/// Half angle of the lidar fan (radians). 110° total.
+const HALF_FOV_RAD: f32 = 55.0 * std::f32::consts::PI / 180.0;
+
+/// Maximum lidar range (metres).
+const MAX_RANGE_M: f32 = 3.0;
+
+/// Ray-marching step (metres).
+const RAY_STEP_M: f32 = 0.01;
+
+/// Robot forward speed (m/s equivalent).
+const SPEED_M_S: f32 = 0.30;
+
+/// Robot rotation rate (rad/s).
+const OMEGA_RAD_S: f32 = 1.0;
+
+/// Episode ends after this many steps (in addition to collision).
+const MAX_STEPS: u32 = 2_000;
+
+/// Number of random rectangular obstacles per episode.
+const NUM_OBSTACLES: usize = 18;
+
+// ── Action encoding ───────────────────────────────────────────────────────────
+
+/// Six discrete actions (matches `FrontierChoice` motor encoding, not the RL
+/// frontier-selection space). Used inside the sim physics engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Action {
+    Forward     = 0,
+    RotateLeft  = 1,
+    RotateRight = 2,
+    StrafeLeft  = 3,
+    StrafeRight = 4,
+    Stop        = 5,
+}
+
+impl Action {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Forward,
+            1 => Self::RotateLeft,
+            2 => Self::RotateRight,
+            3 => Self::StrafeLeft,
+            4 => Self::StrafeRight,
+            _ => Self::Stop,
+        }
+    }
+}
+
+// ── Observation ───────────────────────────────────────────────────────────────
+
+/// Output of each `step()` / `reset()` call.
+#[derive(Debug, Clone)]
+pub struct SimStep {
+    /// Synthetic pseudo-lidar scan (48 rays, same format as real sensor).
+    pub scan: PseudoLidarScan,
+    /// Synthetic IMU sample (gyro_z from rotation, zero noise).
+    pub imu: ImuSample,
+    /// Ground-truth robot pose (for reward computation / debugging).
+    pub pose: Pose2D,
+    /// True if the robot collided with a wall this step.
+    pub collision: bool,
+    /// True if the episode is over (collision or max steps reached).
+    pub done: bool,
+}
+
+// ── FastSim ───────────────────────────────────────────────────────────────────
+
+/// Lightweight 2-D simulator for RL training.
+pub struct FastSim {
+    /// Occupancy grid: `true` = wall. Row-major: index = y * GRID_CELLS + x.
+    grid: Vec<bool>,
+    /// Robot world-frame pose.
+    robot_x: f32,
+    robot_y: f32,
+    robot_theta: f32,
+    /// Steps taken in the current episode.
+    step_count: u32,
+    /// Simulated elapsed time (ms).
+    t_ms: u64,
+    /// Episode random seed source.
+    rng: Rng,
+    /// Angular velocity from the last step (for IMU).
+    last_omega: f32,
+}
+
+impl FastSim {
+    /// Create a new simulator with the given random seed.
+    pub fn new(seed: u64) -> Self {
+        let mut sim = Self {
+            grid: vec![false; GRID_CELLS * GRID_CELLS],
+            robot_x: ARENA_M * 0.5,
+            robot_y: ARENA_M * 0.5,
+            robot_theta: 0.0,
+            step_count: 0,
+            t_ms: 0,
+            rng: Rng::new(seed),
+            last_omega: 0.0,
+        };
+        sim.generate_maze();
+        sim
+    }
+
+    /// Reset the simulator: generate a new maze and return the initial observation.
+    pub fn reset(&mut self) -> SimStep {
+        self.step_count = 0;
+        self.t_ms = 0;
+        self.last_omega = 0.0;
+        self.generate_maze();
+        self.make_step(false)
+    }
+
+    /// Advance the simulation by one time step.
+    pub fn step(&mut self, action: u8) -> SimStep {
+        let act = Action::from_u8(action);
+        let (vx, vy, omega) = action_to_velocity(act);
+
+        // Compute proposed new pose.
+        let cos_t = self.robot_theta.cos();
+        let sin_t = self.robot_theta.sin();
+        let try_x = self.robot_x + (vx * cos_t - vy * sin_t) * DT_S;
+        let try_y = self.robot_y + (vx * sin_t + vy * cos_t) * DT_S;
+        let new_theta = wrap_angle(self.robot_theta + omega * DT_S);
+
+        // Collision check on proposed position.
+        let collision = !self.robot_clear(try_x, try_y);
+        if !collision {
+            self.robot_x = try_x;
+            self.robot_y = try_y;
+        }
+        self.robot_theta = new_theta;
+        self.last_omega = omega;
+        self.step_count += 1;
+        self.t_ms += (DT_S * 1000.0) as u64;
+
+        let done = collision || self.step_count >= MAX_STEPS;
+        self.make_step(collision)
+            .with_done(done)
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    fn make_step(&self, collision: bool) -> SimStep {
+        SimStep {
+            scan:      self.cast_lidar(),
+            imu:       self.synthetic_imu(),
+            pose:      self.pose(),
+            collision,
+            done: false, // caller sets this
+        }
+    }
+
+    fn pose(&self) -> Pose2D {
+        Pose2D {
+            t_ms: self.t_ms,
+            x_m: self.robot_x,
+            y_m: self.robot_y,
+            theta_rad: self.robot_theta,
+            confidence: 1.0, // ground truth
+        }
+    }
+
+    fn synthetic_imu(&self) -> ImuSample {
+        ImuSample {
+            t_ms: self.t_ms,
+            gyro_x: 0.0,
+            gyro_y: 0.0,
+            gyro_z: self.last_omega,
+            accel_x: 0.0,
+            accel_y: 0.0,
+            accel_z: 9.81,
+        }
+    }
+
+    // ── Raycasting ────────────────────────────────────────────────────────────
+
+    fn cast_lidar(&self) -> PseudoLidarScan {
+        let mut rays = Vec::with_capacity(NUM_RAYS);
+        for i in 0..NUM_RAYS {
+            let frac = i as f32 / (NUM_RAYS - 1) as f32; // 0..1
+            let local_angle = -HALF_FOV_RAD + frac * 2.0 * HALF_FOV_RAD;
+            let world_angle = self.robot_theta + local_angle;
+            let range = self.cast_ray(self.robot_x, self.robot_y, world_angle);
+            rays.push(LidarRay {
+                angle_rad:  local_angle,
+                range_m:    range,
+                confidence: 1.0,
+            });
+        }
+        PseudoLidarScan { t_ms: self.t_ms, rays }
+    }
+
+    fn cast_ray(&self, ox: f32, oy: f32, angle: f32) -> f32 {
+        let dx = angle.cos() * RAY_STEP_M;
+        let dy = angle.sin() * RAY_STEP_M;
+        let mut rx = ox;
+        let mut ry = oy;
+        let mut dist = 0.0f32;
+        while dist < MAX_RANGE_M {
+            rx += dx;
+            ry += dy;
+            dist += RAY_STEP_M;
+            let cx = (rx / RESOLUTION_M) as i32;
+            let cy = (ry / RESOLUTION_M) as i32;
+            if cx < 0 || cy < 0
+                || cx >= GRID_CELLS as i32
+                || cy >= GRID_CELLS as i32
+                || self.wall(cx as usize, cy as usize)
+            {
+                return dist;
+            }
+        }
+        MAX_RANGE_M
+    }
+
+    // ── Collision detection ───────────────────────────────────────────────────
+
+    fn robot_clear(&self, x: f32, y: f32) -> bool {
+        let r = ROBOT_RADIUS_M;
+        let cell_r = (r / RESOLUTION_M).ceil() as i32 + 1;
+        let cx = (x / RESOLUTION_M) as i32;
+        let cy = (y / RESOLUTION_M) as i32;
+        for dx in -cell_r..=cell_r {
+            for dy in -cell_r..=cell_r {
+                let nx = cx + dx;
+                let ny = cy + dy;
+                if nx < 0 || ny < 0 || nx >= GRID_CELLS as i32 || ny >= GRID_CELLS as i32 {
+                    return false;
+                }
+                let dist = (dx as f32 * RESOLUTION_M).hypot(dy as f32 * RESOLUTION_M);
+                if dist <= r && self.wall(nx as usize, ny as usize) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // ── Grid accessors ────────────────────────────────────────────────────────
+
+    fn wall(&self, x: usize, y: usize) -> bool {
+        self.grid[y * GRID_CELLS + x]
+    }
+
+    fn set_wall(&mut self, x: usize, y: usize, v: bool) {
+        self.grid[y * GRID_CELLS + x] = v;
+    }
+
+    // ── Maze generation ───────────────────────────────────────────────────────
+
+    fn generate_maze(&mut self) {
+        // Clear all walls.
+        self.grid.fill(false);
+
+        // Border walls (2 cells thick for safety margin).
+        let g = GRID_CELLS;
+        for i in 0..g {
+            for t in 0..3 {
+                self.set_wall(i, t, true);
+                self.set_wall(i, g - 1 - t, true);
+                self.set_wall(t, i, true);
+                self.set_wall(g - 1 - t, i, true);
+            }
+        }
+
+        // Random rectangular obstacles.
+        let min_cells = 4usize;  // 20 cm minimum obstacle dimension
+        let max_cells = 30usize; // 150 cm maximum
+        for _ in 0..NUM_OBSTACLES {
+            let w = min_cells + self.rng.next_usize(max_cells - min_cells + 1);
+            let h = min_cells + self.rng.next_usize(max_cells - min_cells + 1);
+            // Keep away from borders.
+            let x0 = 4 + self.rng.next_usize(g - w - 8);
+            let y0 = 4 + self.rng.next_usize(g - h - 8);
+            for ry in y0..(y0 + h).min(g) {
+                for rx in x0..(x0 + w).min(g) {
+                    self.set_wall(rx, ry, true);
+                }
+            }
+        }
+
+        // Place robot in a free cell near the centre, scanning outward.
+        let start_x = ARENA_M * 0.5;
+        let start_y = ARENA_M * 0.5;
+        let (rx, ry) = self.nearest_free(start_x, start_y);
+        self.robot_x = rx;
+        self.robot_y = ry;
+        self.robot_theta = self.rng.next_f32() * 2.0 * std::f32::consts::PI;
+
+        debug!(
+            obstacles = NUM_OBSTACLES,
+            robot_x   = self.robot_x,
+            robot_y   = self.robot_y,
+            "Maze generated"
+        );
+    }
+
+    /// Find the nearest free-and-clear cell to `(world_x, world_y)`.
+    fn nearest_free(&self, world_x: f32, world_y: f32) -> (f32, f32) {
+        let cx0 = (world_x / RESOLUTION_M) as i32;
+        let cy0 = (world_y / RESOLUTION_M) as i32;
+        // Spiral outward.
+        for radius in 0..(GRID_CELLS as i32 / 2) {
+            for dx in -radius..=radius {
+                for dy in -radius..=radius {
+                    if dx.abs().max(dy.abs()) != radius { continue; }
+                    let nx = cx0 + dx;
+                    let ny = cy0 + dy;
+                    if nx < 0 || ny < 0 || nx >= GRID_CELLS as i32 || ny >= GRID_CELLS as i32 {
+                        continue;
+                    }
+                    let wx = nx as f32 * RESOLUTION_M + RESOLUTION_M * 0.5;
+                    let wy = ny as f32 * RESOLUTION_M + RESOLUTION_M * 0.5;
+                    if self.robot_clear(wx, wy) {
+                        return (wx, wy);
+                    }
+                }
+            }
+        }
+        // Fallback (should not happen in a well-formed maze).
+        (world_x, world_y)
+    }
+}
+
+// ── SimStep helpers ───────────────────────────────────────────────────────────
+
+impl SimStep {
+    fn with_done(mut self, done: bool) -> Self {
+        self.done = done;
+        self
+    }
+}
+
+// ── Free functions ────────────────────────────────────────────────────────────
+
+/// Map a discrete action to `(vx, vy, omega)` in robot frame.
+fn action_to_velocity(action: Action) -> (f32, f32, f32) {
+    match action {
+        Action::Forward     => (SPEED_M_S,  0.0,       0.0),
+        Action::RotateLeft  => (0.0,        0.0,       OMEGA_RAD_S),
+        Action::RotateRight => (0.0,        0.0,      -OMEGA_RAD_S),
+        Action::StrafeLeft  => (0.0,        SPEED_M_S, 0.0),
+        Action::StrafeRight => (0.0,       -SPEED_M_S, 0.0),
+        Action::Stop        => (0.0,        0.0,       0.0),
+    }
+}
+
+fn wrap_angle(a: f32) -> f32 {
+    use std::f32::consts::PI;
+    let mut a = a % (2.0 * PI);
+    if a >  PI { a -= 2.0 * PI; }
+    if a < -PI { a += 2.0 * PI; }
+    a
+}
+
+// ── XorShift64 PRNG ───────────────────────────────────────────────────────────
+
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 0xdeadbeef_cafebabe } else { seed })
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_usize(&mut self, n: usize) -> usize {
+        (self.next() as usize) % n
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        (self.next() >> 11) as f32 / (1u64 << 53) as f32
+    }
+}
