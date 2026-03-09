@@ -11,3 +11,4 @@ sim_fast   = { workspace = true }
 tokio      = { workspace = true }
 anyhow     = { workspace = true }
 tracing    = { workspace = true }
+ort        = { workspace = true }

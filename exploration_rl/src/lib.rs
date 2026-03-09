@@ -7,7 +7,6 @@
 //!
 //! # Layered fallback
 //! 1. **ONNX policy** — loaded from `models/frontier_selector.onnx` if present.
-//!    (Stub: returns random valid action until a model is exported.)
 //! 2. **Classical heuristic** — always-available fallback; used if no model
 //!    file exists or inference fails.
 //!
@@ -29,6 +28,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use core_types::{Frontier, FrontierChoice, Pose2D};
+use ort::session::Session;
+use ort::value::Tensor;
 
 // ── Classical heuristics ──────────────────────────────────────────────────────
 
@@ -73,27 +74,24 @@ fn dist_sq(pose: &Pose2D, f: &Frontier) -> f32 {
 
 /// Policy wrapper: tries ONNX inference, falls back to classical heuristic.
 pub struct FrontierSelector {
-    /// Path to the ONNX model file (may not exist yet).
-    model_path: String,
-    /// True if the ONNX model has been successfully loaded.
-    model_loaded: bool,
+    /// Loaded ONNX session (None if no model file found or load failed).
+    session: Option<Session>,
     /// Replan cooldown: skip if fewer than this many map updates since last plan.
     min_updates_between_plans: u32,
     updates_since_last_plan: u32,
 }
 
 impl FrontierSelector {
-    pub fn new(model_path: impl Into<String>) -> Self {
-        let model_path = model_path.into();
-        let model_loaded = Self::try_load_model(&model_path);
-        if model_loaded {
-            info!("FrontierSelector: ONNX model loaded from {model_path}");
+    pub fn new(model_path: impl AsRef<std::path::Path>) -> Self {
+        let path = model_path.as_ref();
+        let session = Self::try_load_model(path);
+        if session.is_some() {
+            info!("FrontierSelector: ONNX model loaded from {}", path.display());
         } else {
             info!("FrontierSelector: no ONNX model — using classical heuristic");
         }
         Self {
-            model_path,
-            model_loaded,
+            session,
             min_updates_between_plans: 5,
             updates_since_last_plan: u32::MAX, // trigger immediately
         }
@@ -112,7 +110,7 @@ impl FrontierSelector {
             return None;
         }
 
-        let choice = if self.model_loaded {
+        let choice = if self.session.is_some() {
             self.onnx_infer(frontiers, robot_pose)
                 .or_else(|| classical_select(frontiers, robot_pose))
         } else {
@@ -126,27 +124,52 @@ impl FrontierSelector {
         choice
     }
 
-    /// Attempt to load the ONNX model. Returns true if successful.
-    fn try_load_model(path: &str) -> bool {
-        // TODO (Phase 10): load with `ort::Session::builder().commit_from_file(path)`
-        // For now, check if the file exists and log; actual inference is stubbed.
-        std::path::Path::new(path).exists()
+    /// Attempt to load the ONNX model. Returns `Some(Session)` on success.
+    fn try_load_model(path: &std::path::Path) -> Option<Session> {
+        if !path.exists() {
+            return None;
+        }
+        fn load(path: &std::path::Path) -> ort::Result<Session> {
+            Session::builder()?.commit_from_file(path)
+        }
+        match load(path) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("Failed to load ONNX model from {}: {e}", path.display());
+                None
+            }
+        }
     }
 
-    /// Run ONNX policy inference.
-    ///
-    /// TODO (Phase 10): build state vector (frontiers + pose), run session,
-    /// decode argmax of output logits into FrontierChoice.
+    /// Run ONNX policy inference. Returns `None` on any error (classical
+    /// fallback will be used instead).
     fn onnx_infer(
-        &self,
+        &mut self,
         frontiers: &[Frontier],
         robot_pose: &Pose2D,
     ) -> Option<FrontierChoice> {
-        // TODO (Phase 10): load ort::Session from self.model_path, build state
-        // vector with build_state_vector(), run inference, decode argmax.
-        let _ = (&self.model_path, frontiers, robot_pose);
-        warn!("ONNX inference not yet implemented — using classical fallback");
-        None
+        let session = self.session.as_mut()?;
+
+        let state = build_state_vector(frontiers, robot_pose);
+        // Tensor::from_array((shape, owned_vec)) — no ndarray needed.
+        let tensor = Tensor::<f32>::from_array(([1usize, STATE_LEN], state)).ok()?;
+
+        let outputs = session
+            .run(ort::inputs!["state" => tensor])
+            .ok()?;
+
+        // try_extract_tensor returns (&Shape, &[T]) in ort rc.12.
+        let (_, logits) = outputs["logits"].try_extract_tensor::<f32>().ok()?;
+        let action = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, a): &(usize, f32), (_, b): &(usize, f32)| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i as u8)?;
+
+        Some(u8_to_frontier_choice(action))
     }
 }
 
@@ -161,6 +184,9 @@ impl Default for FrontierSelector {
 /// Maximum number of frontiers encoded in the state vector.
 const MAX_FRONTIERS: usize = 8;
 
+/// Total length of the state vector: 4 robot fields + 3 per frontier slot.
+const STATE_LEN: usize = 4 + MAX_FRONTIERS * 3; // 28
+
 /// Build a flat state vector for the policy network.
 ///
 /// Layout (fixed size, zero-padded):
@@ -172,7 +198,7 @@ const MAX_FRONTIERS: usize = 8;
 /// Frontier offsets (dx, dy) are relative to robot position and normalised
 /// to the arena half-width (5.0 m). Size is normalised by 1000 cells.
 pub fn build_state_vector(frontiers: &[Frontier], robot_pose: &Pose2D) -> Vec<f32> {
-    let mut v = Vec::with_capacity(4 + MAX_FRONTIERS * 3);
+    let mut v = Vec::with_capacity(STATE_LEN);
     v.push(robot_pose.x_m / 10.0);
     v.push(robot_pose.y_m / 10.0);
     v.push(robot_pose.theta_rad.cos());
@@ -195,7 +221,28 @@ pub fn build_state_vector(frontiers: &[Frontier], robot_pose: &Pose2D) -> Vec<f3
             v.extend_from_slice(&[0.0, 0.0, 0.0]); // padding
         }
     }
+    debug_assert_eq!(v.len(), STATE_LEN);
     v
+}
+
+fn u8_to_frontier_choice(action: u8) -> FrontierChoice {
+    match action {
+        0 => FrontierChoice::Nearest,
+        1 => FrontierChoice::Largest,
+        2 => FrontierChoice::Leftmost,
+        3 => FrontierChoice::Rightmost,
+        _ => FrontierChoice::RandomValid,
+    }
+}
+
+fn frontier_choice_to_u8(c: &FrontierChoice) -> u8 {
+    match c {
+        FrontierChoice::Nearest    => 0,
+        FrontierChoice::Largest    => 1,
+        FrontierChoice::Leftmost   => 2,
+        FrontierChoice::Rightmost  => 3,
+        FrontierChoice::RandomValid => 4,
+    }
 }
 
 // ── Training runner ───────────────────────────────────────────────────────────
@@ -299,16 +346,6 @@ impl TrainingRunner {
 impl Default for TrainingRunner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-fn frontier_choice_to_u8(c: &FrontierChoice) -> u8 {
-    match c {
-        FrontierChoice::Nearest    => 0,
-        FrontierChoice::Largest    => 1,
-        FrontierChoice::Leftmost   => 2,
-        FrontierChoice::Rightmost  => 3,
-        FrontierChoice::RandomValid => 4,
     }
 }
 
