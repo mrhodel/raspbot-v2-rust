@@ -27,7 +27,7 @@ const M_FR: u8 = 2;
 const M_RR: u8 = 3;
 
 /// min_speed from robot_config.yaml — stall threshold
-const TEST_SPEED: i8 = 20;
+const TEST_SPEED: i8 = 40;
 const MOVE_S:     u64 = 1;
 
 // ── I2C helpers ───────────────────────────────────────────────────────────────
