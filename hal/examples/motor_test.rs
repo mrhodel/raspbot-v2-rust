@@ -72,8 +72,11 @@ const SAMPLE_MS:   u64 = 10; // 100 Hz
 const MOTION_ACCEL_THRESH: f32 = 0.20;
 /// Peak |gyro_z| (rad/s) required to declare a rotation test passing.
 const MOTION_GYRO_THRESH: f32 = 0.05;
-/// Accel threshold for single-wheel tests (lower — robot is mostly anchored).
+/// Accel threshold for FL/RR sweep (the "/" pair — low rotation signature).
 const SINGLE_WHEEL_THRESH: f32 = 0.10;
+/// Gyro threshold for FR/RL sweep (the "\" pair — rotation drops to ~0 on stall).
+/// FR/RL generate 0.5–3 rad/s when spinning; stalled motor drops below noise floor.
+const GYRO_STALL_THRESH: f32 = 0.15;
 
 // ── IMU types ─────────────────────────────────────────────────────────────────
 
@@ -404,7 +407,14 @@ fn run_sweep(
             std::thread::sleep(Duration::from_millis(200));
 
             let m = compute_metrics(&imu);
-            let moving = m.peak_mag > SINGLE_WHEEL_THRESH;
+            // FR and RL are the "\" mecanum pair: they generate strong rotation when
+            // spinning alone. Their gyro_z collapses to noise floor on stall even
+            // while peak_mag stays elevated (motor vibrating but wheel not turning).
+            // FL and RR are the "/" pair: low rotation signature, use accel instead.
+            let moving = match motor {
+                "FR" | "RL" => m.peak_gz > GYRO_STALL_THRESH,
+                _            => m.peak_mag > SINGLE_WHEEL_THRESH,
+            };
             let tag = if moving { "MOVING " } else { "STALLED" };
             println!("    {motor} @ {:3}%  peak_mag={:.3} m/s²  peak_gz={:.4} rad/s  [{tag}]",
                 speed, m.peak_mag, m.peak_gz);
