@@ -17,5 +17,5 @@ pub mod ultrasonic;
 pub use camera::{Camera, StubCamera};
 pub use gimbal::{Gimbal, StubGimbal};
 pub use imu::{Imu, StubImu};
-pub use motor::{MotorController, StubMotorController};
-pub use ultrasonic::{Ultrasonic, StubUltrasonic};
+pub use motor::{MotorController, StubMotorController, YahboomMotorController};
+pub use ultrasonic::{Ultrasonic, StubUltrasonic, YahboomUltrasonic};
