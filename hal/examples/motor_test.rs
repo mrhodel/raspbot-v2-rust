@@ -59,8 +59,8 @@ const REG_GYRO_CONFIG:  u8  = 0x1B;
 const REG_ACCEL_CONFIG: u8  = 0x1C;
 const REG_ACCEL_XOUT_H: u8  = 0x3B;
 
-const ACCEL_SCALE: f32 = 9.81 / 16384.0;
-const GYRO_SCALE:  f32 = std::f32::consts::PI / 180.0 / 131.0;
+const ACCEL_SCALE: f32 = 9.81 / 8192.0;                        // ±4 g → m/s²
+const GYRO_SCALE:  f32 = std::f32::consts::PI / 180.0 / 65.5;  // ±500 °/s → rad/s
 const SAMPLE_MS:   u64 = 10; // 100 Hz
 
 // ── Auto-assessment thresholds ────────────────────────────────────────────────
@@ -96,8 +96,8 @@ impl Bias {
 fn mpu_init(i2c: &mut I2c) -> Result<()> {
     i2c.block_write(REG_PWR_MGMT_1,  &[0x00]).context("MPU wake-up")?;
     std::thread::sleep(Duration::from_millis(100));
-    i2c.block_write(REG_GYRO_CONFIG,  &[0x00]).context("gyro ±250°/s")?;
-    i2c.block_write(REG_ACCEL_CONFIG, &[0x00]).context("accel ±2g")?;
+    i2c.block_write(REG_GYRO_CONFIG,  &[0x08]).context("gyro ±500°/s")?;
+    i2c.block_write(REG_ACCEL_CONFIG, &[0x08]).context("accel ±4g")?;
     Ok(())
 }
 
