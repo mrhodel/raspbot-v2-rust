@@ -8,7 +8,7 @@ robot:
   name: "RaspbotV2"
   wheel_type: mecanum          # mecanum | differential
   max_speed: 80                # motor duty-cycle limit  0-100
-  min_speed: 20                # below this motors stall
+  min_speed: 30                # below this motors stall (RL stalls ~25% on concrete; 30% gives margin)
 
 # ── Hardware Abstraction Layer ────────────────────────────────────
 hal:
@@ -155,8 +155,8 @@ rl:
             rotate_left, rotate_right, gimbal_pan_left,
             gimbal_pan_right, gimbal_tilt_up, gimbal_tilt_down, stop]
     base_speed: 55             # duty cycle for forward
-    strafe_speed: 30           # lower = fewer cm/step sideways (no side sensors)
-    reverse_speed: 30          # lower = fewer cm/step backward (no rear sensor)
+    strafe_speed: 35           # lower = fewer cm/step sideways (no side sensors); above RL stall threshold
+    reverse_speed: 35          # lower = fewer cm/step backward (no rear sensor); above RL stall threshold
     rotate_speed: 45
     gimbal_step_deg: 10
     # Safety pre-checks for blind directions (robot mode only)
