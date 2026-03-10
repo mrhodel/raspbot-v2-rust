@@ -77,7 +77,7 @@ const SINGLE_WHEEL_THRESH: f32 = 0.10;
 
 // ── IMU types ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct ImuSample {
     t_ms: u64,
     ax: f32, ay: f32, az: f32,
