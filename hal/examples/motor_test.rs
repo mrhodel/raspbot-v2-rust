@@ -411,9 +411,16 @@ fn run_sweep(
             // spinning alone. Their gyro_z collapses to noise floor on stall even
             // while peak_mag stays elevated (motor vibrating but wheel not turning).
             // FL and RR are the "/" pair: low rotation signature, use accel instead.
-            let moving = match motor {
-                "FR" | "RL" => m.peak_gz > GYRO_STALL_THRESH,
-                _            => m.peak_mag > SINGLE_WHEEL_THRESH,
+            // Elevated (no traction): gyro stays near zero for all motors because
+            // the robot body can't rotate — use accel for all.
+            // On-ground: FR/RL gyro signature is more reliable than accel.
+            let moving = if surface.contains("elev") {
+                m.peak_mag > SINGLE_WHEEL_THRESH
+            } else {
+                match motor {
+                    "FR" | "RL" => m.peak_gz > GYRO_STALL_THRESH,
+                    _            => m.peak_mag > SINGLE_WHEEL_THRESH,
+                }
             };
             let tag = if moving { "MOVING " } else { "STALLED" };
             println!("    {motor} @ {:3}%  peak_mag={:.3} m/s²  peak_gz={:.4} rad/s  [{tag}]",
