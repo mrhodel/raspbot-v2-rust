@@ -1,15 +1,17 @@
 //! Ultrasonic sensor HAL trait and implementations.
 //!
 //! The HC-SR04 is connected to the Yahboom expansion board (I2C bus 1, addr 0x2B).
-//! The board handles the HC-SR04 trigger/echo timing internally; we just trigger
-//! via I2C and read back the result.
+//! The board handles the HC-SR04 trigger/echo timing internally.
 //!
-//! # Wire protocol (Yahboom expansion board, smbus2 raw path)
+//! # Wire protocol (from Yahboom Raspbot_Lib.py, confirmed via source inspection)
 //!
-//!   Trigger:  write single byte 0x02 to the board
-//!   Wait:     ~60 ms for the HC-SR04 round-trip + MCU processing
-//!   Read:     write 0x02 then read 3 bytes → 24-bit big-endian distance in mm
-//!   Distance: dist_cm = dist_mm / 10.0
+//!   Enable sensor:     block_write(0x07, [1])          (write_i2c_block_data)
+//!   Wait for settle:   ~80 ms
+//!   Read high byte:    block_read(0x1b, 1 byte) → hi
+//!   Read low byte:     block_read(0x1a, 1 byte) → lo
+//!   Distance (mm):     (hi << 8) | lo
+//!   Distance (cm):     mm / 10.0
+//!   Disable sensor:    block_write(0x07, [0])           (optional between readings)
 //!
 //! A median filter over `samples_per_reading` readings reduces spike noise.
 
@@ -20,13 +22,21 @@ use async_trait::async_trait;
 use core_types::UltrasonicReading;
 use tracing::{debug, info, warn};
 
-// ── Yahboom board constants ───────────────────────────────────────────────────
+// ── Yahboom board register map ────────────────────────────────────────────────
 
-const REG_ULTRASONIC: u8 = 0x02;
-/// Wait after trigger before reading (ms). HC-SR04 max round-trip at 400 cm ≈ 24 ms;
-/// the MCU adds a few ms of processing. 60 ms is conservative and reliable.
-const TRIGGER_WAIT_MS: u64 = 60;
-/// Clamp distance to this when the sensor returns 0 (blind-spot / too close).
+/// Write [1] to enable, [0] to disable the HC-SR04.
+const REG_US_ENABLE: u8 = 0x07;
+/// High byte of distance result (mm).
+const REG_US_DIST_H: u8 = 0x1b;
+/// Low byte of distance result (mm).
+const REG_US_DIST_L: u8 = 0x1a;
+
+/// Time from enabling sensor to first stable reading (ms).
+/// Yahboom example uses 1000ms; the Python wrapper uses 80ms — 100ms is safe.
+const SETTLE_MS: u64 = 100;
+/// Gap between consecutive median-filter samples (ms).
+const INTER_SAMPLE_MS: u64 = 20;
+/// Distance reported when the target is in the HC-SR04 blind spot (<~2 cm).
 const BLIND_SPOT_CM: f32 = 2.0;
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -44,22 +54,16 @@ pub trait Ultrasonic: Send + Sync {
 /// `rppal::i2c::I2c` is not `Sync`, so it is wrapped in a `Mutex` to satisfy
 /// the `Ultrasonic: Sync` bound required by `Box<dyn Ultrasonic>`.
 pub struct YahboomUltrasonic {
-    i2c:         std::sync::Mutex<rppal::i2c::I2c>,
-    t0:          Instant,
-    max_range:   f32,
-    min_range:   f32,
+    i2c:       std::sync::Mutex<rppal::i2c::I2c>,
+    t0:        Instant,
+    max_range: f32,
+    min_range: f32,
     /// Number of samples to collect per reading (median filter).
-    n_samples:   u8,
+    n_samples: u8,
 }
 
 impl YahboomUltrasonic {
     /// Open the I2C bus and configure the device address.
-    ///
-    /// * `i2c_bus`    — Linux I2C bus number (1 for Pi I2C-1)
-    /// * `i2c_addr`   — Yahboom board address (0x2B)
-    /// * `max_range`  — clamp ceiling in cm (default 400)
-    /// * `min_range`  — clamp floor in cm (default 3)
-    /// * `n_samples`  — samples per reading for the median filter (1 = fastest)
     pub fn new(
         i2c_bus:   u8,
         i2c_addr:  u16,
@@ -84,64 +88,58 @@ impl YahboomUltrasonic {
         })
     }
 
-    /// Trigger the sensor and read one raw distance value in cm.
-    fn read_once_cm(&self) -> Result<f32> {
+    /// Enable sensor, wait for settle, take N readings, disable, return median.
+    fn read_median_cm(&self) -> Result<f32> {
         let mut i2c = self.i2c.lock().unwrap();
 
-        // Trigger: send the register byte as a raw I2C write.
-        i2c.write(&[REG_ULTRASONIC])
-            .context("ultrasonic trigger write")?;
+        // Enable the ultrasonic sensor.
+        i2c.block_write(REG_US_ENABLE, &[1])
+            .context("ultrasonic enable")?;
+        std::thread::sleep(Duration::from_millis(SETTLE_MS));
 
-        // Blocking sleep is deliberate here — it keeps the sampling timing
-        // deterministic and is short enough not to starve the async runtime
-        // in practice (called infrequently, e.g. at 5-10 Hz).
-        std::thread::sleep(Duration::from_millis(TRIGGER_WAIT_MS));
-
-        // Read: write register address, then read 3 bytes (24-bit big-endian mm).
-        let mut buf = [0u8; 3];
-        i2c.write_read(&[REG_ULTRASONIC], &mut buf)
-            .context("ultrasonic read")?;
-
-        let dist_mm = ((buf[0] as u32) << 16) | ((buf[1] as u32) << 8) | buf[2] as u32;
-        debug!("ultrasonic raw: buf={buf:?} dist_mm={dist_mm}");
-
-        if dist_mm == 0 {
-            // Board reports 0 when the target is in the HC-SR04 blind spot (<~2 cm).
-            return Ok(BLIND_SPOT_CM);
+        let mut samples: Vec<f32> = Vec::with_capacity(self.n_samples as usize);
+        for idx in 0..self.n_samples {
+            // Read high and low bytes separately (board doesn't support
+            // reading both in one block_read call per the Raspbot_Lib source).
+            let mut hi_buf = [0u8; 1];
+            let mut lo_buf = [0u8; 1];
+            if let Err(e) = i2c.block_read(REG_US_DIST_H, &mut hi_buf)
+                .and_then(|_| i2c.block_read(REG_US_DIST_L, &mut lo_buf))
+            {
+                warn!("ultrasonic sample {idx} read error: {e}");
+            } else {
+                let dist_mm = ((hi_buf[0] as u32) << 8) | lo_buf[0] as u32;
+                debug!("ultrasonic raw: hi={:#04x} lo={:#04x} dist_mm={dist_mm}", hi_buf[0], lo_buf[0]);
+                let dist_cm = if dist_mm == 0 {
+                    BLIND_SPOT_CM
+                } else {
+                    (dist_mm as f32 / 10.0).clamp(self.min_range, self.max_range)
+                };
+                samples.push(dist_cm);
+            }
+            if idx + 1 < self.n_samples {
+                std::thread::sleep(Duration::from_millis(INTER_SAMPLE_MS));
+            }
         }
 
-        Ok((dist_mm as f32 / 10.0).clamp(self.min_range, self.max_range))
+        // Disable sensor to reduce power and electromagnetic noise.
+        let _ = i2c.block_write(REG_US_ENABLE, &[0]);
+
+        if samples.is_empty() {
+            anyhow::bail!("all ultrasonic samples failed");
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        Ok(samples[samples.len() / 2])
     }
 }
 
 #[async_trait]
 impl Ultrasonic for YahboomUltrasonic {
     async fn read_distance(&mut self) -> Result<UltrasonicReading> {
-        let mut samples: Vec<f32> = Vec::with_capacity(self.n_samples as usize);
-
-        for i in 0..self.n_samples {
-            match self.read_once_cm() {  // &self — Mutex used internally
-                Ok(cm) => samples.push(cm),
-                Err(e) => warn!("ultrasonic sample {i}: {e}"),
-            }
-            // Short gap between back-to-back samples so the HC-SR04 has time
-            // to quiesce before the next trigger (board enforces this internally,
-            // but an extra gap avoids any echo cross-talk).
-            if i + 1 < self.n_samples {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-
-        if samples.is_empty() {
-            anyhow::bail!("all ultrasonic samples failed");
-        }
-
-        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = samples[samples.len() / 2];
-
+        let cm = self.read_median_cm()?;
         Ok(UltrasonicReading {
             t_ms:     self.t0.elapsed().as_millis() as u64,
-            range_cm: median,
+            range_cm: cm,
         })
     }
 }
