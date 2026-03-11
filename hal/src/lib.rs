@@ -15,7 +15,7 @@ pub mod ultrasonic;
 
 // Re-export trait and stub types at crate root for convenience.
 pub use camera::{Camera, StubCamera};
-pub use gimbal::{Gimbal, StubGimbal};
+pub use gimbal::{Gimbal, StubGimbal, YahboomGimbal};
 pub use imu::{Imu, StubImu};
 pub use motor::{MotorController, StubMotorController, YahboomMotorController};
 pub use ultrasonic::{Ultrasonic, StubUltrasonic, YahboomUltrasonic};
