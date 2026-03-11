@@ -36,8 +36,15 @@ const REG_US_DIST_L: u8 = 0x1a;
 const SETTLE_MS: u64 = 100;
 /// Gap between consecutive median-filter samples (ms).
 const INTER_SAMPLE_MS: u64 = 20;
-/// Distance reported when the target is in the HC-SR04 blind spot (<~2 cm).
-const BLIND_SPOT_CM: f32 = 2.0;
+/// The HC-SR04 board returns dist_mm == 0 in two cases that cannot be
+/// distinguished from registers alone:
+///   (a) Target in blind spot < ~2 cm (too close for echo)
+///   (b) No echo received — target > ~400 cm or no reflective surface
+///
+/// For the safety-interlock role, returning max_range for 0 is correct:
+///   • Case (a): robot's chassis is already touching the obstacle — wheels
+///     would have already stalled; no need to re-trigger emergency stop.
+///   • Case (b): open space — safe to move.
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
@@ -111,7 +118,8 @@ impl YahboomUltrasonic {
                 let dist_mm = ((hi_buf[0] as u32) << 8) | lo_buf[0] as u32;
                 debug!("ultrasonic raw: hi={:#04x} lo={:#04x} dist_mm={dist_mm}", hi_buf[0], lo_buf[0]);
                 let dist_cm = if dist_mm == 0 {
-                    BLIND_SPOT_CM
+                    // No echo (open space) or blind spot — both safe to treat as max range.
+                    self.max_range
                 } else {
                     (dist_mm as f32 / 10.0).clamp(self.min_range, self.max_range)
                 };

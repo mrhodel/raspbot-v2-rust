@@ -30,19 +30,20 @@ const SETTLE_MS:      u64 = 100;
 const INTER_SAMPLE:   u64 = 20;
 const LOOP_PERIOD:    u64 = 350;   // ms between continuous-mode lines
 
-// Calibration: test points (description, nominal_cm; 0.0 = user measures)
+// Calibration: test points (description, nominal_cm; 0.0 = observation only)
 const CALIB_POINTS: &[(&str, f32)] = &[
-    // Edge cases first
-    ("open space — nothing within 400 cm (no echo)",   0.0),
-    ("< 1 cm  — touch an object to the sensor face",   0.0),
-    // Calibration ladder
+    // Edge cases
+    ("~ 350-400 cm  — move an object back until reading starts dropping or jumps",  0.0),
+    ("  open space  — nothing in front, sensor aimed at far wall or ceiling (no echo)", 0.0),
+    ("< 1 cm        — touch a flat object to the sensor face",                      0.0),
+    // Calibration ladder (nominal_cm > 0 → included in scale factor)
     ("5 cm   (near minimum range)",                    5.0),
-    ("15 cm  (safety-stop threshold)",                15.0),
+    ("15 cm  (safety-stop threshold — most important)", 15.0),
     ("30 cm  (typical close obstacle)",               30.0),
     ("100 cm",                                       100.0),
     ("200 cm",                                       200.0),
-    // Surface-type test
-    ("~50 cm, surface tilted ~45° to sensor axis",     0.0),
+    // Surface-type
+    ("~50 cm, surface tilted ~45° to the sensor axis", 0.0),
 ];
 const CALIB_SAMPLES:   u32 = 20;   // readings per calibration point
 const CALIB_SAMPLE_MS: u64 = 350;  // ms between calibration samples
@@ -90,7 +91,8 @@ fn read_single(i2c: &mut I2c) -> anyhow::Result<(f32, u8, u8)> {
     i2c.block_read(REG_DIST_L, &mut lo)?;
     let _ = i2c.block_write(REG_ENABLE, &[0]);
     let mm = ((hi[0] as u32) << 8) | lo[0] as u32;
-    let cm = if mm == 0 { 2.0f32 } else { (mm as f32 / 10.0).clamp(2.0, 500.0) };
+    // dist_mm == 0 → no echo (open space) or blind spot — both treated as max range.
+    let cm = if mm == 0 { 400.0f32 } else { (mm as f32 / 10.0).clamp(2.0, 500.0) };
     Ok((cm, hi[0], lo[0]))
 }
 
@@ -104,7 +106,7 @@ fn read_median(i2c: &mut I2c, n: u8) -> anyhow::Result<(f32, u8, u8)> {
         let mut lo = [0u8; 1];
         if i2c.block_read(REG_DIST_H, &mut hi).and_then(|_| i2c.block_read(REG_DIST_L, &mut lo)).is_ok() {
             let mm = ((hi[0] as u32) << 8) | lo[0] as u32;
-            let cm = if mm == 0 { 2.0f32 } else { (mm as f32 / 10.0).clamp(2.0, 500.0) };
+            let cm = if mm == 0 { 400.0f32 } else { (mm as f32 / 10.0).clamp(2.0, 500.0) };
             samples.push((cm, hi[0], lo[0]));
         }
         if idx + 1 < n {
@@ -117,11 +119,12 @@ fn read_median(i2c: &mut I2c, n: u8) -> anyhow::Result<(f32, u8, u8)> {
     Ok(samples[samples.len() / 2])
 }
 
+/// Format a distance value for display.
+/// `raw_zero` = true when the register read 0x0000 (no-echo or blind-spot).
 fn fmt_dist(cm: f32) -> String {
-    if cm <= 2.5 {
-        format!("{cm:6.1} cm  [BLIND SPOT / touch]")
-    } else if cm >= 399.0 {
-        format!("{cm:6.1} cm  [NO ECHO / beyond range]")
+    if cm >= 399.0 {
+        // We set dist_mm==0 → max_range in the driver, so this is the no-echo path.
+        format!("{cm:6.1} cm  [NO ECHO — open space or blind spot < 2 cm]")
     } else if cm < 15.0 {
         format!("{cm:6.1} cm  *** CLOSE ***")
     } else {
