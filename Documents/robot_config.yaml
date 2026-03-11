@@ -38,8 +38,13 @@ hal:
     i2c_bus: 1
     i2c_address: 0x2B          # same expansion board as motors/ultrasonic
     pan_range: [-90, 90]       # degrees from centre
-    tilt_range: [-45, 30]
-    tilt_neutral: 30           # raw servo angle (0-180) that points camera level
+    # Tilt servo is mounted inverted: higher raw = camera up.
+    # With tilt_neutral=30 raw, max down range = 30° (raw→0), max up = 80° (raw→110).
+    # tilt_range updated from [-45,30] to [-30,30] to match physical limits.
+    # Fine-tune tilt_neutral from 30→28 to correct ~1-2° upward mounting offset.
+    # Fine-tune pan by adjusting PAN_CENTER const (90→87) for ~2-3° CW chassis offset.
+    tilt_range: [-30, 30]
+    tilt_neutral: 30           # raw servo angle (0-180) that points camera level (tune to ~28)
     move_speed_deg_s: 120      # max angular velocity (software-limited)
 
   camera:

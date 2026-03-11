@@ -9,16 +9,26 @@
 //!
 //! # Angle convention
 //!
-//!   Pan:  raw = PAN_CENTER (90°) + pan_deg
-//!         pan_deg = 0 → forward, −90 → full left, +90 → full right
+//!   Pan:  raw = PAN_CENTER (90°) − pan_deg
+//!         pan_deg = 0  → forward (raw 90°)
+//!         pan_deg = −90 → left   (raw 180°)
+//!         pan_deg = +90 → right  (raw 0°)
+//!         (servo is mirrored relative to the intuitive direction)
 //!
-//!   Tilt: raw = tilt_neutral_raw − tilt_deg
-//!         tilt_deg = 0   → level   (raw = tilt_neutral, default 30°)
-//!         tilt_deg = +30 → up      (raw = 0°)
-//!         tilt_deg = −45 → down    (raw = tilt_neutral + 45°)
+//!   Tilt: raw = tilt_neutral_raw + tilt_deg
+//!         tilt_deg = 0   → level   (raw = tilt_neutral, ~30°)
+//!         tilt_deg = +30 → up      (raw = tilt_neutral + 30°)
+//!         tilt_deg = −30 → down    (raw = 0°, max down from neutral=30°)
 //!
-//!   The subtraction sign for tilt reflects servo mounting: higher raw
-//!   angle tilts the camera downward.
+//!   Higher raw tilt angle = camera points MORE upward (servo mounted
+//!   inverted relative to intuitive direction).
+//!
+//! # Physical mounting offsets (fine-tune in config, not in code)
+//!   Pan: servo centre is ~2-3° clockwise of chassis forward axis.
+//!        Compensate by adjusting PAN_CENTER constant or adding pan_neutral
+//!        to config when empirically measured.
+//!   Tilt: raw=30° points ~1-2° above level.
+//!         Compensate by reducing tilt_neutral_raw to ~28° in config.
 
 use std::time::Duration;
 
@@ -97,11 +107,15 @@ impl YahboomGimbal {
     }
 
     fn deg_to_raw_pan(&self, pan_deg: f32) -> u8 {
-        (PAN_CENTER + pan_deg).clamp(0.0, 180.0) as u8
+        // Subtract because servo is mounted mirrored: increasing raw angle
+        // moves camera to the right, so we invert the sign.
+        (PAN_CENTER - pan_deg).clamp(0.0, 180.0) as u8
     }
 
     fn deg_to_raw_tilt(&self, tilt_deg: f32) -> u8 {
-        (self.tilt_neutral_raw - tilt_deg)
+        // Add because servo is mounted inverted: increasing raw angle tilts
+        // camera upward, so positive tilt_deg (up) increases raw.
+        (self.tilt_neutral_raw + tilt_deg)
             .clamp(0.0, TILT_RAW_MAX) as u8
     }
 

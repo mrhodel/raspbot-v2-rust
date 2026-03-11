@@ -60,34 +60,36 @@ fn run_verification(i2c: &mut I2c) -> anyhow::Result<()> {
     pause("Camera should be pointing straight ahead, level.");
 
     // ── Pan left ──────────────────────────────────────────────────────────────
-    println!("Pan LEFT  (pan_deg = -90 → raw=0°)...");
-    move_to(i2c, SERVO_PAN, PAN_CENTER, 0)?;
+    // pan_deg=-90 → raw = 90 - (-90) = 180
+    println!("Pan LEFT  (pan_deg = -90 → raw=180°)...");
+    move_to(i2c, SERVO_PAN, PAN_CENTER, 180)?;
     pause("Camera should be turned to the LEFT.");
 
     // ── Pan right ─────────────────────────────────────────────────────────────
-    println!("Pan RIGHT (pan_deg = +90 → raw=180°)...");
-    move_to(i2c, SERVO_PAN, 0, 180)?;
+    // pan_deg=+90 → raw = 90 - 90 = 0
+    println!("Pan RIGHT (pan_deg = +90 → raw=0°)...");
+    move_to(i2c, SERVO_PAN, 180, 0)?;
     pause("Camera should be turned to the RIGHT.");
 
     // ── Back to center ────────────────────────────────────────────────────────
     println!("Pan back to CENTER...");
-    move_to(i2c, SERVO_PAN, 180, PAN_CENTER)?;
+    move_to(i2c, SERVO_PAN, 0, PAN_CENTER)?;
 
     // ── Tilt up ───────────────────────────────────────────────────────────────
-    // tilt_deg=+30 → raw = TILT_NEUTRAL - 30 = 0
-    println!("Tilt UP   (tilt_deg = +30 → raw=0°)...");
-    move_to(i2c, SERVO_TILT, TILT_NEUTRAL, 0)?;
+    // tilt_deg=+30 → raw = TILT_NEUTRAL + 30 = 60
+    println!("Tilt UP   (tilt_deg = +30 → raw=60°)...");
+    move_to(i2c, SERVO_TILT, TILT_NEUTRAL, 60)?;
     pause("Camera should be tilted UP (looking at ceiling).");
 
     // ── Tilt down ─────────────────────────────────────────────────────────────
-    // tilt_deg=-45 → raw = TILT_NEUTRAL + 45 = 75
-    println!("Tilt DOWN (tilt_deg = -45 → raw=75°)...");
-    move_to(i2c, SERVO_TILT, 0, 75)?;
+    // tilt_deg=-30 → raw = TILT_NEUTRAL - 30 = 0  (max down with neutral=30°)
+    println!("Tilt DOWN (tilt_deg = -30 → raw=0°)...");
+    move_to(i2c, SERVO_TILT, 60, 0)?;
     pause("Camera should be tilted DOWN (looking at floor).");
 
     // ── Return to neutral ─────────────────────────────────────────────────────
     println!("Returning to neutral (pan=0, tilt=level)...");
-    move_to(i2c, SERVO_TILT, 75, TILT_NEUTRAL)?;
+    move_to(i2c, SERVO_TILT, 0, TILT_NEUTRAL)?;
     move_to(i2c, SERVO_PAN,  PAN_CENTER, PAN_CENTER)?;
 
     println!("\nIf any direction was REVERSED, report which axis");
@@ -139,8 +141,8 @@ fn main() -> anyhow::Result<()> {
 
     println!("Gimbal test  I2C-{I2C_BUS} @ {I2C_ADDR:#04x}");
     println!("Protocol: block_write(0x02, [servo_id, angle])");
-    println!("  PAN  servo1: raw = 90 + pan_deg   (0°=left, 90°=center, 180°=right)");
-    println!("  TILT servo2: raw = {TILT_NEUTRAL} - tilt_deg   (0°=up, {TILT_NEUTRAL}°=level, 75°=down)\n");
+    println!("  PAN  servo1: raw = 90 - pan_deg   (180°=left, 90°=center, 0°=right)");
+    println!("  TILT servo2: raw = {TILT_NEUTRAL} + tilt_deg   (0°=down, {TILT_NEUTRAL}°=level, 60°=up)\n");
 
     let mut i2c = I2c::with_bus(I2C_BUS)?;
     i2c.set_slave_address(I2C_ADDR)?;
