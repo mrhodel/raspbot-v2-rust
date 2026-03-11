@@ -25,7 +25,9 @@ hal:
     i2c_bus: 1
     i2c_address: 0x2B          # same expansion board as motors/servos
     max_range_cm: 400
-    min_range_cm: 3            # HC-SR04 physical minimum range ~2-3cm actual
+    min_range_cm: 5            # Empirically confirmed: reliable from ~5 cm; 3-4 cm = transition
+                               # zone; < 3 cm = blind spot / MCU wrap-around (returns 478-480 cm)
+                               # dist_mm == 0 (no echo) is treated as max_range, not blind spot
     samples_per_reading: 3     # median filter over N acquisitions (1=fastest, 3=more stable)
 
   gimbal:
