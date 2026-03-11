@@ -1,0 +1,10 @@
+# Training dependencies for frontier-selector PPO policy
+# Install with:
+#   pip install -r scripts/requirements.txt
+#
+# For CUDA 12.x (RTX 3050):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+torch>=2.2.0
+numpy>=1.24.0
+onnx>=1.15.0

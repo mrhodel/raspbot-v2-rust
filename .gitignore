@@ -11,6 +11,10 @@ models/checkpoints/
 logs/
 *.log
 
+# Generated output (model checkpoints, test run CSVs)
+checkpoints/
+runs/
+
 # Converted/temp files
 /tmp/
 
