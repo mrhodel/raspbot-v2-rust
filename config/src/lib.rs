@@ -17,6 +17,8 @@ pub struct RobotConfig {
     pub hal: HalConfig,
     #[serde(default)]
     pub agent: AgentConfig,
+    #[serde(default)]
+    pub perception: PerceptionConfig,
 }
 
 impl RobotConfig {
@@ -120,3 +122,42 @@ pub struct SafetyConfig {
 }
 
 fn default_emergency_stop_cm() -> f32 { 15.0 }
+
+// ── Perception ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerceptionConfig {
+    /// Path to the MiDaS ONNX model file.
+    #[serde(default = "default_midas_model_path")]
+    pub midas_model_path: String,
+    /// Output depth map width (fed to RL state).
+    #[serde(default = "default_depth_out_width")]
+    pub depth_out_width: u32,
+    /// Output depth map height (fed to RL state).
+    #[serde(default = "default_depth_out_height")]
+    pub depth_out_height: u32,
+    /// Bottom rows of the depth map to zero out (robot body mask).
+    /// Expressed in depth-map pixels (not camera pixels).
+    #[serde(default)]
+    pub depth_mask_rows: u32,
+    /// Number of ONNX intra-op CPU threads.
+    #[serde(default = "default_num_threads")]
+    pub num_threads: usize,
+}
+
+impl Default for PerceptionConfig {
+    fn default() -> Self {
+        Self {
+            midas_model_path: default_midas_model_path(),
+            depth_out_width:  default_depth_out_width(),
+            depth_out_height: default_depth_out_height(),
+            depth_mask_rows:  0,
+            num_threads:      default_num_threads(),
+        }
+    }
+}
+
+fn default_midas_model_path() -> String { "models/midas_small.onnx".to_string() }
+fn default_depth_out_width()  -> u32    { 32 }
+fn default_depth_out_height() -> u32    { 32 }
+fn default_num_threads()      -> usize  { 4 }

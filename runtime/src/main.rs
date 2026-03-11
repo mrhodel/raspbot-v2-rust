@@ -80,7 +80,13 @@ async fn main() -> anyhow::Result<()> {
     info!("HAL stubs initialised");
 
     // ── Perception ────────────────────────────────────────────────────────────
-    let depth_infer    = DepthInference::new(192, 192);
+    let depth_infer    = DepthInference::new(
+        &cfg.perception.midas_model_path,
+        cfg.perception.depth_out_width,
+        cfg.perception.depth_out_height,
+        cfg.perception.depth_mask_rows,
+        cfg.perception.num_threads,
+    );
     let mut event_gate = EventGate::with_default_threshold();
     let lidar_extractor = PseudoLidarExtractor::new(48, 3.0);
     info!("Perception pipeline initialised");

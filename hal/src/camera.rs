@@ -93,7 +93,8 @@ mod usb {
         ) -> Result<Self> {
             use v4l::buffer::Type;
             use v4l::io::mmap::Stream as MmapStream;
-            use v4l::prelude::*;
+            use v4l::io::traits::CaptureStream;
+            use v4l::video::Capture;
             use v4l::video::capture::Parameters;
             use v4l::{Device, FourCC};
 
@@ -115,7 +116,7 @@ mod usb {
             );
 
             // Request frame rate (best-effort — some drivers ignore this).
-            if let Err(e) = dev.set_parameters(&Parameters::with_fps(fps)) {
+            if let Err(e) = dev.set_params(&Parameters::with_fps(fps)) {
                 warn!("V4L2Camera: set fps={fps} ignored by driver: {e}");
             }
 

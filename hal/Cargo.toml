@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# Enables the real V4L2 camera driver.  Requires libclang-dev at build time
-# (for v4l's bindgen step) and Linux V4L2 headers.
-# Build on Pi:  cargo build --release            (default = enabled)
-# Dev-machine:  cargo check --no-default-features (skips v4l)
-default   = ["usb-camera"]
+# usb-camera: real V4L2 driver (requires libclang on build host, Linux V4L2 headers)
+# mpu6050:    real MPU-6050 driver via rppal I2C (Pi only)
+# Dev-machine: cargo check --no-default-features
+default    = ["usb-camera", "mpu6050"]
 usb-camera = ["dep:v4l"]
+mpu6050    = []
 
 [dependencies]
 core_types  = { workspace = true }

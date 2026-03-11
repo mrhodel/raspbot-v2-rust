@@ -19,5 +19,7 @@ pub use camera::{Camera, StubCamera};
 pub use camera::V4L2Camera;
 pub use gimbal::{Gimbal, StubGimbal, YahboomGimbal};
 pub use imu::{Imu, StubImu};
+#[cfg(feature = "mpu6050")]
+pub use imu::Mpu6050Imu;
 pub use motor::{MotorController, StubMotorController, YahboomMotorController};
 pub use ultrasonic::{Ultrasonic, StubUltrasonic, YahboomUltrasonic};

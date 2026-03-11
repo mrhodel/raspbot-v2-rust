@@ -1,13 +1,13 @@
 //! Perception pipeline.
 //!
 //! Subsystems:
-//!   - `EventGate`   — decides when to run depth inference
-//!   - `depth`       — MiDaS ONNX inference (stub; real impl in Phase 6)
-//!   - `pseudo_lidar` — converts depth map → lidar rays
+//!   - `EventGate`        — decides when to run depth inference
+//!   - `depth`            — MiDaS ONNX inference (real or stub fallback)
+//!   - `pseudo_lidar`     — converts depth map → lidar rays
 //!
 //! The event gate reuses the previous depth estimate when the scene has not
 //! changed enough to justify another inference, targeting a 70–85% reduction
-//! in neural-network calls (requirements_v3.md §5.1).
+//! in neural-network calls.
 
 pub mod depth;
 pub mod event_gate;

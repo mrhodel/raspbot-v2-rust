@@ -52,8 +52,8 @@ hal:
     driver: usb                # usb | simulation
     device_index: 0            # fallback if device_path is empty
     device_path: /dev/v4l/by-id/usb-DHZJ-240229-XH_Integrated_Webcam_HD-video-index0
-    width: 320
-    height: 240
+    width: 640
+    height: 480
     fps: 15
     auto_exposure: true
     # In-process MJPEG stream — open http://<robot-ip>:8080/ in a browser or VLC.
@@ -67,42 +67,11 @@ hal:
 
 # ── Perception ────────────────────────────────────────────────────
 perception:
-  vision:
-    input_size: [224, 224]     # fed into feature extractor
-    feature_dim: 128           # MobileNetV2 bottleneck output
-    device: cpu                # cpu | cuda (RPi → cpu)
-
-  depth:
-    model: midas_small         # midas_small | midas_v21 | none
-    output_size: [16, 16]      # downsampled depth map fed to RL
-    # If model=none, a simple stereo-disparity proxy is used
-    normalize: true
-    # Limit Torch CPU threads to keep streaming responsive
-    torch_threads: 2
-    torch_interop_threads: 1
-
-  obstacle:
-    confidence_threshold: 0.50
-    nms_iou_threshold: 0.45
-    min_pixel_area: 500        # ignore tiny detections
-    danger_zone_px: 80         # bottom strip height = "floor boundary"
-
-  floor:
-    method: edge_color         # edge_color | homography
-    hsv_floor_low:  [0,  0,  80]
-    hsv_floor_high: [180, 50, 255]
-    boundary_rows: 0.55        # fractions of frame height
-
-  objects:
-    model: yolov5n             # yolov5n | yolov5s | mobilenet_ssd
-    weights: models/yolov5n.pt
-    classes_of_interest: [0, 56, 57, 58, 59, 60, 62, 63, 64, 67]
-    # 0=person, 56-67=furniture/household (COCO)
-
-  sensor_fusion:
-    us_weight: 0.60
-    cam_weight: 0.40
-    history_window: 5          # frames retained for temporal smoothing
+  midas_model_path: models/midas_small.onnx
+  depth_out_width:  32         # depth map columns fed to RL state
+  depth_out_height: 32         # depth map rows fed to RL state
+  depth_mask_rows:  0          # bottom N rows of 32×32 map to zero (body mask)
+  num_threads:      4          # ONNX intra-op CPU threads
 
 # ── Mapping ───────────────────────────────────────────────────────
 mapping:
