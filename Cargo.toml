@@ -55,3 +55,6 @@ sim_vision   = { path = "sim_vision" }
 # ML inference
 ort     = { version = "2.0.0-rc.12", features = ["download-binaries"] }
 ndarray = "0.15"
+
+# Image encode/decode (JPEG for MJPEG stream, PNG for calibration frames)
+image   = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

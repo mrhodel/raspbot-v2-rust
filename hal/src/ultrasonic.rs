@@ -97,7 +97,7 @@ impl YahboomUltrasonic {
 
     /// Enable sensor, wait for settle, take N readings, disable, return median.
     fn read_median_cm(&self) -> Result<f32> {
-        let mut i2c = self.i2c.lock().unwrap();
+        let i2c = self.i2c.lock().unwrap();
 
         // Enable the ultrasonic sensor.
         i2c.block_write(REG_US_ENABLE, &[1])

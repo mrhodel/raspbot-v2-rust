@@ -85,17 +85,19 @@ pub struct CameraConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
-    #[serde(default = "default_freeze_reopen")]
-    pub freeze_reopen_s: f32,
     #[serde(default = "default_true")]
     pub auto_exposure: bool,
     #[serde(default = "default_stream_port")]
     pub stream_port: u16,
     #[serde(default = "default_true")]
     pub stream_enabled: bool,
+    /// Rows from the bottom of every frame that are permanently robot body.
+    /// Set to 0 until calibrated via camera_test --save-frame.
+    /// Perception layer computes mask_start_row = height - body_mask_bottom_rows.
+    #[serde(default)]
+    pub body_mask_bottom_rows: u32,
 }
 
-fn default_freeze_reopen() -> f32 { 3.0 }
 fn default_true() -> bool { true }
 fn default_stream_port() -> u16 { 8080 }
 

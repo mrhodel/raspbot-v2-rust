@@ -15,6 +15,8 @@ pub mod ultrasonic;
 
 // Re-export trait and stub types at crate root for convenience.
 pub use camera::{Camera, StubCamera};
+#[cfg(feature = "usb-camera")]
+pub use camera::V4L2Camera;
 pub use gimbal::{Gimbal, StubGimbal, YahboomGimbal};
 pub use imu::{Imu, StubImu};
 pub use motor::{MotorController, StubMotorController, YahboomMotorController};

@@ -49,20 +49,21 @@ hal:
 
   camera:
     # Raspbot V2 ships with a 1MP USB camera on the 2-DOF gimbal.
-    # The primary driver is 'usb' (OpenCV VideoCapture / V4L2).
-    # 'picamera2' is only needed if a CSI module is fitted instead.
-    driver: usb                # usb | picamera2 | simulation
-    device_index: 0            # USB video device index
-    device_path: /dev/v4l/by-id/usb-DHZJ-240229-XH_Integrated_Webcam_HD-video-index0   # Use V4L2 device path (more reliable than index)
+    driver: usb                # usb | simulation
+    device_index: 0            # fallback if device_path is empty
+    device_path: /dev/v4l/by-id/usb-DHZJ-240229-XH_Integrated_Webcam_HD-video-index0
     width: 320
     height: 240
     fps: 15
-    # Seconds of identical-looking frames before forcing a USB reopen
-    freeze_reopen_s: 3.0
     auto_exposure: true
-    # Optional MJPEG stream for remote monitoring
+    # In-process MJPEG stream — open http://<robot-ip>:8080/ in a browser or VLC.
     stream_port: 8080
     stream_enabled: true
+    # Rows from the bottom of every frame that are permanently robot body.
+    # Set to 0 until calibrated:  camera_test --save-frame /tmp/ref.png
+    # Visually count body-intrusion rows in ref.png, then update this value.
+    # Perception computes mask_start_row = height - body_mask_bottom_rows.
+    body_mask_bottom_rows: 0
 
 # ── Perception ────────────────────────────────────────────────────
 perception:

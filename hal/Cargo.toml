@@ -3,6 +3,14 @@ name = "hal"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enables the real V4L2 camera driver.  Requires libclang-dev at build time
+# (for v4l's bindgen step) and Linux V4L2 headers.
+# Build on Pi:  cargo build --release            (default = enabled)
+# Dev-machine:  cargo check --no-default-features (skips v4l)
+default   = ["usb-camera"]
+usb-camera = ["dep:v4l"]
+
 [dependencies]
 core_types  = { workspace = true }
 config      = { workspace = true }
@@ -10,4 +18,9 @@ async-trait = { workspace = true }
 anyhow      = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
+image       = { workspace = true }
 rppal       = "0.19"
+v4l         = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
