@@ -337,10 +337,15 @@ async fn main() -> anyhow::Result<()> {
     let mut rx_gray = bus.camera_frame_gray.subscribe();
     let perc_handle = tokio::spawn(async move {
         info!("Perception task started");
+        let mut last_infer = std::time::Instant::now();
+        const MAX_INFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
             match rx_gray.recv().await {
                 Ok(gray) => {
+                    let force_timer = last_infer.elapsed() >= MAX_INFER_INTERVAL;
+                    if force_timer { event_gate.force(); }
                     if event_gate.should_infer(&gray) {
+                        last_infer = std::time::Instant::now();
                         let rgb_stub = core_types::CameraFrame {
                             t_ms: gray.t_ms, width: gray.width, height: gray.height,
                             data: gray.data.iter().flat_map(|&v| [v, v, v]).collect(),
