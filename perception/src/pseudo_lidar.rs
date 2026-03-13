@@ -50,11 +50,14 @@ impl PseudoLidarExtractor {
                     .min(w as f32) as usize;
                 let col_end = col_end.max(col_start + 1).min(w);
 
-                // Sample the strip: take max depth value (nearest obstacle).
-                // Masked rows (robot body) are already 0 and are skipped.
+                // Sample the strip: use the upper 60% of rows to avoid the floor,
+                // which appears in the lower portion of the depth map. Within that
+                // zone take the maximum depth value (nearest obstacle) so the
+                // lidar is conservative about obstacles at driving height.
+                let upper_rows = (usable_rows * 3 / 5).max(1).min(usable_rows);
                 let mut max_depth = 0.0_f32;
                 let mut valid_samples = 0u32;
-                for row in 0..usable_rows {
+                for row in 0..upper_rows {
                     for col in col_start..col_end {
                         let v = depth.data[row * w + col];
                         if v > 0.0 {
@@ -65,7 +68,7 @@ impl PseudoLidarExtractor {
                 }
 
                 let confidence = if valid_samples > 0 {
-                    (valid_samples as f32 / (usable_rows * (col_end - col_start)) as f32)
+                    (valid_samples as f32 / (upper_rows * (col_end - col_start)) as f32)
                         .min(1.0)
                 } else {
                     0.0
