@@ -53,6 +53,7 @@ pub struct Bus {
     pub slam_pose2d:          watch::Sender<Pose2D>,
     pub safety_state:         watch::Sender<SafetyState>,
     pub gimbal_pan_deg:       watch::Sender<f32>,
+    pub nearest_obstacle_m:   watch::Sender<f32>,
 
     // ── SLAM events (broadcast) ───────────────────────────────────────────
     pub slam_keyframe_event:  broadcast::Sender<KeyframeEvent>,
@@ -121,6 +122,7 @@ impl Bus {
         let (tx_safety,        rx_safety)       = watch::channel(SafetyState::default());
         let (tx_exec_state,    rx_exec_state)   = watch::channel(ExecutiveState::default());
         let (tx_gimbal_pan,    _)               = watch::channel(0.0_f32);
+        let (tx_nearest,       _)               = watch::channel(f32::MAX);
 
         let (tx_decision,  rx_decision)  = mpsc::channel(cap);
         let (tx_path,      rx_path)      = mpsc::channel(cap);
@@ -142,6 +144,7 @@ impl Bus {
             slam_pose2d:         tx_pose2d,
             safety_state:        tx_safety,
             gimbal_pan_deg:      tx_gimbal_pan,
+            nearest_obstacle_m:  tx_nearest,
             slam_keyframe_event: tx_keyframe,
             map_grid_delta:      tx_grid,
             map_explored_stats:  tx_explored,

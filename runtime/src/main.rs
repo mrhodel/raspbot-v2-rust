@@ -348,8 +348,12 @@ async fn main() -> anyhow::Result<()> {
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
+                                let near_m = scan.rays.iter()
+                                    .map(|r| r.range_m)
+                                    .fold(f32::MAX, f32::min);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
+                                let _ = bus_perc.nearest_obstacle_m.send(near_m);
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }
@@ -895,8 +899,12 @@ async fn run_slam_debug(
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
+                                let near_m = scan.rays.iter()
+                                    .map(|r| r.range_m)
+                                    .fold(f32::MAX, f32::min);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
+                                let _ = bus_perc.nearest_obstacle_m.send(near_m);
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }

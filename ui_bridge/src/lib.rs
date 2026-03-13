@@ -17,6 +17,7 @@
 //! - `executive/state`     — executive state machine state
 //! - `health/runtime`      — CPU / memory / timing snapshot
 //! - `sensor/ultrasonic`   — latest ultrasonic distance reading
+//! - `sensor/nearest_m`    — nearest obstacle from pseudo-lidar (camera-based, all directions)
 //!
 //! # HTTP overlay page
 //! Plain HTTP GET requests to port 9000 receive an HTML page that embeds
@@ -77,6 +78,7 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       <h3>ROBOT TELEMETRY</h3>
       <div><span class="label">MODE </span><span id="mode" class="val">--</span></div>
       <div><span class="label">US   </span><span id="us" class="val">--</span> cm</div>
+      <div><span class="label">VIS  </span><span id="vis" class="val">--</span> cm</div>
       <div><span class="label">X    </span><span id="x" class="val">--</span> m</div>
       <div><span class="label">Y    </span><span id="y" class="val">--</span> m</div>
       <div><span class="label">HDG  </span><span id="hdg" class="val">--</span>&deg;</div>
@@ -103,6 +105,14 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       return '--';
     }
 
+    // Color-code a distance display: red <30 cm, yellow <60 cm, green otherwise.
+    function distClass(cm) {
+      if (cm == null || isNaN(cm)) return 'val';
+      if (cm < 30) return 'err';
+      if (cm < 60) return 'warn';
+      return 'val';
+    }
+
     function connect() {
       const ws = new WebSocket('ws://' + host + ':9000/');
       const wsSt = document.getElementById('ws_st');
@@ -122,9 +132,20 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
             case 'executive/state':
               document.getElementById('mode').textContent = stateLabel(msg.data);
               break;
-            case 'sensor/ultrasonic':
-              document.getElementById('us').textContent = fmt(msg.data && msg.data.range_cm, 1);
+            case 'sensor/ultrasonic': {
+              const cm = msg.data && msg.data.range_cm;
+              const el = document.getElementById('us');
+              el.textContent = fmt(cm, 1);
+              el.className = distClass(cm);
               break;
+            }
+            case 'sensor/nearest_m': {
+              const cm = msg.data != null ? msg.data * 100 : null;
+              const el = document.getElementById('vis');
+              el.textContent = fmt(cm, 0);
+              el.className = distClass(cm);
+              break;
+            }
             case 'slam/pose2d':
               document.getElementById('x').textContent    = fmt(msg.data && msg.data.x_m, 2);
               document.getElementById('y').textContent    = fmt(msg.data && msg.data.y_m, 2);
@@ -166,6 +187,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
         let rx_pose = bus_pose.slam_pose2d.subscribe();
         let rx_exec = bus_pose.executive_state.subscribe();
         let rx_pan  = bus_pose.gimbal_pan_deg.subscribe();
+        let rx_near = bus_pose.nearest_obstacle_m.subscribe();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -173,6 +195,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
             let pose  = *rx_pose.borrow();
             let state = rx_exec.borrow().clone();
             let pan   = *rx_pan.borrow();
+            let near  = *rx_near.borrow();
             if let Ok(msg) = serde_json::to_string(&serde_json::json!({
                 "topic": "slam/pose2d",
                 "t_ms":  pose.t_ms,
@@ -191,6 +214,15 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                 "data":  pan,
             })) {
                 let _ = fanout_pose.send(Arc::new(msg));
+            }
+            // Only publish when we have a real reading (f32::MAX = no inference yet).
+            if near < f32::MAX {
+                if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                    "topic": "sensor/nearest_m",
+                    "data":  near,
+                })) {
+                    let _ = fanout_pose.send(Arc::new(msg));
+                }
             }
         }
     });
