@@ -80,12 +80,20 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       <div><span class="label">X    </span><span id="x" class="val">--</span> m</div>
       <div><span class="label">Y    </span><span id="y" class="val">--</span> m</div>
       <div><span class="label">HDG  </span><span id="hdg" class="val">--</span>&deg;</div>
+      <div><span class="label">CONF </span><span id="conf" class="val">--</span></div>
+      <div><span class="label">PAN  </span><span id="pan" class="val">--</span>&deg;</div>
       <div><span class="label">WS   </span><span id="ws_st" class="warn">connecting</span></div>
     </div>
   </div>
   <script>
     const host = window.location.hostname;
-    document.getElementById('stream').src = 'http://' + host + ':8080/';
+
+    function startStream() {
+      const img = document.getElementById('stream');
+      img.src = 'http://' + host + ':8080/';
+      img.onerror = () => { img.src = ''; setTimeout(startStream, 2000); };
+    }
+    startStream();
 
     function fmt(v, d) { return (v != null && v.toFixed) ? v.toFixed(d) : '--'; }
 
@@ -100,7 +108,7 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       const wsSt = document.getElementById('ws_st');
       wsSt.className = 'warn'; wsSt.textContent = 'connecting';
 
-      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; };
+      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; startStream(); };
       ws.onclose = () => {
         wsSt.className = 'err'; wsSt.textContent = 'reconnecting';
         setTimeout(connect, 2000);
@@ -118,10 +126,14 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
               document.getElementById('us').textContent = fmt(msg.data && msg.data.range_cm, 1);
               break;
             case 'slam/pose2d':
-              document.getElementById('x').textContent   = fmt(msg.data && msg.data.x, 2);
-              document.getElementById('y').textContent   = fmt(msg.data && msg.data.y, 2);
+              document.getElementById('x').textContent    = fmt(msg.data && msg.data.x_m, 2);
+              document.getElementById('y').textContent    = fmt(msg.data && msg.data.y_m, 2);
+              document.getElementById('conf').textContent = fmt(msg.data && msg.data.confidence, 2);
               const rad = msg.data && msg.data.theta_rad;
-              document.getElementById('hdg').textContent = rad != null ? (rad * 180 / Math.PI).toFixed(1) : '--';
+              document.getElementById('hdg').textContent  = rad != null ? (rad * 180 / Math.PI).toFixed(1) : '--';
+              break;
+            case 'gimbal/pan':
+              document.getElementById('pan').textContent = fmt(msg.data, 1);
               break;
           }
         } catch(e) {}
@@ -142,11 +154,51 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     let (fanout_tx, _) = broadcast::channel::<Arc<String>>(FANOUT_CAP);
     let fanout_tx = Arc::new(fanout_tx);
 
+    // ── Pose ticker: sample slam_pose2d watch at 10 Hz and fan out ───────
+    // Keeping the watch poll in a dedicated task avoids a known footgun
+    // where `watch::changed()` in a multi-arm `select!` fires only once:
+    // when another arm wins, the `changed()` future is dropped without
+    // calling `borrow_and_update()`, and subsequent polls can silently
+    // stall depending on tokio scheduler ordering.
+    let fanout_pose = Arc::clone(&fanout_tx);
+    let bus_pose    = Arc::clone(&bus);
+    tokio::spawn(async move {
+        let rx_pose = bus_pose.slam_pose2d.subscribe();
+        let rx_exec = bus_pose.executive_state.subscribe();
+        let rx_pan  = bus_pose.gimbal_pan_deg.subscribe();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let pose  = *rx_pose.borrow();
+            let state = rx_exec.borrow().clone();
+            let pan   = *rx_pan.borrow();
+            if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                "topic": "slam/pose2d",
+                "t_ms":  pose.t_ms,
+                "data":  pose,
+            })) {
+                let _ = fanout_pose.send(Arc::new(msg));
+            }
+            if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                "topic": "executive/state",
+                "data":  state,
+            })) {
+                let _ = fanout_pose.send(Arc::new(msg));
+            }
+            if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                "topic": "gimbal/pan",
+                "data":  pan,
+            })) {
+                let _ = fanout_pose.send(Arc::new(msg));
+            }
+        }
+    });
+
     // ── Aggregator task: subscribe to bus, serialize, fan out ────────────
     let fanout_agg = Arc::clone(&fanout_tx);
     let bus_agg = Arc::clone(&bus);
     tokio::spawn(async move {
-        let mut rx_pose     = bus_agg.slam_pose2d.subscribe();
         let mut rx_grid     = bus_agg.map_grid_delta.subscribe();
         let mut rx_frontier = bus_agg.map_frontiers.subscribe();
         let mut rx_exec     = bus_agg.executive_state.subscribe();
@@ -160,16 +212,6 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                     if let Ok(msg) = serde_json::to_string(&serde_json::json!({
                         "topic": "executive/state",
                         "data":  state,
-                    })) {
-                        let _ = fanout_agg.send(Arc::new(msg));
-                    }
-                }
-                Ok(()) = rx_pose.changed() => {
-                    let pose = *rx_pose.borrow_and_update();
-                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
-                        "topic": "slam/pose2d",
-                        "t_ms":  pose.t_ms,
-                        "data":  pose,
                     })) {
                         let _ = fanout_agg.send(Arc::new(msg));
                     }

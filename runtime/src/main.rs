@@ -310,21 +310,42 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // ── Perception + SLAM task ────────────────────────────────────────────────
+    // ── SLAM task (IMU-only, runs independently of depth inference) ──────────
+    // Kept separate so that the 147ms depth inference does not starve IMU
+    // integration: heading would freeze during every inference frame if both
+    // were in the same select! loop.
+    let bus_slam   = Arc::clone(&bus);
+    let mut rx_imu = bus.imu_raw.subscribe();
+    let slam_handle = tokio::spawn(async move {
+        info!("SLAM task started (IMU dead-reckoning)");
+        loop {
+            match rx_imu.recv().await {
+                Ok(sample) => {
+                    let pose = slam.update(&sample);
+                    let _ = bus_slam.slam_pose2d.send(pose);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("SLAM: IMU lagged {n} samples");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // ── Perception task (camera → depth → pseudo-lidar) ───────────────────────
     let bus_perc   = Arc::clone(&bus);
     let mut rx_gray = bus.camera_frame_gray.subscribe();
-    let mut rx_imu  = bus.imu_raw.subscribe();
     let perc_handle = tokio::spawn(async move {
-        info!("Perception/SLAM task started");
+        info!("Perception task started");
         loop {
-            tokio::select! {
-                Ok(gray) = rx_gray.recv() => {
+            match rx_gray.recv().await {
+                Ok(gray) => {
                     if event_gate.should_infer(&gray) {
                         let rgb_stub = core_types::CameraFrame {
                             t_ms: gray.t_ms, width: gray.width, height: gray.height,
                             data: gray.data.iter().flat_map(|&v| [v, v, v]).collect(),
                         };
-                        match depth_infer.infer(&rgb_stub) {
+                        match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
@@ -334,11 +355,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                Ok(sample) = rx_imu.recv() => {
-                    let pose = slam.update(&sample);
-                    let _ = bus_perc.slam_pose2d.send(pose);
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Perception: camera lagged {n} frames");
                 }
-                else => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -573,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
     // half of the depth map (simple left/right free-space heuristic).
     let mut gimbal = gimbal;
     let mut rx_depth_g = bus.vision_depth.subscribe();
+    let bus_gimbal = Arc::clone(&bus);
     let gimbal_handle = tokio::spawn(async move {
         info!("Gimbal task started");
         if let Err(e) = gimbal.set_angles(0.0, 0.0).await {
@@ -605,6 +626,7 @@ async fn main() -> anyhow::Result<()> {
                     warn!("Gimbal pan error: {e}");
                 }
             }
+            let _ = bus_gimbal.gimbal_pan_deg.send(gimbal.angles().0);
         }
     });
 
@@ -639,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
     drop(cam_handle);
     drop(imu_handle);
     drop(us_handle);
+    drop(slam_handle);
     drop(perc_handle);
     drop(map_handle);
     drop(safety_handle);
@@ -839,20 +862,37 @@ async fn run_slam_debug(
         }
     });
 
-    // Perception + SLAM task
-    let bus_perc   = Arc::clone(&bus);
-    let mut rx_gray = bus.camera_frame_gray.subscribe();
+    // SLAM task
+    let bus_slam    = Arc::clone(&bus);
     let mut rx_imu  = bus.imu_raw.subscribe();
+    let slam_handle = tokio::spawn(async move {
+        loop {
+            match rx_imu.recv().await {
+                Ok(sample) => {
+                    let pose = slam.update(&sample);
+                    let _ = bus_slam.slam_pose2d.send(pose);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("SLAM: IMU lagged {n} samples");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Perception task
+    let bus_perc    = Arc::clone(&bus);
+    let mut rx_gray = bus.camera_frame_gray.subscribe();
     let perc_handle = tokio::spawn(async move {
         loop {
-            tokio::select! {
-                Ok(gray) = rx_gray.recv() => {
+            match rx_gray.recv().await {
+                Ok(gray) => {
                     if event_gate.should_infer(&gray) {
                         let rgb_stub = core_types::CameraFrame {
                             t_ms: gray.t_ms, width: gray.width, height: gray.height,
                             data: gray.data.iter().flat_map(|&v| [v, v, v]).collect(),
                         };
-                        match depth_infer.infer(&rgb_stub) {
+                        match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
@@ -862,11 +902,10 @@ async fn run_slam_debug(
                         }
                     }
                 }
-                Ok(sample) = rx_imu.recv() => {
-                    let pose = slam.update(&sample);
-                    let _ = bus_perc.slam_pose2d.send(pose);
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Perception: camera lagged {n} frames");
                 }
-                else => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -899,6 +938,7 @@ async fn run_slam_debug(
 
     drop(cam_handle);
     drop(imu_handle);
+    drop(slam_handle);
     drop(perc_handle);
     drop(telem_handle);
 
