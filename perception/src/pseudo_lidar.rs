@@ -15,9 +15,12 @@ use core_types::{DepthMap, LidarRay, PseudoLidarScan};
 /// Horizontal field of view of the camera in radians.
 const HFOV_RAD: f32 = 110.0_f32 * std::f32::consts::PI / 180.0;
 
-/// MiDaS outputs inverse depth (1 = closest). This scale converts the
-/// normalised value to metres. Calibrate against real measurements in Phase 6.
-const DEPTH_SCALE_M: f32 = 3.0; // 1.0 normalised → 3 m max range
+// MiDaS outputs relative inverse depth normalised to [0, 1]:
+//   1.0 = closest point in frame, 0.0 = farthest.
+// The mapping to range_m is linear: range = max_range × (1 − depth).
+// This is a heuristic — MiDaS has no metric scale — but it gives the
+// right direction: high depth → small range (close obstacle).
+// Calibrate max_range_m against real measurements in Phase 8.
 
 pub struct PseudoLidarExtractor {
     num_rays: usize,
@@ -69,12 +72,8 @@ impl PseudoLidarExtractor {
                 };
 
                 // Convert inverse-depth [0,1] → range [0, max_range_m].
-                // Inverse: high value = close; range = scale / depth_value.
-                let range_m = if max_depth > 0.0 {
-                    (DEPTH_SCALE_M / max_depth).min(self.max_range_m)
-                } else {
-                    self.max_range_m // no obstacle detected → report max range
-                };
+                // depth = 1.0 means closest, depth = 0.0 means farthest.
+                let range_m = self.max_range_m * (1.0 - max_depth);
 
                 LidarRay { angle_rad, range_m, confidence }
             })
