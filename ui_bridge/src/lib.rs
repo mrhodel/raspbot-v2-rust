@@ -19,9 +19,11 @@
 //! - `sensor/ultrasonic`   — latest ultrasonic distance reading
 //! - `sensor/nearest_m`    — nearest obstacle from pseudo-lidar (camera-based, all directions)
 //!
-//! # HTTP overlay page
-//! Plain HTTP GET requests to port 9000 receive an HTML page that embeds
-//! the MJPEG stream (port 8080) and overlays telemetry from the WebSocket.
+//! - `vision/pseudo_lidar`  — current lidar scan (rays with angle + range)
+//!
+//! # HTTP pages
+//! - `GET /`    — video overlay: MJPEG stream + telemetry HUD
+//! - `GET /map` — 2-D map canvas: occupancy grid, robot, frontiers, lidar rays
 //!
 //! # Default port
 //! 9000 (configurable via `UiBridgeConfig`).
@@ -51,6 +53,269 @@ impl Default for UiBridgeConfig {
 
 /// Internal fan-out channel capacity.
 const FANOUT_CAP: usize = 64;
+
+/// 2-D map canvas page served at `/map`.
+const MAP_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Robot Map</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; }
+    body { background: #0d0d0d; display: flex; height: 100vh; overflow: hidden; font-family: monospace; }
+    #map-wrap { flex: 1; overflow: auto; position: relative; padding: 8px; }
+    #map-bg, #map-fg { position: absolute; top: 8px; left: 8px; image-rendering: pixelated; }
+    #sidebar { width: 170px; background: #111; padding: 8px 12px; font-size: 13px; line-height: 2; flex-shrink: 0; border-left: 1px solid #333; overflow-y: auto; }
+    .label { color: #8a8; }
+    .val  { color: #0f0; }
+    .warn { color: #fa0; }
+    .err  { color: #f44; }
+    h3 { margin: 0 0 4px; color: #fff; font-size: 11px; letter-spacing: 2px; border-bottom: 1px solid #444; padding-bottom: 4px; }
+    #legend { margin-top: 12px; font-size: 11px; }
+    .ls { display:inline-block; width:12px; height:12px; margin-right:4px; vertical-align:middle; }
+  </style>
+</head>
+<body>
+  <div id="map-wrap">
+    <canvas id="map-bg"></canvas>
+    <canvas id="map-fg"></canvas>
+  </div>
+  <div id="sidebar">
+    <h3>TELEMETRY</h3>
+    <div><span class="label">MODE  </span><span id="mode" class="val">--</span></div>
+    <div><span class="label">US    </span><span id="us" class="val">--</span> cm</div>
+    <div><span class="label">VIS   </span><span id="vis" class="val">--</span> cm</div>
+    <div><span class="label">X     </span><span id="x" class="val">--</span> m</div>
+    <div><span class="label">Y     </span><span id="y" class="val">--</span> m</div>
+    <div><span class="label">HDG   </span><span id="hdg" class="val">--</span>&deg;</div>
+    <div><span class="label">CONF  </span><span id="conf" class="val">--</span></div>
+    <div><span class="label">PAN   </span><span id="pan" class="val">--</span>&deg;</div>
+    <div><span class="label">CELLS </span><span id="cells" class="val">0</span></div>
+    <div><span class="label">WS    </span><span id="ws_st" class="warn">connecting</span></div>
+    <div id="legend">
+      <h3 style="margin-top:8px">LEGEND</h3>
+      <div><span class="ls" style="background:#0f2010"></span>free</div>
+      <div><span class="ls" style="background:#1a1a1a"></span>unknown</div>
+      <div><span class="ls" style="background:#b0b0b0"></span>obstacle</div>
+      <div><span class="ls" style="background:#00cccc"></span>frontier</div>
+      <div><span class="ls" style="background:#00ff44"></span>robot</div>
+    </div>
+  </div>
+  <script>
+    const PX   = 4;      // canvas pixels per grid cell
+    const RES  = 0.05;   // metres per cell
+    const host = window.location.hostname;
+
+    // ── Map state ──────────────────────────────────────────────────────────
+    // Cells store absolute log-odds values from GridDelta.
+    const grid = new Map();   // "cx,cy" → log_odds (absolute)
+    let minCX = null, maxCX = null, minCY = null, maxCY = null;
+
+    // ── Overlay state ──────────────────────────────────────────────────────
+    let pose = null;
+    let frontiers = [];
+    let lidarRays = null;
+    let flashFrames = 0;
+
+    // ── Canvas elements ────────────────────────────────────────────────────
+    const bgC = document.getElementById('map-bg');
+    const fgC = document.getElementById('map-fg');
+    const bgX = bgC.getContext('2d');
+    const fgX = fgC.getContext('2d');
+
+    // Initialise with tiny placeholder so canvas exists.
+    bgC.width = bgC.height = fgC.width = fgC.height = 4;
+
+    // ── Coordinate helpers ─────────────────────────────────────────────────
+    // World y increases up; canvas y increases down — flip Y so the map
+    // renders with physical orientation (north = up).
+    function cellPx(cx, cy) {
+      return [(cx - minCX) * PX, (maxCY - cy) * PX];
+    }
+    function worldPx(xm, ym) {
+      return cellPx(xm / RES, ym / RES);
+    }
+
+    // ── Cell colour ────────────────────────────────────────────────────────
+    function cellColor(lo) {
+      if (lo >  1.5) return '#c0c0c0';  // definitely occupied
+      if (lo >  0.5) return '#707070';  // probably occupied
+      if (lo < -0.5) return '#0f2010';  // free
+      return '#2a2a2a';                 // uncertain
+    }
+
+    // ── Draw a single cell onto the bg canvas ─────────────────────────────
+    function drawCell(cx, cy, lo) {
+      const [px, py] = cellPx(cx, cy);
+      bgX.fillStyle = cellColor(lo);
+      bgX.fillRect(px, py, PX, PX);
+    }
+
+    // ── Full bg redraw (after canvas resize) ──────────────────────────────
+    function redrawBg() {
+      bgX.fillStyle = '#1a1a1a';
+      bgX.fillRect(0, 0, bgC.width, bgC.height);
+      for (const [key, lo] of grid) {
+        const c = key.split(',');
+        drawCell(+c[0], +c[1], lo);
+      }
+    }
+
+    // ── Apply a GridDelta message ──────────────────────────────────────────
+    function applyDelta(cells) {
+      if (!cells || cells.length === 0) return;
+
+      let boundsChanged = false;
+      for (const [cx, cy, lo] of cells) {
+        grid.set(cx + ',' + cy, lo);
+        if (minCX === null) {
+          minCX = maxCX = cx; minCY = maxCY = cy; boundsChanged = true;
+        } else {
+          if (cx < minCX) { minCX = cx; boundsChanged = true; }
+          if (cx > maxCX) { maxCX = cx; boundsChanged = true; }
+          if (cy < minCY) { minCY = cy; boundsChanged = true; }
+          if (cy > maxCY) { maxCY = cy; boundsChanged = true; }
+        }
+      }
+
+      const w = (maxCX - minCX + 2) * PX;
+      const h = (maxCY - minCY + 2) * PX;
+
+      if (boundsChanged || bgC.width !== w || bgC.height !== h) {
+        bgC.width = bgC.height = fgC.width = fgC.height = 1; // force clear
+        bgC.width  = fgC.width  = w;
+        bgC.height = fgC.height = h;
+        redrawBg();
+      } else {
+        for (const [cx, cy, lo] of cells) drawCell(cx, cy, lo);
+      }
+
+      document.getElementById('cells').textContent = grid.size;
+    }
+
+    // ── Overlay (robot + frontiers + lidar rays) ───────────────────────────
+    function drawOverlay() {
+      requestAnimationFrame(drawOverlay);
+      fgX.clearRect(0, 0, fgC.width, fgC.height);
+      if (!pose || minCX === null) return;
+
+      const [rx, ry] = worldPx(pose.x_m, pose.y_m);
+      const theta = pose.theta_rad;
+
+      // Lidar rays (faint green).
+      if (lidarRays) {
+        fgX.strokeStyle = 'rgba(0,255,0,0.12)';
+        fgX.lineWidth = 1;
+        for (const ray of lidarRays) {
+          const wa = theta + ray.angle_rad;
+          const rp = ray.range_m / RES * PX;
+          fgX.beginPath();
+          fgX.moveTo(rx, ry);
+          fgX.lineTo(rx + Math.cos(wa) * rp, ry - Math.sin(wa) * rp);
+          fgX.stroke();
+        }
+      }
+
+      // Frontiers (cyan circles, sized by frontier area).
+      for (const f of frontiers) {
+        const [fx, fy] = worldPx(f.centroid_x_m, f.centroid_y_m);
+        const r = Math.max(3, Math.sqrt(f.size_cells) * PX * 0.3);
+        fgX.strokeStyle = '#00cccc';
+        fgX.lineWidth = 2;
+        fgX.beginPath();
+        fgX.arc(fx, fy, r, 0, Math.PI * 2);
+        fgX.stroke();
+      }
+
+      // Robot triangle.
+      const sz = 8;
+      fgX.save();
+      fgX.translate(rx, ry);
+      fgX.rotate(-theta);   // negate: Y is flipped
+      fgX.fillStyle = flashFrames > 0 ? '#ff4444' : '#00ff44';
+      if (flashFrames > 0) flashFrames--;
+      fgX.beginPath();
+      fgX.moveTo( sz,  0);
+      fgX.lineTo(-sz, -sz * 0.6);
+      fgX.lineTo(-sz,  sz * 0.6);
+      fgX.closePath();
+      fgX.fill();
+      fgX.restore();
+    }
+
+    // ── Telemetry helpers ──────────────────────────────────────────────────
+    function fmt(v, d) { return (v != null && v.toFixed) ? v.toFixed(d) : '--'; }
+    function stateLabel(d) {
+      if (typeof d === 'string') return d;
+      if (typeof d === 'object' && d !== null) return Object.keys(d)[0];
+      return '--';
+    }
+    function distClass(cm) {
+      if (cm == null || isNaN(cm)) return 'val';
+      return cm < 30 ? 'err' : cm < 60 ? 'warn' : 'val';
+    }
+
+    // ── WebSocket ──────────────────────────────────────────────────────────
+    function connect() {
+      const ws = new WebSocket('ws://' + host + ':9000/');
+      const wsSt = document.getElementById('ws_st');
+      wsSt.className = 'warn'; wsSt.textContent = 'connecting';
+      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; };
+      ws.onclose = () => { wsSt.className = 'err'; wsSt.textContent = 'reconnecting'; setTimeout(connect, 2000); };
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          switch (msg.topic) {
+            case 'map/grid_delta':
+              if (msg.data && msg.data.cells) applyDelta(msg.data.cells);
+              break;
+            case 'map/frontiers':
+              frontiers = msg.data || [];
+              break;
+            case 'vision/pseudo_lidar':
+              lidarRays = msg.data && msg.data.rays;
+              break;
+            case 'slam/pose2d':
+              pose = msg.data;
+              document.getElementById('x').textContent    = fmt(pose.x_m, 2);
+              document.getElementById('y').textContent    = fmt(pose.y_m, 2);
+              document.getElementById('conf').textContent = fmt(pose.confidence, 2);
+              document.getElementById('hdg').textContent  = (pose.theta_rad * 180 / Math.PI).toFixed(1);
+              break;
+            case 'executive/state': {
+              const lbl = stateLabel(msg.data);
+              document.getElementById('mode').textContent = lbl;
+              if (lbl === 'SafetyStopped') flashFrames = 30;
+              break;
+            }
+            case 'sensor/ultrasonic': {
+              const cm = msg.data && msg.data.range_cm;
+              const el = document.getElementById('us');
+              el.textContent = fmt(cm, 1); el.className = distClass(cm);
+              break;
+            }
+            case 'sensor/nearest_m': {
+              const cm = msg.data != null ? msg.data * 100 : null;
+              const el = document.getElementById('vis');
+              el.textContent = fmt(cm, 0); el.className = distClass(cm);
+              break;
+            }
+            case 'gimbal/pan':
+              document.getElementById('pan').textContent = fmt(msg.data, 1);
+              break;
+          }
+        } catch(e) {}
+      };
+    }
+
+    connect();
+    requestAnimationFrame(drawOverlay);
+  </script>
+</body>
+</html>
+"#;
 
 /// HTML overlay page served to plain HTTP clients.
 const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
@@ -236,6 +501,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
         let mut rx_exec     = bus_agg.executive_state.subscribe();
         let mut rx_health   = bus_agg.health_runtime.subscribe();
         let mut rx_us       = bus_agg.ultrasonic.subscribe();
+        let mut rx_lidar    = bus_agg.vision_pseudo_lidar.subscribe();
 
         loop {
             tokio::select! {
@@ -283,6 +549,15 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                         let _ = fanout_agg.send(Arc::new(msg));
                     }
                 }
+                Ok(scan) = rx_lidar.recv() => {
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                        "topic": "vision/pseudo_lidar",
+                        "t_ms":  scan.t_ms,
+                        "data":  *scan,
+                    })) {
+                        let _ = fanout_agg.send(Arc::new(msg));
+                    }
+                }
                 else => break,
             }
         }
@@ -309,12 +584,14 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                     // Peek at the request to distinguish WebSocket upgrade
                     // from a plain HTTP GET (browser opening the overlay page).
                     let mut peek = [0u8; 512];
-                    let is_ws = match stream.peek(&mut peek).await {
+                    let (is_ws, is_map) = match stream.peek(&mut peek).await {
                         Ok(n) => {
                             let h = std::str::from_utf8(&peek[..n]).unwrap_or("");
-                            h.contains("Upgrade: websocket") || h.contains("upgrade: websocket")
+                            let ws  = h.contains("Upgrade: websocket") || h.contains("upgrade: websocket");
+                            let map = !ws && h.starts_with("GET /map");
+                            (ws, map)
                         }
-                        Err(_) => false,
+                        Err(_) => (false, false),
                     };
 
                     if is_ws {
@@ -330,8 +607,10 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                             last_send_ok: true,
                         };
                         let _ = bus_status.ui_bridge_status.send(status);
+                    } else if is_map {
+                        tokio::spawn(serve_page(stream, MAP_HTML));
                     } else {
-                        tokio::spawn(serve_overlay(stream));
+                        tokio::spawn(serve_page(stream, OVERLAY_HTML));
                     }
                 }
                 Err(e) => warn!("UI bridge accept error: {e}"),
@@ -342,18 +621,19 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     Ok(())
 }
 
-/// Serve the HTML overlay page to a plain HTTP client.
-async fn serve_overlay(mut stream: TcpStream) {
-    let body = OVERLAY_HTML.as_bytes();
+/// Serve an HTML page to a plain HTTP client.
+///
+/// Flushes and half-closes the write side so the OS sends FIN instead of RST
+/// (without this the kernel may reset the connection before all bytes leave
+/// the send buffer, especially when there is unread request data pending).
+async fn serve_page(mut stream: TcpStream, html: &'static str) {
+    let body = html.as_bytes();
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes()).await;
     let _ = stream.write_all(body).await;
-    // Flush and half-close the write side so the OS sends FIN instead of RST.
-    // Without this the kernel may reset the connection before all bytes leave
-    // the send buffer (especially when there is unread request data pending).
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
 }
