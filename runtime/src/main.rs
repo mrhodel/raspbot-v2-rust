@@ -578,13 +578,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 // Watchdog: no command for MOTOR_WATCHDOG_MS → zero all motors.
+                // Uses send_command (not emergency_stop) — this is normal idle
+                // keepalive behaviour, not a safety event.
                 // Log only on first occurrence per idle stretch to avoid spam.
                 () = tokio::time::sleep(watchdog) => {
                     if !watchdog_logged {
                         warn!("Motor watchdog: no command for {MOTOR_WATCHDOG_MS}ms — zeroing motors");
                         watchdog_logged = true;
                     }
-                    if let Err(e) = motor.emergency_stop().await {
+                    if let Err(e) = motor.send_command(MotorCommand::stop(0)).await {
                         error!("Motor watchdog stop failed: {e}");
                     }
                 }
