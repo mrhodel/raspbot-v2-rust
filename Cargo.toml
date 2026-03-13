@@ -41,7 +41,7 @@ executive    = { path = "executive" }
 ui_bridge    = { path = "ui_bridge" }
 config       = { path = "config" }
 telemetry    = { path = "telemetry" }
-hal          = { path = "hal" }
+hal          = { path = "hal", default-features = false }
 perception   = { path = "perception" }
 micro_slam   = { path = "micro_slam" }
 mapping      = { path = "mapping" }

@@ -1,4 +1,4 @@
-//! Read-only WebSocket visualization bridge.
+//! Read-only WebSocket visualization bridge with HTTP overlay page.
 //!
 //! Subscribes to key bus topics and fans out JSON-serialized snapshots to
 //! all connected browser clients. The bridge is entirely read-only — clients
@@ -16,6 +16,11 @@
 //! - `map/frontiers`       — current frontier list
 //! - `executive/state`     — executive state machine state
 //! - `health/runtime`      — CPU / memory / timing snapshot
+//! - `sensor/ultrasonic`   — latest ultrasonic distance reading
+//!
+//! # HTTP overlay page
+//! Plain HTTP GET requests to port 9000 receive an HTML page that embeds
+//! the MJPEG stream (port 8080) and overlays telemetry from the WebSocket.
 //!
 //! # Default port
 //! 9000 (configurable via `UiBridgeConfig`).
@@ -25,7 +30,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use core_types::BridgeStatus;
 use futures_util::SinkExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -45,6 +51,88 @@ impl Default for UiBridgeConfig {
 /// Internal fan-out channel capacity.
 const FANOUT_CAP: usize = 64;
 
+/// HTML overlay page served to plain HTTP clients.
+const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Robot View</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #111; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; min-height: 100vh; font-family: monospace; }
+    #container { position: relative; display: inline-block; margin-top: 8px; }
+    #stream { display: block; max-width: 100%; border: 1px solid #333; }
+    #overlay { position: absolute; top: 8px; left: 8px; background: rgba(0,0,0,0.65); color: #0f0; padding: 8px 12px; font-size: 14px; line-height: 1.8; border-radius: 4px; min-width: 200px; }
+    .label { color: #8a8; }
+    .val { color: #0f0; }
+    .warn { color: #fa0; }
+    .err  { color: #f44; }
+    h3 { margin: 0 0 4px 0; color: #fff; font-size: 12px; letter-spacing: 2px; border-bottom: 1px solid #444; padding-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <img id="stream" src="" alt="MJPEG stream loading...">
+    <div id="overlay">
+      <h3>ROBOT TELEMETRY</h3>
+      <div><span class="label">MODE </span><span id="mode" class="val">--</span></div>
+      <div><span class="label">US   </span><span id="us" class="val">--</span> cm</div>
+      <div><span class="label">X    </span><span id="x" class="val">--</span> m</div>
+      <div><span class="label">Y    </span><span id="y" class="val">--</span> m</div>
+      <div><span class="label">HDG  </span><span id="hdg" class="val">--</span>&deg;</div>
+      <div><span class="label">WS   </span><span id="ws_st" class="warn">connecting</span></div>
+    </div>
+  </div>
+  <script>
+    const host = window.location.hostname;
+    document.getElementById('stream').src = 'http://' + host + ':8080/';
+
+    function fmt(v, d) { return (v != null && v.toFixed) ? v.toFixed(d) : '--'; }
+
+    function stateLabel(data) {
+      if (typeof data === 'string') return data;
+      if (typeof data === 'object' && data !== null) return Object.keys(data)[0];
+      return '--';
+    }
+
+    function connect() {
+      const ws = new WebSocket('ws://' + host + ':9000/');
+      const wsSt = document.getElementById('ws_st');
+      wsSt.className = 'warn'; wsSt.textContent = 'connecting';
+
+      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; };
+      ws.onclose = () => {
+        wsSt.className = 'err'; wsSt.textContent = 'reconnecting';
+        setTimeout(connect, 2000);
+      };
+      ws.onerror = () => ws.close();
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          switch (msg.topic) {
+            case 'executive/state':
+              document.getElementById('mode').textContent = stateLabel(msg.data);
+              break;
+            case 'sensor/ultrasonic':
+              document.getElementById('us').textContent = fmt(msg.data && msg.data.range_cm, 1);
+              break;
+            case 'slam/pose2d':
+              document.getElementById('x').textContent   = fmt(msg.data && msg.data.x, 2);
+              document.getElementById('y').textContent   = fmt(msg.data && msg.data.y, 2);
+              const rad = msg.data && msg.data.theta_rad;
+              document.getElementById('hdg').textContent = rad != null ? (rad * 180 / Math.PI).toFixed(1) : '--';
+              break;
+          }
+        } catch(e) {}
+      };
+    }
+    connect();
+  </script>
+</body>
+</html>
+"#;
+
 /// Start the UI bridge. This function spawns Tokio tasks internally and
 /// returns immediately. Call from the runtime main after building the bus.
 ///
@@ -63,6 +151,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
         let mut rx_frontier = bus_agg.map_frontiers.subscribe();
         let mut rx_exec     = bus_agg.executive_state.subscribe();
         let mut rx_health   = bus_agg.health_runtime.subscribe();
+        let mut rx_us       = bus_agg.ultrasonic.subscribe();
 
         loop {
             tokio::select! {
@@ -111,15 +200,28 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                         let _ = fanout_agg.send(Arc::new(msg));
                     }
                 }
+                Ok(reading) = rx_us.recv() => {
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                        "topic": "sensor/ultrasonic",
+                        "t_ms":  reading.t_ms,
+                        "data":  reading,
+                    })) {
+                        let _ = fanout_agg.send(Arc::new(msg));
+                    }
+                }
                 else => break,
             }
         }
     });
 
-    // ── Listener task: accept connections, spawn per-client handlers ──────
+    // ── Listener task: accept connections, route to WS or HTTP handler ────
     let addr = format!("0.0.0.0:{}", cfg.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("UI bridge WebSocket listening on ws://{addr}");
+    // SO_REUSEADDR lets us rebind immediately after a crash or fast restart.
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr.parse()?)?;
+    let listener = socket.listen(128)?;
+    info!("UI bridge listening on ws://{addr}  (overlay: http://{addr}/)");
 
     let bus_status = Arc::clone(&bus);
     let fanout_listener = Arc::clone(&fanout_tx);
@@ -130,18 +232,33 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    connected += 1;
-                    info!("UI bridge: client connected from {peer}");
-                    let rx = fanout_listener.subscribe();
-                    tokio::spawn(handle_client(stream, rx));
-
-                    let status = BridgeStatus {
-                        t_ms: 0, // runtime fills real timestamps later
-                        connected_clients: connected,
-                        bytes_sent_total: bytes_sent,
-                        last_send_ok: true,
+                    // Peek at the request to distinguish WebSocket upgrade
+                    // from a plain HTTP GET (browser opening the overlay page).
+                    let mut peek = [0u8; 512];
+                    let is_ws = match stream.peek(&mut peek).await {
+                        Ok(n) => {
+                            let h = std::str::from_utf8(&peek[..n]).unwrap_or("");
+                            h.contains("Upgrade: websocket") || h.contains("upgrade: websocket")
+                        }
+                        Err(_) => false,
                     };
-                    let _ = bus_status.ui_bridge_status.send(status);
+
+                    if is_ws {
+                        connected += 1;
+                        info!("UI bridge: WS client connected from {peer}");
+                        let rx = fanout_listener.subscribe();
+                        tokio::spawn(handle_client(stream, rx));
+
+                        let status = BridgeStatus {
+                            t_ms: 0,
+                            connected_clients: connected,
+                            bytes_sent_total: bytes_sent,
+                            last_send_ok: true,
+                        };
+                        let _ = bus_status.ui_bridge_status.send(status);
+                    } else {
+                        tokio::spawn(serve_overlay(stream));
+                    }
                 }
                 Err(e) => warn!("UI bridge accept error: {e}"),
             }
@@ -149,6 +266,22 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     });
 
     Ok(())
+}
+
+/// Serve the HTML overlay page to a plain HTTP client.
+async fn serve_overlay(mut stream: TcpStream) {
+    let body = OVERLAY_HTML.as_bytes();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes()).await;
+    let _ = stream.write_all(body).await;
+    // Flush and half-close the write side so the OS sends FIN instead of RST.
+    // Without this the kernel may reset the connection before all bytes leave
+    // the send buffer (especially when there is unread request data pending).
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
 }
 
 /// Per-client task: receive fan-out messages and forward to WebSocket.

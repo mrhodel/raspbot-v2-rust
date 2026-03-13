@@ -16,6 +16,8 @@ pub struct RobotConfig {
     pub robot: RobotParams,
     pub hal: HalConfig,
     #[serde(default)]
+    pub imu: ImuConfig,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub perception: PerceptionConfig,
@@ -102,6 +104,39 @@ pub struct CameraConfig {
 
 fn default_true() -> bool { true }
 fn default_stream_port() -> u16 { 8080 }
+
+// ── IMU ───────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImuConfig {
+    #[serde(default)]
+    pub ax_bias: f32,
+    #[serde(default)]
+    pub ay_bias: f32,
+    #[serde(default = "default_az_bias")]
+    pub az_bias: f32,  // defaults to gravity so zero-bias still yields sane accel norm
+    #[serde(default)]
+    pub gx_bias: f32,
+    #[serde(default)]
+    pub gy_bias: f32,
+    #[serde(default)]
+    pub gz_bias: f32,
+}
+
+impl Default for ImuConfig {
+    fn default() -> Self {
+        Self {
+            ax_bias: 0.0,
+            ay_bias: 0.0,
+            az_bias: default_az_bias(),
+            gx_bias: 0.0,
+            gy_bias: 0.0,
+            gz_bias: 0.0,
+        }
+    }
+}
+
+fn default_az_bias() -> f32 { 9.81 }
 
 // ── Agent ─────────────────────────────────────────────────────────────────────
 

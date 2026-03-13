@@ -42,10 +42,10 @@ impl PseudoLidarExtractor {
                 let angle_rad = HFOV_RAD * (frac - 0.5); // centred, left positive
 
                 // Column range for this ray.
-                let col_start = (frac * w as f32) as usize;
+                let col_start = ((frac * w as f32) as usize).min(w.saturating_sub(1));
                 let col_end = ((frac + 1.0 / self.num_rays as f32) * w as f32)
                     .min(w as f32) as usize;
-                let col_end = col_end.max(col_start + 1);
+                let col_end = col_end.max(col_start + 1).min(w);
 
                 // Sample the strip: take max depth value (nearest obstacle).
                 // Masked rows (robot body) are already 0 and are skipped.

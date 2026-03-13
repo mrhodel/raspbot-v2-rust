@@ -7,6 +7,13 @@ edition = "2021"
 name = "robot"
 path = "src/main.rs"
 
+# Feature flags mirror hal's hardware features.
+# Dev machines without libclang: cargo check --no-default-features
+[features]
+default     = ["usb-camera", "mpu6050"]
+usb-camera  = ["hal/usb-camera"]   # real V4L2 camera (requires libclang on build host)
+mpu6050     = ["hal/mpu6050"]      # real MPU-6050 IMU
+
 [dependencies]
 core_types         = { workspace = true }
 bus                = { workspace = true }
@@ -15,7 +22,7 @@ calibration        = { workspace = true }
 executive          = { workspace = true }
 ui_bridge          = { workspace = true }
 telemetry          = { workspace = true }
-hal                = { workspace = true }
+hal                = { workspace = true, default-features = false }
 perception         = { workspace = true }
 micro_slam         = { workspace = true }
 mapping            = { workspace = true }

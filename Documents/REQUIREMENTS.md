@@ -1,480 +1,1126 @@
-# Yahboom Raspbot V2 — Autonomous Navigation (Rust)
-### Requirements Specification — Living Document
+# Yahboom Raspbot V2 — Autonomous Indoor Exploration (Revised Architecture)
+## Requirements Specification — Version 1.6 (V5.2)
 
-| Field | Value |
-|---|---|
-| Status | **Draft — In Review** |
-| Version | 0.2 |
-| Last Updated | 2026-03-08 |
-| Authors | Mike, Claude |
+**Status:** Active — Phase 17 (sim-to-real tuning) in progress
+**Last Updated:** 2026-03-12
+**Authors:** Mike, AI Assistant
 
 ---
 
-## Table of Contents
-1. [Project Overview](#1-project-overview)
-2. [Hardware Specification](#2-hardware-specification)
-3. [System Architecture](#3-system-architecture)
-4. [Simulation Design](#4-simulation-design)
-5. [Perception Pipeline](#5-perception-pipeline)
-6. [RL Design — Action Space, State & Reward](#6-rl-design)
-7. [Navigation](#7-navigation)
-8. [Operational Modes](#8-operational-modes)
-9. [Implementation Phases](#9-implementation-phases)
-10. [Decisions Log](#10-decisions-log)
-11. [Open Questions](#11-open-questions)
-12. [Change Log](#12-change-log)
+# 1. Project Overview
+
+Develop an autonomous indoor exploration robot based on the Yahboom Raspbot V2 and Raspberry Pi 5.
+
+The robot will:
+
+- explore unknown indoor environments
+- avoid obstacles
+- build and maintain a 2D occupancy map
+- estimate pose indoors without wheel encoders
+- select exploration targets autonomously
+- navigate to targets using classical planning
+- support replayable telemetry for debugging and offline evaluation
+
+A hybrid architecture is used:
+
+- **Learning component:** reinforcement learning selects exploration targets
+- **Deterministic robotics:** perception, localization, mapping, planning, control, calibration, executive behavior management, safety, and human-observable visualization
+
+This architecture maximizes reliability while maintaining adaptive behavior.
 
 ---
 
-## 1. Project Overview
+# 2. Key Design Principles
 
-Build a fully autonomous indoor navigation system for the Yahboom Raspbot V2 robot car, implemented in Rust. The robot must navigate around a home or garage environment using its gimbal-mounted camera as the primary sensor. The ultrasonic sensor is used solely as a hardware safety interlock.
-
-**Primary goal:** Explore and navigate unknown indoor spaces without collisions, using vision-derived depth as the main obstacle sensor.
-
-**Non-goals (current scope):**
-- Object identification or semantic labeling
-- Multi-robot coordination
-- Outdoor navigation
-- SLAM with loop closure
+1. **Classical control for motion**
+2. **Learning only for exploration strategy**
+3. **Robot must work with classical frontier heuristics before RL**
+4. **Vision converted to pseudo-lidar for mapping**
+5. **Micro-SLAM for pose estimation without encoders**
+6. **Event-driven perception to reduce compute**
+7. **Time-synchronized telemetry for debugging**
+8. **Simulation-first development**
+9. **Hardware-safe failover layers**
+10. **Message-passing architecture to reduce coupling**
+11. **Confidence-aware operation under degraded sensing**
+12. **Calibration is a first-class subsystem, not an afterthought**
+13. **A central executive owns behavior transitions**
+14. **Topological exploration quality matters more than precise metric accuracy in v1**
+15. **Live human-observable visualization should be available during debug and bring-up**
 
 ---
 
-## 2. Hardware Specification
+# 3. Hardware Specification
 
-### 2.1 Platform
+## 3.1 Platform
+
 | Parameter | Value |
 |---|---|
-| Robot model | Yahboom Raspbot V2 |
-| Compute | Raspberry Pi 5, 16 GB RAM |
-| Drive type | Mecanum (4-wheel, holonomic) |
-| Motor duty-cycle range | 20–80 (below 20 = stall) |
-| Max duty-cycle | 80 |
-| Robot body length | ~25 cm |
-| Camera mount height | ~10 cm above ground (measured with robot on test stand) |
+| Robot | Yahboom Raspbot V2 |
+| Compute | Raspberry Pi 5 (16 GB) |
+| OS | Debian GNU/Linux 12 (bookworm), aarch64 |
+| Drive | 4-wheel mecanum |
+| Camera | USB 1 MP, V4L2 `/dev/video0` |
+| Camera resolution | 640×480 @ 15 fps YUYV (320×240 not supported by driver) |
+| Camera FOV | 110° horizontal (wide-angle, confirmed) |
+| Camera height | ~10 cm (measured on wheels-up stand) |
+| IMU | MPU-6050 — I2C-6, bit-banged 400 kHz, GPIO22/23 (pins 15/16), addr 0x68 |
+| IMU config | ±8g accel (ACCEL_CONFIG=0x10), ±500°/s gyro (GYRO_CONFIG=0x08) |
+| Battery monitor | INA226 — I2C-6, addr 0x40 — **not yet wired** |
+| Ultrasonic | HC-SR04 forward, I2C-1 via Yahboom board (addr 0x2B) |
+| Wheel encoders | Not available — dead reckoning only |
+| Motor stall floor | 30% duty (forward/rotate); 35% (strafe); RL motor is weakest |
 
-### 2.2 I2C Bus Layout
-All hardware peripherals share a single Yahboom expansion board:
+## 3.2 Camera Configuration
 
-| Peripheral | I2C Bus | Address |
-|---|---|---|
-| Motor driver | 1 | 0x2B |
-| Ultrasonic (HC-SR04) | 1 | 0x2B |
-| Gimbal servos | 1 | 0x2B |
+Default tilt:
 
-### 2.3 Ultrasonic Sensor
-- Fixed, forward-facing only (does not move with gimbal)
-- Range: 3–400 cm
-- Role: **Hardware safety interlock only** — not an RL input (see §6.1)
-- Median filter: 3 samples per reading
+- **−15° downward**
 
-### 2.4 Gimbal
-- 2-DOF: pan (horizontal) and tilt (vertical)
-- Pan range: ±90° from centre
-- Tilt range: −45° (down) to +30° (up); neutral (level) = 30° raw servo angle
-- Max angular velocity: 120 °/s (software-limited)
-- Driven by Yahboom expansion board via I2C (not GPIO/PCA9685)
+Allowed range:
 
-### 2.5 Camera
-- 1 MP USB camera, mounted on gimbal
-- Interface: V4L2 (`/dev/v4l/by-id/usb-DHZJ-...`)
-- Capture resolution: 320×240 @ 15 fps
-- **Horizontal FOV: 110° (wide-angle)**
-- Approximate vertical FOV: ~83° (estimated from 4:3 aspect ratio and 110° H-FOV)
-- Stream: MJPEG on port 8080 (optional, for remote monitoring)
+- −25° to −5°
 
-### 2.6 Camera Geometry & Robot Body Masking
+Benefits:
 
-The camera sits on the gimbal at the front of the robot (~10 cm high, 110° H-FOV).
-At neutral tilt (level), the bottom edge of the frame is ~41° below horizontal.
-At that angle with a 10 cm mount height, the bottom of the frame sees the floor
-approximately **11.5 cm ahead of the camera**. Because the camera is at the front of the
-25 cm body, the robot's own chassis is mostly behind the camera mount and unlikely to
-appear in the forward-looking frame at neutral tilt. However, the gimbal arm and front
-bumper may appear at the very bottom rows at downward tilt angles.
+- better floor visibility
+- earlier obstacle detection
+- improved mapping stability
 
-**Geometric estimate:** bottom ~15–20% of rows (rows 192–240 of a 240-row frame)
-may show the gimbal mount or chassis at steep downward tilt. A conservative initial
-mask of **bottom 20% (48 rows)** will be used until hardware calibration.
+## 3.3 Yahboom Expansion Board / HAL Assumption
 
-- **Implication for depth map:** masked rows are zeroed before MiDaS input and
-  excluded from RL state and proximity reward calculations
-- **Sim equivalent:** the virtual camera model must reproduce this occlusion region
-- **Test method:** robot placed on wheels-up stand (available) for safe static camera tests
+The Yahboom platform uses a shared controller board accessed via I2C rather than separate direct drivers for each function.
+The Rust HAL shall treat this as a **board-level command protocol** problem.
 
-> **TODO (Phase 5 — Camera HW test):** Photograph the robot (on wheels-up stand) at
-> neutral tilt and at maximum downward tilt (-45°). Measure the pixel row where the
-> chassis/gimbal arm begins and update the mask row constant in `robot_config.yaml`.
+Implications:
+
+- motor control
+- servo / gimbal control
+- ultrasonic reads
+
+may all be implemented through a shared Yahboom I2C protocol.
+
+**Implementation note:** the official vendor Python library is expected to be the reference for reverse-engineering register writes / command format. Capturing and documenting this protocol is an explicit deliverable of the HAL phase.
 
 ---
 
-## 3. System Architecture
+# 4. System Architecture
 
-### 3.1 Crate Workspace Layout
-```
-robot/                         ← Cargo workspace root
-├── Cargo.toml
-├── robot_config.yaml          ← Runtime configuration (no constants in code)
-├── crates/
-│   ├── config/                ← YAML config loader → typed structs (shared)
-│   ├── hal/                   ← Hardware abstraction layer
-│   │   ├── motor.rs           ← Mecanum drive
-│   │   ├── ultrasonic.rs      ← HC-SR04 via I2C
-│   │   ├── gimbal.rs          ← Pan/tilt servo control
-│   │   └── camera.rs          ← V4L2 capture + MJPEG stream
-│   ├── perception/            ← Vision pipeline
-│   │   ├── midas.rs           ← MiDaS depth inference (ONNX)
-│   │   └── features.rs        ← MobileNetV2 feature extraction (future)
-│   ├── mapping/               ← Probabilistic occupancy grid
-│   ├── navigation/            ← A* planner + pure-pursuit controller
-│   ├── rl/                    ← PPO agent (train + infer)
-│   └── sim/                   ← Bevy-based 2D/3D simulator
-├── src/
-│   └── main.rs                ← Agent orchestrator binary
-└── models/
-    ├── midas_small.onnx
-    └── checkpoints/
-```
+```text
+                ┌─────────────────────────┐
+                │        CAMERA           │
+                └──────────┬──────────────┘
+                           │
+                           ▼
+                 Event-Driven Vision Gate
+                           │
+                    (frame change?)
+                           │
+                   yes ─────────── no
+                    │               │
+                    ▼               │
+                  MiDaS             │
+                    │               │
+                    └──── reuse last depth
+                           │
+                           ▼
+                   Pseudo-Lidar Extraction
+                           │
+                           ▼
+            ┌─────────────────────────────────┐
+            │  Micro-SLAM / Pose Estimation   │
+            │  (camera + IMU, no encoders)    │
+            └──────────────┬──────────────────┘
+                           │
+                           ▼
+                   Occupancy Grid Mapping
+                           │
+                           ▼
+                    Frontier Detection
+                           │
+                           ├──────────────► Classical Frontier Heuristics
+                           │
+                           ▼
+                   RL Frontier Selection
+                           │
+                           ▼
+                       A* Planner
+                           │
+                           ▼
+                  Pure Pursuit Controller
+                           │
+                           ▼
+                         Motors
 
-### 3.2 Key Technology Choices
-| Concern | Choice | Rationale |
-|---|---|---|
-| Language | Rust | Performance, safety, single binary deployment |
-| ML inference | `ort` (ONNX Runtime) | Best model compatibility; models pre-exported from PyTorch |
-| I2C / GPIO | `rppal` | Pi-native, well-maintained |
-| Camera | `v4l` crate (V4L2) | Direct kernel interface, no OpenCV dependency |
-| Simulator | Bevy (game engine) | All-Rust, renders 3D camera view, z-buffer depth available |
-| Async runtime | `tokio` | Concurrent tasks: camera capture, I2C polling, control loop |
-| ROS2 | **Not used** | Adds build complexity; standalone Rust binary preferred |
-| Visualization | `rerun` (optional) | Lightweight telemetry without ROS |
-
-### 3.3 Runtime Concurrency Model
-```
-tokio runtime
-├── Task: camera_capture      (15 Hz)  → shared frame buffer
-├── Task: sensor_poll         (20 Hz)  → US reading + gimbal angle
-├── Task: gimbal_controller   (10 Hz)  → reactive, reads depth map
-├── Task: control_loop        (10 Hz)  → perception → RL → motor commands
-└── Task: mjpeg_stream        (async)  → optional HTTP stream
+   Safety / Executive / Telemetry observe and arbitrate across the full stack
 ```
 
 ---
 
-## 4. Simulation Design
+# 5. Perception Pipeline
 
-### 4.1 Simulator: Bevy-Based 3D Environment
+## 5.1 Event-Driven Depth
 
-The simulator is implemented in Rust using the Bevy game engine. It provides:
-- A 3D rendered environment with a virtual camera matching the real robot's gimbal camera
-- Ground-truth z-buffer depth (available directly from the renderer)
-- MiDaS depth inference run on the rendered RGB frame (for sim-to-real transfer)
-- Simple rigid-body kinematics (no physics engine needed for flat-floor navigation)
+Depth inference occurs only when:
 
-### 4.2 Environment Generation
+- frame difference exceeds threshold
+- robot rotates
+- gimbal moves
+- parallax scan executes
+- exploration state changes
 
-Environments are procedurally generated at the start of each training episode:
-- Rectangular room with configurable size range
-- Random interior walls (maze-like partitions)
-- Random obstacle objects: boxes and cylinders representing furniture (chairs, tables, etc.)
-- Robot spawns at a random free cell with a random heading
-- Minimum clearance around spawn point guaranteed
+Expected reduction in neural-network inference:
 
-**Environment parameters (configurable):**
-| Parameter | Range |
-|---|---|
-| Room width | 4–10 m |
-| Room depth | 4–10 m |
-| Wall segments | 2–6 per episode |
-| Obstacle objects | 3–10 per episode |
-| Obstacle types | Box (table), cylinder (chair leg/bin) |
+**70–85%**
 
-### 4.3 Virtual Camera & Robot Geometry
+## 5.2 Initial Depth Model and Runtime
 
-The virtual camera must match the real robot's physical configuration:
-- **Position:** mounted at the front of the robot, `camera_forward_offset_m` ahead of the robot centre
-- **Height:** `camera_height_m` above the ground plane
-- **Field of view:** match real camera horizontal FOV (to be measured on hardware)
-- **Gimbal articulation:** pan and tilt angles applied to camera transform
-- **Robot body mask:** same mask region as real camera (§2.6) applied to rendered frames
+Initial depth stack for implementation:
 
-> Robot body occlusion in the virtual camera view must match the real robot.
-> This requires accurate modelling of the robot's physical length and camera mount height.
-> Values to be calibrated during Phase 5 (Camera HW test) and updated here.
+- **MiDaS v3.1 small-class model**
+- preferred first candidates:
+  - `dpt_levit_224`
+  - or another comparable small ONNX-exportable MiDaS variant
+- ONNX export required
+- quantization is allowed later if needed
 
-### 4.4 Depth Strategy: MiDaS in Simulation
+Initial runtime assumption:
 
-MiDaS small is run on the rendered RGB frame rather than using raw z-buffer depth.
-This improves sim-to-real transfer since the policy learns to interpret MiDaS output,
-not perfect ground-truth depth.
+- ONNX Runtime (`ort` crate) is the preferred first choice
+- alternative runtimes may be used later if deployment friction or performance requires it
 
-**Timing estimates (MiDaS small, 256×256 input):**
+Performance target:
 
-| Hardware | MiDaS inference | Vision every N=3 steps | Per episode (500 steps) | 1000 episodes |
-|---|---|---|---|---|
-| Dev CPU (modern) | ~60 ms | ~167 calls | ~10 s overhead + sim | ~3–4 hours |
-| RTX 3050 (training machine) | ~5 ms | ~167 calls | ~1 s overhead + sim | ~20–30 min |
-| Pi 5 (inference only, deploy) | ~15–20 ms | — | — | — |
+- raw depth inference on Pi 5 CPU is expected to be modest
+- effective system behavior should rely on event-driven inference so that depth is available when needed at roughly **5–10 Hz effective decision support**, not necessarily 5–10 Hz raw model execution
 
-**Training machine: Nvidia RTX 3050** — confirmed available. ~1000 episodes estimated in
-20–30 minutes; 10,000 episodes (sufficient for a navigation policy) in ~3–5 hours.
+## 5.3 Pseudo-Lidar Extraction
 
-**Implications:**
+Depth image → lidar-like rays.
 
-- Train on dev machine (RTX 3050), deploy checkpoint to Pi 5 for fine-tuning
-- `vision_every_n_steps = 3` is the default; benchmark in Phase 6 to confirm optimal value
-- A "fast mode" option (z-buffer depth only, no MiDaS) should be available for rapid
-  environment/reward iteration before committing to full MiDaS training runs
+Typical configuration:
 
-### 4.5 Sim-to-Real Transfer Strategy
-
-| Sim element | Real robot equivalent |
-|---|---|
-| Bevy renderer RGB → MiDaS depth | Camera RGB → MiDaS depth |
-| Procedural wall/obstacle geometry | Actual walls, furniture |
-| Dead-reckoning odometry (command integration) | Same (no encoders) |
-| Gimbal angle from servo command | Servo command feedback |
-| Collision = any body overlap | US < 15 cm OR depth map saturation |
-
----
-
-## 5. Perception Pipeline
-
-### 5.1 MiDaS Depth Estimation
-- Model: MiDaS small (exported to ONNX)
-- Input: 256×256 RGB (resized from 320×240 capture)
-- Output: inverse-depth map, normalised to [0, 1] (1 = closest)
-- Robot body mask applied **before** passing to RL state
-- Downsampled to **32×32** for RL state input (1024 values)
-- Run every N steps (configurable, default 3)
-
-### 5.2 MobileNetV2 Feature Extraction
-- **Status: Deferred.** The initial design excludes MobileNetV2; MiDaS depth map is
-  the sole visual RL input. MobileNetV2 may be reintroduced if the policy needs richer
-  visual features beyond depth.
-
-### 5.3 Object Detection (YOLOv5)
-- **Status: Removed from scope.** Object distance and size are derived from the MiDaS
-  depth map. Semantic classification is not required.
-
-### 5.4 Sensor Fusion
-- US sensor is **not fused into RL state**. It operates as an independent safety layer.
-- Depth map is the sole obstacle representation fed to the policy.
-
----
-
-## 6. RL Design
-
-### 6.1 Design Philosophy
-
-The Python predecessor used the ultrasonic sensor as the primary obstacle sensor, with
-the camera as a secondary feature extractor. This caused the policy to over-rely on the
-single forward US beam and under-utilise the wide-angle camera view.
-
-**The Rust redesign inverts this hierarchy:**
-- The **camera depth map is the primary obstacle sensor** (wide angle, 2D spatial info)
-- The **US sensor is a hardware safety interlock only** — it triggers an unconditional
-  emergency stop below `emergency_stop_cm` (15 cm) and is invisible to the RL policy
-- **Gimbal control is separated from the RL action space** — a reactive gimbal controller
-  steers the camera toward the direction of maximum free space, ensuring the policy
-  always has a useful view without spending actions on gimbal management
-
-### 6.2 Action Space (6 discrete actions)
-| ID | Action | Motor behaviour |
-|---|---|---|
-| 0 | Forward | All wheels forward |
-| 1 | Rotate left | Left wheels back, right wheels forward |
-| 2 | Rotate right | Left wheels forward, right wheels back |
-| 3 | Strafe left | Mecanum lateral left |
-| 4 | Strafe right | Mecanum lateral right |
-| 5 | Stop | All wheels stop |
-
-Removed from Python version: `backward`, `gimbal_pan_*`, `gimbal_tilt_*`.
-- Backward removed: rarely useful for exploration, prone to wall-backing exploit
-- Gimbal actions removed: handled by reactive gimbal controller (see §6.5)
-
-Speed constants (duty-cycle):
-| Action | Speed |
-|---|---|
-| Forward | 55 |
-| Rotate | 45 |
-| Strafe | 35 |
-
-### 6.3 State Space (1031 values)
-| Component | Size | Source | Notes |
-|---|---|---|---|
-| Depth map (flattened, masked) | 1024 | MiDaS 32×32 | Robot body rows zeroed |
-| Gimbal pan angle (sin, cos) | 2 | Servo command | Normalised |
-| Robot velocity estimate (vx, vy, ω) | 3 | Dead reckoning | From motor commands + timing |
-| Heading (sin θ, cos θ) | 2 | Integrated odometry | |
-| **Total** | **1031** | | |
-
-Removed from Python version: US rays (not an RL input), local occupancy map window
-(simplification for initial training; may reintroduce).
-
-### 6.4 Reward Structure
-| Signal | Value | Condition |
-|---|---|---|
-| Exploration bonus | +0.02 per cell | Newly revealed occupancy cell |
-| Visual clearance bonus | +0.1 | Mean depth in central 1/3 of frame > 0.6 (open space ahead) |
-| Proximity penalty | −2.0 × (fraction of depth map pixels > 0.8) | Camera-derived, not US |
-| Collision penalty | −50.0 | Any collision (sim body overlap; robot US < 15 cm on hardware) |
-| Time step cost | −0.01 | Every step |
-| Spin penalty | −0.3 per step | After 3+ consecutive rotate actions |
-
-**Key change from Python version:** Proximity penalty is derived entirely from the depth map
-(fraction of visible pixels indicating close obstacles), not from the US reading. This forces
-the policy to learn obstacle avoidance from the camera.
-
-### 6.5 Reactive Gimbal Controller
-
-The gimbal is controlled by a separate low-level reactive controller, not the RL policy:
-
-```
-Each control tick:
-  1. Divide the current 32×32 depth map into left / centre / right columns
-  2. Compute mean free space (low depth value) in each column
-  3. Steer pan angle toward the column with the most free space
-     (proportional control with max ±10°/tick, clamped to pan_range)
-  4. Hold tilt at a fixed look-ahead angle (tuned for camera height and
-     typical obstacle height — to be set during HW calibration)
-```
-
-This ensures the camera is always looking toward navigable space, providing the RL
-policy with useful depth information without consuming action budget on gimbal management.
-
-### 6.6 PPO Hyperparameters
 | Parameter | Value |
 |---|---|
-| Learning rate | 3.0e-4 |
-| Gamma | 0.99 |
-| GAE lambda | 0.95 |
-| Clip epsilon | 0.2 |
-| Value loss coeff | 0.5 |
-| Entropy coeff | 0.01 |
-| Epochs per update | 4 |
-| Batch size | 64 |
-| Rollout steps (sim) | 512 |
-| Rollout steps (hardware) | 64 |
-| Hidden dim | 256 |
-| Max steps per episode | 500 |
-| Checkpoint interval | 10 episodes |
+| Depth resolution | 192×192 to 256×256 |
+| Lidar rays | 48 |
+| Max range | 3 m |
+| Update rate | 5–10 Hz effective |
+| Projection style | nearest-obstacle ray extraction |
+
+Advantages:
+
+- robust mapping
+- reduced noise
+- fast occupancy updates
+- compatibility with classical robotics algorithms
+
+## 5.4 Floor-Plane Anchoring
+
+Where practical, the perception stack should use known geometry to improve metric consistency:
+
+- camera height above floor
+- camera tilt angle
+- estimated floor plane
+
+This geometric information may be used to anchor or scale pseudo-depth estimates, especially near the floor region.
+This does not eliminate monocular ambiguity, but it provides a useful metric constraint.
+
+## 5.5 Parallax Scans
+
+The robot occasionally performs a small lateral scan to improve depth confidence:
+
+```text
+left 10 cm
+right 20 cm
+left 10 cm
+```
+
+Recommended frequency:
+
+- every 5–10 seconds
+- on entering a new room
+- when depth confidence is low
 
 ---
 
-## 7. Navigation
+# 6. Calibration Subsystem
 
-### 7.1 Occupancy Grid Mapping
-- Resolution: 5 cm/cell
-- Initial size: 200×200 cells (10 m × 10 m); expands dynamically
-- Probabilistic update (log-odds): p_occ_hit=0.75, p_occ_miss=0.40
-- Obstacle inflation: Gaussian blur, σ=0.8 cells, every 10 steps
-- Decay toward prior (0.5) at rate 0.001/step
+## 6.1 Purpose
 
-### 7.2 Path Planner
-- Algorithm: A* with Euclidean heuristic
-- Safety margin: 2 cells from obstacles
-- Path smoothing: 3 iterations
-- Replan on: path blocked, goal reached, timeout
+Calibration shall be treated as a required subsystem and operational mode.
 
-### 7.3 Pure-Pursuit Controller
+The system requires calibration for:
+
+- camera intrinsics
+- camera-to-robot extrinsics
+- IMU bias
+- gravity reference
+- default camera tilt validation
+
+## 6.2 Required Calibration Outputs
+
+The calibration process shall produce configuration data for:
+
+- camera intrinsic matrix / distortion parameters
+- camera pose relative to robot base frame
+- IMU bias offsets
+- IMU mounting orientation relative to robot base frame
+- validated downward camera tilt value
+
+## 6.3 Operational Mode
+
+An explicit runtime mode shall exist:
+
+- `calibrate`
+
+Sub-modes may include:
+
+- `calibrate-camera`
+- `calibrate-imu`
+- `calibrate-extrinsics`
+
+## 6.4 Deliverable Expectation
+
+A lightweight `calibration/` crate or equivalent module is recommended.
+
+---
+
+# 7. Executive / Behavior Management
+
+## 7.1 Purpose
+
+A central executive shall own high-level behavior transitions and system state changes.
+
+This prevents responsibility for mode changes from being spread implicitly across planning, safety, mapping, and recovery code.
+
+## 7.2 Responsibilities
+
+The executive shall:
+
+- own the current high-level system state
+- react to safety events
+- react to degraded localization confidence
+- trigger recovery behaviors
+- control transitions between calibration, exploration, recovery, paused, and fault states
+- expose machine-readable state transitions to telemetry
+
+## 7.3 Minimum State Set
+
+Initial explicit states should include at least:
+
+- `Idle`
+- `Calibrating`
+- `Exploring`
+- `Recovering`
+- `SafetyStopped`
+- `Fault`
+
+## 7.4 Transition Examples
+
+Examples of transitions the executive should manage:
+
+- `Exploring` → `Recovering` on stuck detection
+- `Exploring` → `SafetyStopped` on emergency stop
+- `Exploring` → `Recovering` on severe localization confidence drop
+- `Recovering` → `Exploring` on successful recovery
+- any state → `Fault` on unrecoverable subsystem failure
+
+A simple explicit state machine is preferred for v1 over a more elaborate behavior-tree framework.
+
+## 7.5 Arm / Disarm *(implemented)*
+
+The robot starts in `Idle` on every launch. Motors are disarmed — CmdVel commands are silently dropped until explicitly armed.
+
+**Arm mechanism:** SIGUSR1 sent to the robot process (`kill -USR1 <pid>`).
+
+Arm transitions:
+- `Idle` → `Exploring` (normal arm)
+- `SafetyStopped` → `Idle` → `Exploring` (re-arm after estop)
+
+After an emergency stop the robot stays in `SafetyStopped` and must be re-armed with a second SIGUSR1. It does **not** automatically resume when an obstacle is cleared.
+
+---
+
+# 8. Micro-SLAM / Localization
+
+## 8.1 Purpose
+
+Because wheel encoders are unavailable, the robot shall estimate pose using a lightweight
+visual-inertial localization pipeline ("micro-SLAM") built from:
+
+- monocular camera
+- IMU (gyro + accel)
+- short-horizon feature tracking
+- sparse local map / keyframes
+
+## 8.2 Scope
+
+Micro-SLAM is intended to provide:
+
+- short- to medium-term pose stability
+- reliable heading estimation
+- local drift reduction good enough for room-scale exploration
+- keyframe-based local consistency
+
+It is **not required** to provide full global loop-closure SLAM in version 1.4.
+
+## 8.3 Functional Design
+
+The initial micro-SLAM implementation should include:
+
+1. **Feature detection**
+   - FAST or ORB features on grayscale frames
+
+2. **Feature tracking**
+   - pyramidal Lucas-Kanade optical flow or descriptor matching
+
+3. **IMU propagation**
+   - gyro integration for heading
+   - accel used for short-term stabilization / gravity estimate
+
+4. **Visual-inertial pose update**
+   - estimate frame-to-frame motion from tracked features
+   - fuse with IMU to stabilize yaw and reject jitter
+
+5. **Keyframe buffer**
+   - retain a short rolling set of keyframes
+   - use local re-alignment against recent keyframes to reduce drift
+
+6. **Pose output**
+   - 2D pose for mapping and planning: `(x, y, theta)`
+   - optional internal 3D estimate if useful
+
+## 8.4 Performance Target
+
+Micro-SLAM should run in real time on the Pi 5 at approximately:
+
+- feature tracking: 10–15 Hz
+- IMU propagation: 50–100 Hz
+- pose output to mapper/controller: 10 Hz
+
+## 8.5 Capability Expectation
+
+Micro-SLAM is expected to be:
+
+- much better than dead reckoning from motor commands
+- good enough for room and hallway exploration
+- still subject to drift over long paths or low-texture scenes
+
+Expected limitations:
+
+- blank walls may degrade tracking
+- rapid lighting changes may reduce feature stability
+- no guaranteed global consistency without later loop closure
+- mecanum slip and perception latency will limit metric fidelity
+
+## 8.6 Interfaces and Data Structures
+
+### Required outputs
+
+Micro-SLAM shall publish:
+
+- current fused pose
+- visual delta pose
+- tracking quality metrics
+- keyframe events
+- confidence estimate
+
+### Reference data structures
+
+```rust
+pub struct ImuSample {
+    pub t_ms: u64,
+    pub gyro_z: f32,
+    pub accel_x: f32,
+    pub accel_y: f32,
+    pub accel_z: f32,
+}
+
+pub struct FeaturePoint {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub score: f32,
+}
+
+pub struct FeatureFrame {
+    pub t_ms: u64,
+    pub points: Vec<FeaturePoint>,
+}
+
+pub struct TrackSet {
+    pub t_ms: u64,
+    pub matches: Vec<(u32, [f32; 2], [f32; 2])>,
+    pub mean_flow: [f32; 2],
+    pub inlier_count: usize,
+}
+
+pub struct VisualDelta {
+    pub t_ms: u64,
+    pub dx_m: f32,
+    pub dy_m: f32,
+    pub dtheta_rad: f32,
+    pub confidence: f32,
+}
+
+pub struct Pose2D {
+    pub t_ms: u64,
+    pub x_m: f32,
+    pub y_m: f32,
+    pub theta_rad: f32,
+    pub confidence: f32,
+}
+```
+
+## 8.7 Runtime Tasks
+
+### IMU task
+Runs at 50–100 Hz.
+
+Responsibilities:
+
+- read gyro + accel
+- calibrate bias
+- estimate gravity direction
+- integrate short-term yaw
+
+### Feature task
+Runs at camera rate.
+
+Responsibilities:
+
+- grayscale preprocessing
+- detect strongest features
+- publish feature frame
+
+### Tracking task
+Runs at camera rate.
+
+Responsibilities:
+
+- track features frame-to-frame
+- reject outliers
+- estimate optical flow consistency
+- trigger keyframe creation
+
+### Motion estimation task
+Runs at camera rate.
+
+Responsibilities:
+
+- compute local visual motion
+- estimate short translation and yaw delta
+- publish visual delta pose
+
+### Fusion task
+Runs at 10–50 Hz.
+
+Responsibilities:
+
+- fuse IMU and visual motion
+- generate 2D pose
+- publish confidence estimate
+- report degraded tracking state
+
+---
+
+# 9. Mapping
+
+Occupancy grid:
+
 | Parameter | Value |
 |---|---|
-| Lookahead distance | 0.20 m |
-| Goal tolerance | 0.10 m |
-| Angle Kp | 1.2 |
-| Linear Kp | 0.8 |
-| Max angular velocity | 60 (duty-cycle units) |
-| Max linear velocity | 70 (duty-cycle units) |
+| Cell size | 5 cm |
+| Grid size | dynamic |
+| Sensor model | raycasting from pseudo-lidar |
+| Decay | slow toward unknown |
 
-### 7.4 Recovery Behaviour
-On stuck detection (no progress for N steps):
-1. Rotate 30°
-2. Brief reverse if US permits (≥ 30 cm rear estimate — note: no rear sensor,
-   so reverse is only attempted after a timed spin to face rearward)
-3. Up to 5 attempts before declaring navigation failure
+Mapping shall consume:
 
-### 7.5 Frontier-Based Exploration
-- Frontier: boundary between known-free and unknown cells
-- Minimum frontier size: 3 cells
-- Goal selection: nearest frontier centroid
-- Gimbal sweep (full pan) every 5 seconds during EXPLORE phase
-- Gimbal sweep suppressed during EXECUTE (path following) phase
+- pseudo-lidar rays from depth
+- pose estimate from micro-SLAM
+
+Mapping shall publish:
+
+- occupancy grid snapshots or deltas
+- frontier candidates
+- explored area statistics
+
+## 9.1 Frontier Detection
+
+The system shall detect frontiers as boundaries between known-free and unknown space.
+
+Initial implementation guidance:
+
+- threshold occupancy into free / occupied / unknown
+- identify frontier cells as free cells adjacent to unknown cells
+- cluster neighboring frontier cells
+- compute simple cluster properties such as:
+  - centroid
+  - size
+  - distance from robot
+  - heading offset
+  - reachable / blocked status if known
+
+This classical frontier detector is required before RL is added.
 
 ---
 
-## 8. Operational Modes
+# 10. Exploration Strategy
 
-| Mode | Description |
+Exploration uses **frontier-based mapping**.
+
+The robot must support **classical frontier heuristics before reinforcement learning**.
+
+Required baseline strategies:
+
+- nearest frontier
+- largest frontier
+
+Optional baseline strategies:
+
+- leftmost frontier
+- rightmost frontier
+- random valid frontier
+
+RL is evaluated only after baseline exploration is functioning end-to-end.
+
+---
+
+# 11. Reinforcement Learning Design
+
+## 11.1 Role of RL
+
+RL chooses a frontier or frontier-selection heuristic only.
+RL does **not** directly control motors.
+
+## 11.2 State
+
+RL state should be based on geometry and exploration context, not raw motor control.
+
+Example contents:
+
+- local 64×64 occupancy window
+- robot heading
+- candidate frontier descriptors
+- local free-space statistics
+
+A smaller frontier-descriptor-based state may be substituted later if it proves simpler and more robust.
+
+## 11.3 Actions
+
+Select a frontier or frontier-selection heuristic.
+
+Example:
+
+| Action | Meaning |
 |---|---|
-| `hw-test` | Individual hardware component tests (wheels, gimbal, US, camera) |
-| `sim-train` | Run PPO training in Bevy simulator |
-| `sim-run` | Load trained policy, run in simulator (evaluation) |
-| `robot-run` | Load trained policy, run on real robot |
-| `robot-finetune` | Run on real robot with policy updates enabled |
+| 0 | nearest frontier |
+| 1 | largest frontier |
+| 2 | leftmost frontier |
+| 3 | rightmost frontier |
+| 4 | random valid frontier |
 
-All modes load `robot_config.yaml` at startup. The `driver` fields (`yahboom` vs `simulation`)
-switch between real HAL and simulated HAL transparently.
+## 11.4 Rewards
 
----
+| Reward | Intent |
+|---|---|
+| New map area discovered | positive |
+| Frontier reached | positive |
+| Collision | large negative |
+| Time penalty | small negative |
 
-## 9. Implementation Phases
+## 11.5 Training Requirement
 
-| Phase | Crate(s) | Deliverable | Status |
-|---|---|---|---|
-| 1 | `config` | Parse `robot_config.yaml` → typed Rust structs | Pending |
-| 2 | `hal/motor` | Drive each wheel independently; HW test mode | Pending |
-| 3 | `hal/ultrasonic` | Read distance via I2C; calibrate min/max | Pending |
-| 4 | `hal/gimbal` | Pan/tilt servo control; range limits; reactive controller stub | Pending |
-| 5 | `hal/camera` | V4L2 frame capture; MJPEG stream; robot body mask calibration | Pending |
-| 6 | `perception` | MiDaS ONNX inference; depth map pipeline; timing benchmark | Pending |
-| 7 | `mapping` | Probabilistic occupancy grid; visualisation via rerun | Pending |
-| 8 | `navigation` | A* planner; pure-pursuit controller; frontier exploration | Pending |
-| 9 | `sim` | Bevy 3D simulator; procedural environment generation; virtual camera | Pending |
-| 10 | `rl` | PPO implementation; train in sim; evaluate episode timing | Pending |
-| 11 | `main` | Full orchestrator; all modes wired together | Pending |
-| 12 | — | On-robot fine-tuning; sim-to-real evaluation | Pending |
+The training pipeline must compare learned frontier selection against classical heuristics so the value of RL can be measured rather than assumed.
 
 ---
 
-## 10. Decisions Log
+# 12. Motion Control
 
-| # | Date | Decision | Rationale |
-|---|---|---|---|
-| D-01 | 2026-03-07 | Language: Rust | Performance, single binary, safety |
-| D-02 | 2026-03-07 | ML inference: ONNX Runtime (`ort` crate) | Best model compat; models pre-exported from PyTorch |
-| D-03 | 2026-03-07 | Simulator: Bevy (custom, all-Rust) | Tight RL integration; no external process; z-buffer + MiDaS |
-| D-04 | 2026-03-07 | Sim environments: procedural maze-like, new per episode | Prevents overfitting to fixed layout |
-| D-05 | 2026-03-07 | Depth in sim: MiDaS on rendered RGB (not raw z-buffer) | Better sim-to-real transfer |
-| D-06 | 2026-03-07 | US sensor role: hardware safety interlock only | Force policy to learn from camera; eliminate US dependency |
-| D-07 | 2026-03-07 | Gimbal: reactive controller, not RL action | Frees action budget; camera always points toward free space |
-| D-08 | 2026-03-07 | Action space: 6 discrete (no backward, no gimbal) | Simpler, removes exploits; backward added back if needed |
-| D-09 | 2026-03-07 | Training: sim-only → on-robot fine-tuning | Safe; faster iteration |
-| D-10 | 2026-03-07 | ROS2: not used | Build complexity; standalone Rust binary preferred |
-| D-11 | 2026-03-07 | YOLOv5 / object detection: removed | Depth map sufficient; no semantic classification needed |
-| D-12 | 2026-03-07 | MobileNetV2: deferred | MiDaS depth is primary visual input; revisit if needed |
-| D-13 | 2026-03-08 | Odometry: dead reckoning from motor commands + timing | No wheel encoders available |
-| D-14 | 2026-03-08 | Training machine: Nvidia RTX 3050 | ~10k episodes in 3–5 hours; train on dev, deploy to Pi 5 |
-| D-15 | 2026-03-08 | Camera FOV: 110° wide-angle, mount height 10 cm | Measured/confirmed from Yahboom spec and physical measurement |
-| D-16 | 2026-03-08 | Body mask initial estimate: bottom 20% of frame (48 rows) | Geometric calculation; calibrate in Phase 5 on wheels-up stand |
-| D-17 | 2026-03-08 | Wheels-up test stand available for static HW testing | Safe way to run motors and camera tests without the robot driving away |
+Classical deterministic navigation.
 
----
+## 12.1 Planner
 
-## 11. Open Questions
+- A*
 
-| # | Question | Owner | Priority |
-|---|---|---|---|
-| ~~Q-01~~ | ~~Robot physical length and camera mount height~~ | **Resolved** — length ~25 cm, height ~10 cm (measured on wheels-up stand) | — |
-| ~~Q-02~~ | ~~Real camera horizontal FOV~~ | **Resolved** — 110° wide-angle (Yahboom spec) | — |
-| ~~Q-03~~ | ~~GPU on training machine~~ | **Resolved** — Nvidia RTX 3050 | — |
-| Q-04 | Should `robot-finetune` mode update the full network or only the policy head (value/actor output layers)? | Design decision | Medium — needed for Phase 12 |
-| Q-05 | Should the occupancy map be included in the RL state in a later iteration? | Design decision | Low — deferred |
-| Q-06 | What `vision_every_n_steps` value should be used for sim training? Benchmark in Phase 6. | Phase 6 output | Medium |
+## 12.2 Controller
+
+- pure pursuit
+
+## 12.3 Recovery
+
+If stuck:
+
+1. rotate
+2. reverse slightly if safe
+3. select a new frontier
+4. trigger a parallax scan if needed
 
 ---
 
-## 12. Change Log
+# 13. Simulation Architecture
 
-| Version | Date | Summary |
+Two simulators shall be supported.
+
+## 13.1 sim_fast
+
+Purpose:
+
+- RL training
+- reward tuning
+- large-scale experiments
+- mapping / frontier / planning validation
+
+Scope:
+
+- 2D grid world
+- kinematic robot motion
+- configurable noise
+- no expensive rendering required
+
+Recommended initial design:
+
+- occupancy-style world or procedural 2D floorplan
+- robot represented by simple footprint
+- commanded motion integrated into pose
+- pseudo-lidar or equivalent range observations produced directly from map geometry
+
+Suggested configurable noise / realism:
+
+- translational noise
+- rotational noise
+- IMU noise
+- pseudo-lidar noise
+- occasional dropped observations
+- randomized sensor quality for robustness testing
+
+Target speed:
+
+- approximately tens of thousands of steps per second on desktop-class hardware
+
+## 13.2 sim_vision
+
+Purpose:
+
+- perception testing
+- pseudo-lidar validation
+- micro-SLAM validation
+- sim-to-real checks
+
+Scope:
+
+- 3D or visually richer simulator
+- lower speed acceptable
+- used for perception realism, not the bulk of RL training
+
+## 13.3 Episode Definition
+
+Initial RL / exploration episodes should define:
+
+- random initial pose
+- generated room or floorplan
+- maximum step budget
+- success condition based on explored area / frontier exhaustion / target completion
+- failure condition based on collision, timeout, or unrecoverable state
+
+---
+
+# 14. Network / GUI Bridge
+
+## 14.1 Purpose
+
+A lightweight read-only network / GUI bridge shall expose live robot state for human visualization during bring-up, debugging, and evaluation.
+
+This bridge is not part of the autonomy core and shall not be required for basic robot operation.
+
+## 14.2 Minimum Scope
+
+The initial bridge should support:
+
+- live occupancy-grid visualization
+- robot pose visualization
+- frontier candidate visualization
+- current executive state display
+- selected frontier strategy display
+- basic health telemetry display
+
+## 14.3 Transport Guidance
+
+A simple implementation is preferred:
+
+- local or LAN WebSocket server
+- browser-based client or simple HTML/JS viewer
+- read-only streaming in v1
+
+## 14.4 Data Sources
+
+The bridge should subscribe to existing bus topics rather than introducing parallel data paths.
+
+Likely inputs include:
+
+- `map/grid_delta`
+- `map/frontiers`
+- `slam/pose2d`
+- `executive/state`
+- `decision/frontier_choice`
+- `health/runtime`
+
+## 14.5 Non-Goals for v1
+
+The bridge does not need to provide:
+
+- full operator teleoperation
+- rich mission planning UI
+- mandatory cloud connectivity
+- safety-critical command control
+
+A small future extension may allow simple operator controls such as start/stop/debug mode switching, but the initial bridge should remain visualization-first.
+
+---
+
+# 15. Message Bus / Runtime Communication
+
+## 14.1 Purpose
+
+Subsystems shall communicate via typed messages over asynchronous channels rather than
+tight direct coupling between modules.
+
+Benefits:
+
+- easier debugging
+- cleaner ownership boundaries
+- isolated subsystem testing
+- simpler simulation/real-hardware swapping
+
+## 14.2 Topic Set
+
+Initial logical topics:
+
+```text
+camera/frame_raw
+camera/frame_gray
+imu/raw
+imu/orientation
+vision/depth
+vision/pseudo_lidar
+vision/features
+vision/tracks
+slam/visual_delta
+slam/pose2d
+slam/keyframe_event
+map/grid_delta
+map/frontiers
+map/explored_stats
+decision/frontier_choice
+planner/path
+controller/cmd_vel
+motor/command
+executive/state
+safety/event
+telemetry/event_marker
+health/runtime
+ui/bridge_status
+```
+
+## 14.3 Message Bus Requirements
+
+The runtime bus shall support:
+
+- multiple subscribers per topic
+- bounded queues
+- timestamped messages
+- non-blocking publish where practical
+- graceful handling of slow subscribers
+- drop detection / counters for debug builds
+
+## 14.4 Implementation Guidance
+
+A `tokio`-based implementation using `broadcast`, `watch`, or `mpsc` is acceptable.
+
+Recommended pattern:
+
+- high-rate sensor streams: bounded `broadcast`
+- latest-state topics: `watch`
+- command paths: bounded `mpsc`
+
+---
+
+# 16. Telemetry & Replay System
+
+## 15.1 Goal
+
+Every control cycle shall log enough synchronized data to reconstruct and replay robot behavior offline.
+
+## 15.2 Logged Data
+
+Telemetry should include:
+
+- frame reference or compressed camera frame
+- depth map and pseudo-lidar
+- IMU samples or summaries
+- micro-SLAM pose estimate
+- occupancy map state or deltas
+- frontier candidates
+- chosen frontier strategy or RL decision
+- planner path
+- controller output
+- motor commands
+- ultrasonic readings
+- executive state transitions
+- event markers
+- confidence / health indicators
+
+## 15.3 Health Telemetry
+
+Health telemetry should include, where available:
+
+- Pi temperature
+- CPU utilization or load indicator
+- depth inference timing
+- micro-SLAM timing
+- dropped-frame counters
+- I2C error counters
+- battery voltage or supply voltage if measurable
+- throttle / undervoltage indicators if available
+
+## 15.4 Schema Requirements
+
+Each record shall include:
+
+- monotonic timestamp
+- topic name
+- source subsystem
+- payload
+- optional sequence number
+
+### Reference record structure
+
+```rust
+pub struct TelemetryRecord<T> {
+    pub t_ms: u64,
+    pub topic: String,
+    pub source: String,
+    pub seq: u64,
+    pub payload: T,
+}
+```
+
+A compact binary format is acceptable for runtime logging; a readable export format is recommended for debugging and review.
+
+## 15.5 Event Markers
+
+The system shall record structured event markers, including at least:
+
+- collision
+- emergency stop
+- frontier selected
+- frontier reached
+- parallax scan started / completed
+- tracking confidence drop
+- keyframe inserted
+- planner failed
+- recovery behavior triggered
+- calibration completed
+- executive state changed
+
+## 15.6 Replay Requirements
+
+Replay tooling shall support:
+
+- time-synchronized sensor playback
+- step-by-step timeline advance
+- camera/depth/map side-by-side visualization
+- comparison of alternate algorithms against recorded runs
+
+---
+
+# 17. HAL Scheduling and Priority Policy
+
+Because the Yahboom board likely multiplexes control and sensing over I2C, the HAL shall treat bus access as a schedulable shared resource.
+
+## 16.1 Priority Order
+
+Suggested priority order:
+
+1. emergency stop / safety halt
+2. motor commands
+3. gimbal commands
+4. critical status reads needed for control
+5. ultrasonic reads
+6. low-priority diagnostics / telemetry-only reads
+
+## 16.2 Design Guidance
+
+An internal HAL queue or scheduler is recommended so that urgent commands are not delayed by routine sensor polling.
+
+---
+
+# 18. Safety Layer
+
+Hardware safety is independent of AI.
+
+Triggers:
+
+- ultrasonic < 15 cm
+- watchdog timeout (500 ms without a US reading)
+- explicit emergency stop
+- invalid pose / control sanity failure
+
+Response:
+
+- immediate motor halt via `MotorCommand::stop()` on priority channel
+- executive transitions to `SafetyStopped` (blocks all further CmdVel)
+
+The safety subsystem shall also publish a machine-readable event to `safety/event`.
+
+## 18.1 Motor Crash-Stop *(implemented)*
+
+`YahboomMotorController` implements `Drop`. On drop (normal shutdown, SIGTERM, panic unwind) all four motors are synchronously zeroed via blocking I2C writes (~40 ms). SIGKILL cannot be caught.
+
+## 18.2 Motor Watchdog *(implemented)*
+
+The motor execution task sends a zero command if no motor command (safety or CmdVel) is received within **500 ms**. Covers: control loop stall, task hang, or any bug that stops the command pipeline without crashing the process.
+
+---
+
+# 19. Operational Modes
+
+| Mode | Purpose |
+|---|---|
+| hw-test | test hardware components |
+| calibrate | run calibration routines |
+| sim-train | RL training |
+| sim-run | policy evaluation |
+| robot-run | autonomous operation |
+| robot-debug | autonomous run with heavy telemetry |
+| slam-debug | camera/IMU localization validation |
+
+---
+
+# 20. Software Workspace Layout
+
+```text
+robot/
+ ├── config/
+ ├── core_types/
+ ├── bus/
+ ├── calibration/
+ ├── executive/
+ ├── ui_bridge/
+ ├── hal/
+ ├── perception/
+ ├── micro_slam/
+ ├── mapping/
+ ├── exploration_rl/
+ ├── planning/
+ ├── control/
+ ├── safety/
+ ├── sim_fast/
+ ├── sim_vision/
+ ├── telemetry/
+ └── runtime/
+```
+
+---
+
+# 21. Development Phases
+
+| # | Phase | Status |
 |---|---|---|
-| 0.1 | 2026-03-08 | Initial draft — requirements and architecture defined |
+| 1 | hardware bring-up | **Done** |
+| 2 | Yahboom HAL protocol capture / documentation | **Done** |
+| 3 | IMU integration and calibration | **Done** (MPU-6050, I2C-6 bit-banged) |
+| 4 | bus + typed message definitions | **Done** |
+| 5 | executive state machine | **Done** (arm/disarm via SIGUSR1) |
+| 6 | network / GUI bridge skeleton | **Done** |
+| 7 | camera + event-driven depth pipeline | **Done** (640×480, MiDaS ONNX, EventGate) |
+| 8 | pseudo-lidar extraction | **Done** (48-ray) |
+| 9 | telemetry / replay system | **Done** (NDJSON writer; replay tooling TODO) |
+| 10 | micro-SLAM prototype | **Partial** (IMU dead-reckoning; visual-inertial pipeline TODO) |
+| 11 | occupancy mapping from pseudo-lidar + pose | **Done** |
+| 12 | classical frontier detection + baseline heuristics | **Done** |
+| 13 | planner + controller | **Done** (A* + pure pursuit) |
+| 14 | fast simulator | **Done** (sim_fast 2D, 200×200 grid) |
+| 15 | RL frontier selector | **Done** (AWR training pipeline + classical fallback) |
+| 16 | real robot integration | **Done** (runtime HAL wired, motor safety gates) |
+| 17 | sim-to-real tuning | **In progress** |
+
+---
+
+# 22. Expected Capabilities
+
+The robot should be able to:
+
+- explore rooms autonomously
+- avoid furniture and walls
+- map small indoor environments
+- navigate between discovered spaces
+- maintain useful local pose estimates without wheel encoders
+- operate and be debugged without RL initially
+- expose live map/state/health visualization during debug runs
+
+Target expectations for version 1.4:
+
+- reliable exploration in textured, well-lit rooms
+- useful room-scale local maps
+- graceful degradation under poor tracking conditions
+- research-grade reliability, not product-grade autonomy
+- stronger topological understanding than precise metric reconstruction
+
+Expected realistic limitations:
+
+- long-run global map drift may still occur
+- low-texture scenes may degrade localization
+- monocular depth noise may create occasional false or missed obstacles
+- mecanum slip will reduce metric accuracy
+- integration effort for Yahboom I2C control may be non-trivial
+
+---
+
+# 23. Out of Scope
+
+- semantic object recognition
+- multi-robot coordination
+- outdoor navigation
+- full loop-closure SLAM in initial release
+
+---
+
+# 24. Implementation Gap Analysis *(as of 2026-03-12)*
+
+| § | Feature | Status | Notes |
+|---|---|---|---|
+| 5.1 | Event-driven depth (EventGate) | **Done** | |
+| 5.3 | Pseudo-lidar extraction (48-ray) | **Done** | |
+| 5.4 | Floor-plane anchoring | **Missing** | No camera-height/tilt geometry used to anchor depth |
+| 5.5 | Parallax scans | **Missing** | No strafe-scan logic in perception or runtime |
+| 6 | Calibration subsystem | **Partial** | `calibration/` crate has CalibrationManager (load/save JSON); no interactive calibration routines |
+| 6.3 | `calibrate` operational mode | **Missing** | Mode listed in docs but no CLI dispatch; binary always runs full pipeline |
+| 7 | Executive state machine | **Done** | arm/disarm via SIGUSR1 (§7.5) |
+| 8 | Micro-SLAM (visual-inertial) | **Partial** | `ImuDeadReckon` (gyro-only, confidence fixed 0.3); feature detection / optical flow / keyframes not implemented |
+| 9 | Mapping + frontier detection | **Done** | |
+| 10 | A* planner + pure pursuit | **Done** | |
+| 11 | RL frontier selector | **Done** | AWR training + classical fallback |
+| 13.1 | sim_fast (2D fast simulator) | **Done** | |
+| 13.2 | sim_vision (3D visual simulator) | **Missing** | Crate exists as pure stub (`pub struct VisualSim;`) |
+| 14 | Network / GUI bridge | **Done** | WebSocket, live map/pose/frontier visualization |
+| 15.3 | Health telemetry (Pi temp, CPU, battery) | **Partial** | `HealthMetrics` struct defined; no publishing task; INA226 not wired |
+| 15.6 | Replay tooling | **Partial** | NDJSON log writer done; step-by-step replay / offline comparison not implemented |
+| 17 | HAL I2C priority queue | **Missing** | No bus arbiter; each HAL driver makes independent I2C calls; safety priority enforced by tokio biased-select in runtime only |
+| 19 | Operational modes (`calibrate`, `slam-debug`, etc.) | **Missing** | All modes documented but no `std::env::args()` dispatch; binary always runs exploration loop |
+
+### Gaps blocking Phase 17 (sim-to-real tuning)
+
+1. **Operational mode dispatch** — needed to run `calibrate` and `slam-debug` without the full autonomy stack running
+2. **Micro-SLAM visual pipeline** — IMU-only dead reckoning drifts too fast for useful mapping beyond one room; visual-inertial tracking is the next major subsystem
+3. **HAL I2C priority** — currently acceptable via biased-select; revisit if safety commands are observed to lag during heavy I2C use
+
+### Lower-priority gaps (post Phase 17)
+
+- Floor-plane anchoring (§5.4) — metric consistency near floor
+- Parallax scans (§5.5) — depth confidence in ambiguous scenes
+- Health telemetry publication (§15.3) — diagnostics during long runs
+- Replay tooling (§15.6) — offline debugging and algorithm comparison
+- sim_vision stub (§13.2) — perception/SLAM validation

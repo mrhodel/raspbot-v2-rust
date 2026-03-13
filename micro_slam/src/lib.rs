@@ -24,14 +24,20 @@ pub struct ImuDeadReckon {
     pose: Pose2D,
     t0: std::time::Instant,
     last_t_ms: Option<u64>,
+    gz_bias: f32,
 }
 
 impl ImuDeadReckon {
     pub fn new() -> Self {
+        Self::with_gz_bias(0.0)
+    }
+
+    pub fn with_gz_bias(gz_bias: f32) -> Self {
         Self {
             pose: Pose2D::default(),
             t0: std::time::Instant::now(),
             last_t_ms: None,
+            gz_bias,
         }
     }
 
@@ -41,7 +47,7 @@ impl ImuDeadReckon {
 
         if let Some(prev_t) = self.last_t_ms {
             let dt_s = (sample.t_ms.saturating_sub(prev_t)) as f32 / 1000.0;
-            self.pose.theta_rad += sample.gyro_z * dt_s;
+            self.pose.theta_rad += (sample.gyro_z - self.gz_bias) * dt_s;
             // Normalise to (-π, π].
             self.pose.theta_rad = wrap_angle(self.pose.theta_rad);
         }

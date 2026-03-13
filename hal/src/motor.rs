@@ -112,6 +112,20 @@ impl YahboomMotorController {
     }
 }
 
+impl Drop for YahboomMotorController {
+    /// Synchronous all-stop on drop.
+    ///
+    /// Called on normal shutdown (Ctrl-C / SIGTERM) and on panic unwind.
+    /// Not called on SIGKILL — nothing is.
+    fn drop(&mut self) {
+        warn!("YahboomMotor: drop — zeroing all motors");
+        for motor_id in [M_FL, M_RL, M_FR, M_RR] {
+            let _ = self.write_motor(motor_id, 0);
+            std::thread::sleep(Duration::from_millis(INTER_WRITE_MS));
+        }
+    }
+}
+
 #[async_trait]
 impl MotorController for YahboomMotorController {
     async fn send_command(&mut self, cmd: MotorCommand) -> Result<()> {

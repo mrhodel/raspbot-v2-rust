@@ -144,7 +144,9 @@ impl YahboomUltrasonic {
 #[async_trait]
 impl Ultrasonic for YahboomUltrasonic {
     async fn read_distance(&mut self) -> Result<UltrasonicReading> {
-        let cm = self.read_median_cm()?;
+        // read_median_cm uses std::thread::sleep; block_in_place signals to
+        // tokio that this thread will block so other tasks can migrate.
+        let cm = tokio::task::block_in_place(|| self.read_median_cm())?;
         Ok(UltrasonicReading {
             t_ms:     self.t0.elapsed().as_millis() as u64,
             range_cm: cm,

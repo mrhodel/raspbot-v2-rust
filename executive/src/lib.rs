@@ -56,6 +56,18 @@ impl Executive {
         Ok(())
     }
 
+    /// Arm the robot for autonomous operation.
+    ///
+    /// From `Idle`          → `Exploring` (one step).
+    /// From `SafetyStopped` → `Idle` → `Exploring` (reset then re-arm).
+    /// Any other state returns `Err`.
+    pub fn arm(&mut self) -> Result<(), String> {
+        if matches!(self.state, ExecutiveState::SafetyStopped) {
+            self.transition(ExecutiveState::Idle)?;
+        }
+        self.transition(ExecutiveState::Exploring)
+    }
+
     /// State transition guard.
     ///
     /// Allowed transitions:

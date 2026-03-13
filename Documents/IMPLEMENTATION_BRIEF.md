@@ -1,339 +1,128 @@
 # IMPLEMENTATION_BRIEF.md
+## Phase 17 — Sim-to-Real Tuning Handoff
 
-## Goal
-
-Implement the Yahboom Raspbot V2 autonomous indoor exploration stack in Rust on a Raspberry Pi 5.
-
-This is a research-grade indoor robot project focused on reliable autonomous exploration, obstacle avoidance, local mapping, and debuggable system integration.
+**Last Updated:** 2026-03-12
+**Source of Truth:** `REQUIREMENTS.md` (V5.2). If this brief conflicts with it, follow `REQUIREMENTS.md`.
 
 ---
 
-## Source of Truth
+## Current State of the Robot
 
-Primary architecture/specification document:
+All 16 implementation phases are complete. The robot runs a full autonomous exploration loop:
 
-- `requirements_v3.md`
+```
+Camera → MiDaS depth → pseudo-lidar → occupancy map → frontier detection
+→ RL/classical frontier selector → A* planner → pure-pursuit → motors
+```
 
-This brief is a practical handoff summary for implementation. If there is a conflict, follow `requirements_v3.md`.
+Safety layers are wired. The system is ready for Phase 17: first real runs, observation, and tuning.
 
 ---
 
-## Project Summary
+## Safety Protocol — Read Before Running
 
-The robot should:
+The robot starts **disarmed** (motors blocked) on every launch.
 
-- explore unknown indoor spaces
-- avoid obstacles
-- build and maintain a 2D occupancy map
-- estimate pose without wheel encoders
-- choose exploration targets autonomously
-- navigate to those targets with classical planning/control
-- produce replayable telemetry for debugging
+**To arm:**
+```bash
+kill -USR1 $(pgrep robot)
+```
 
-The overall design is intentionally hybrid:
+**To stop:**
+```bash
+kill $(pgrep robot)          # clean shutdown — motors zeroed via Drop
+pkill -9 robot               # last resort — SIGKILL does NOT zero motors
+```
 
-- **Learning** is used only for exploration target selection
-- **Classical robotics** is used for motion, mapping, control, and safety
+**Safety interlocks (always active, regardless of arm state):**
+- Ultrasonic < 15 cm → emergency stop, transitions to `SafetyStopped`
+- 500 ms motor watchdog → zeros motors if command pipeline stalls
+- `Drop` on motor controller → zeros motors on shutdown or panic unwind
+
+**After an emergency stop:** robot stays in `SafetyStopped`. Re-arm with a second `kill -USR1`.
+
+**On crash:** motors zero within ~40 ms (Drop impl). SIGKILL is the only case where motors don't stop automatically — keep a hand on the power switch for initial runs.
+
+---
+
+## What Is Built and Working
+
+| Subsystem | Status | Notes |
+|---|---|---|
+| HAL (motor, US, gimbal, camera, IMU) | Done | Yahboom I2C protocol reverse-engineered and confirmed |
+| Executive state machine | Done | `Idle → Exploring` via SIGUSR1; `Exploring → SafetyStopped` on estop |
+| Safety layer | Done | US interlock + motor watchdog + Drop crash-stop |
+| MiDaS ONNX depth inference | Done | `midas_small.onnx`, 147 ms on Pi 5, 4 threads |
+| Event-driven vision gate | Done | Skips inference when scene is unchanged |
+| Pseudo-lidar extraction | Done | 48 rays, 3 m max range |
+| Occupancy grid mapping | Done | 5 cm/cell, log-odds, frontier BFS clustering |
+| A* planner + pure pursuit | Done | 2-cell safety margin; 0.2 m lookahead |
+| RL frontier selector | Done | AWR training pipeline; classical fallback if no model |
+| sim_fast (2D simulator) | Done | 200×200 grid, 48-ray lidar, mecanum kinematics |
+| UI bridge | Done | WebSocket, live map/pose/frontiers at `ws://raspbot:9090` |
+| Telemetry | Done | NDJSON log writer; replay tooling not yet built |
+| Micro-SLAM | Partial | IMU dead-reckoning only (gyro integration, confidence=0.3) — **drifts** |
+
+---
+
+## Key Gaps for Phase 17
+
+### 1. Operational mode dispatch (blocking)
+The binary always runs the full exploration loop. There is no `calibrate` or `slam-debug` mode yet. Implement `std::env::args()` dispatch in `runtime/src/main.rs` so that:
+- `robot calibrate` runs IMU bias collection without the exploration stack
+- `robot slam-debug` runs camera + IMU + telemetry only (no planning/motors)
+- `robot robot-run` (default) runs the full stack as today
+
+### 2. Micro-SLAM visual pipeline (blocking for extended runs)
+`micro_slam/src/lib.rs` contains only `ImuDeadReckon` — gyro-only integration. This drifts significantly after a few metres. The architecture requires a visual-inertial pipeline (§8, REQUIREMENTS.md):
+- FAST/ORB feature detection on grayscale frames
+- Lucas–Kanade optical flow tracking
+- IMU-fused pose update
+- Keyframe-based drift reduction
+
+Until this is in, map quality degrades quickly and the robot cannot explore beyond a single room reliably.
+
+### 3. HAL I2C priority (watch, not blocking)
+Currently each HAL driver makes independent I2C calls with no bus arbiter. Safety is enforced by tokio biased-select in the motor task. This is acceptable for now but should be revisited if safety commands are observed to lag during heavy gimbal/US polling.
 
 ---
 
 ## Locked Architectural Decisions
 
-These are intentional design choices and should not be changed without asking first.
+Do not change these without asking first.
 
-### 1. RL is only for exploration strategy
-The reinforcement learning agent does **not** control motors directly.
-
-RL is used only to choose the next exploration target / frontier selection policy.
-
-### 2. Motion is classical
-Robot motion uses:
-
-- occupancy mapping
-- frontier detection
-- A* planning
-- pure-pursuit control
-- recovery behaviors
-
-### 3. No wheel encoders
-Wheel encoders are not available and are not part of the initial architecture.
-
-### 4. IMU is required
-An MPU-class IMU will be added and used for heading stabilization and visual-inertial localization.
-
-### 5. Localization is micro-SLAM, not full SLAM
-Initial localization uses a lightweight camera + IMU pipeline:
-
-- feature tracking
-- IMU propagation
-- local keyframes
-- fused `Pose2D`
-
-Initial release does **not** require loop closure or full global SLAM.
-
-### 6. Depth is converted to pseudo-lidar
-MiDaS depth is not used directly for mapping. It is converted into lidar-like rays and raycast into the occupancy grid.
-
-### 7. Vision is event-driven
-Depth inference should not run continuously if unnecessary. The system should reuse the last depth estimate when the scene has not changed enough to justify another inference.
-
-### 8. Message-bus architecture is required
-Subsystems should communicate through typed asynchronous messages rather than direct coupling.
-
-### 9. Telemetry and replay are mandatory
-A replayable, timestamped telemetry system is a required part of the architecture, not an optional add-on.
-
-### 10. No ROS2
-The project is intentionally standalone Rust without ROS2.
+1. **RL selects frontiers only — not motor commands.** The RL agent outputs a frontier choice; classical A* + pure-pursuit handles motion.
+2. **US sensor is a safety interlock, not an RL input.** The policy sees depth maps only.
+3. **Gimbal is reactive, not an RL action.** The gimbal controller steers toward free space independently.
+4. **No ROS2.** Standalone Rust binary.
+5. **Message-bus architecture.** Subsystems communicate via typed async channels on the bus, not direct coupling.
+6. **Telemetry is mandatory.** Every run should produce a replayable NDJSON log.
+7. **Classical frontier heuristics must work before RL is evaluated.** RL adds value on top of a working classical baseline.
 
 ---
 
-## System Overview
+## Recommended Phase 17 Sequence
 
-High-level pipeline:
-
-```text
-Camera
-   ↓
-Event-Driven Vision Gate
-   ↓
-MiDaS Depth
-   ↓
-Pseudo-Lidar Extraction
-   ↓
-Micro-SLAM Pose Estimation (camera + IMU)
-   ↓
-Occupancy Grid Mapping
-   ↓
-Frontier Detection
-   ↓
-RL Frontier Selection
-   ↓
-A* Planner
-   ↓
-Pure Pursuit Controller
-   ↓
-Motors
-```
+1. **Build and deploy** to Pi — confirm clean compile and startup
+2. **Wheels-up test** — arm with SIGUSR1, verify exploration runs (map builds, robot stays still, no segfault)
+3. **Add operational mode dispatch** — unblocks calibration and slam-debug
+4. **IMU bias calibration** — flat surface, stationary, collect bias offsets, write to `robot_config.yaml`
+5. **slam-debug run** — camera + IMU logging only, drive manually, inspect pose drift in telemetry
+6. **First real floor run** — wheels down, arm, let it explore one room, observe and log
+7. **Tune and iterate** — reward shaping, speed, obstacle inflation based on observed behaviour
+8. **Visual-inertial micro-SLAM** — implement feature tracking (see §8 in REQUIREMENTS.md), replace dead-reckoning
 
 ---
 
-## Primary Implementation Goal
+## Robot Hardware Quick Reference
 
-Create a compilable Rust workspace that matches the architecture in `requirements_v3.md`.
-
-Target crates/modules:
-
-```text
-robot/
- ├── config/
- ├── core_types/
- ├── bus/
- ├── hal/
- ├── perception/
- ├── micro_slam/
- ├── mapping/
- ├── exploration_rl/
- ├── planning/
- ├── control/
- ├── safety/
- ├── telemetry/
- └── runtime/
-```
-
-The initial goal is not “full autonomy immediately.” The initial goal is a sound, testable, debuggable software foundation.
-
----
-
-## First Milestone
-
-Deliver a non-autonomous debug-capable system that can:
-
-- read camera frames
-- read IMU data
-- publish typed messages on the bus
-- log synchronized telemetry
-- run event-driven depth inference
-- generate pseudo-lidar
-- produce a basic fused pose estimate
-- write replayable logs
-
-This milestone is more important than RL or full exploration.
-
----
-
-## Recommended Implementation Order
-
-Implement in this sequence unless a strong reason appears not to.
-
-1. workspace skeleton
-2. `core_types`
-3. `bus`
-4. `telemetry`
-5. `hal` stubs
-6. IMU integration
-7. camera pipeline
-8. event-driven depth
-9. pseudo-lidar extraction
-10. micro-SLAM prototype
-11. occupancy mapping
-12. planner + controller
-13. safety layer
-14. fast simulator
-15. RL frontier selector
-16. real robot integration
-17. simulator/perception refinement
-
----
-
-## Technical Priorities
-
-### Highest priority
-- code clarity
-- typed interfaces
-- replayability
-- deterministic subsystem boundaries
-- simple, debuggable implementations first
-
-### Lower priority for early phases
-- peak performance optimization
-- advanced RL
-- full SLAM
-- semantic perception
-- sophisticated simulator realism
-
----
-
-## Guidance for Key Subsystems
-
-### Bus
-Prefer a simple `tokio`-based bus using appropriate channel types:
-
-- `broadcast` for shared sensor streams
-- `watch` for latest-state topics
-- `mpsc` for command paths
-
-Messages should be timestamped and typed.
-
-### Telemetry
-Telemetry must record enough information to replay runs offline.
-
-At minimum include:
-
-- timestamps
-- topic names
-- message source
-- payload
-- event markers
-
-### Perception
-Use the simplest pipeline that works first:
-
-- grayscale frame preprocessing
-- event-driven inference gate
-- MiDaS inference
-- pseudo-lidar extraction
-
-Do not overcomplicate depth handling early.
-
-### Micro-SLAM
-Keep the first version minimal:
-
-- FAST or ORB features
-- Lucas–Kanade optical flow or equivalent short-horizon tracking
-- IMU-assisted pose fusion
-- 2D pose output
-- confidence metric
-
-Avoid loop closure and graph optimization initially.
-
-### Mapping
-Standard occupancy grid is acceptable for the first implementation.
-Do not switch to TSDF unless specifically asked later.
-
-### RL
-RL should remain isolated from motion control.
-It should choose frontier targets or frontier-selection heuristics only.
-
----
-
-## Constraints
-
-- target platform: Raspberry Pi 5
-- no wheel encoders
-- no ROS2
-- keep dependencies modest where reasonable
-- prefer simple implementations over sophisticated but fragile ones
-- optimize for observability and incremental testing
-
----
-
-## Known Open Questions
-
-These are still open and can be handled pragmatically during implementation.
-
-- OpenCV bindings vs pure Rust for feature tracking
-- exact IMU hardware details and calibration workflow
-- exact telemetry storage format
-- exact replay tooling format
-- ONNX Runtime deployment details on the Pi
-- how much of `sim_vision` is needed in the earliest phase
-
-These are implementation choices, not blockers.
-
----
-
-## What Success Looks Like Early
-
-A successful early implementation will let us:
-
-- boot the system cleanly
-- inspect live or logged camera/IMU streams
-- confirm messages flow through the bus
-- inspect pseudo-lidar output
-- inspect pose estimates over short indoor runs
-- replay a run and compare subsystem outputs offline
-
-If those work, the project is on a strong path.
-
----
-
-## What Not To Do Early
-
-Please avoid these until the foundation is working:
-
-- direct RL motor control
-- full loop-closure SLAM
-- complex graph optimization
-- over-engineered planner stacks
-- premature simulator complexity
-- heavy coupling between crates/modules
-- “helpful” architectural rewrites that conflict with the current spec
-
----
-
-## Delivery Style Requested
-
-Please implement incrementally and keep the project runnable at each stage.
-
-Preferred style:
-
-- small coherent commits / changesets
-- clear TODO markers
-- compile-first scaffolding
-- explicit interfaces
-- stubs where needed rather than speculative complexity
-- practical notes about tradeoffs when making implementation choices
-
----
-
-## Final Note
-
-This project is intended to be:
-
-- practical
-- debuggable
-- modular
-- realistic for a Pi-class robot
-
-Please preserve those qualities over elegance or novelty.
+| Item | Value |
+|---|---|
+| SSH | `ssh pi@raspbot` (10.0.0.183) |
+| ORT dylib | `export ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.so` |
+| MiDaS model | `models/midas_small.onnx` |
+| Build (Pi) | `cargo build --release -p runtime` |
+| Build (dev) | `cargo check --workspace --no-default-features` |
+| UI bridge | `http://raspbot:9090` (WebSocket) |
+| Camera stream | `http://raspbot:8080/` (MJPEG) |
+| Emergency stop pin | Physical power switch on robot body |
