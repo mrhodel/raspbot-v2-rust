@@ -624,8 +624,12 @@ async fn main() -> anyhow::Result<()> {
             // right_avg > left_avg → right side more blocked → pan left (negative).
             let pan_error = (left_sum - right_sum) / n;
             let (cur_pan, _) = gimbal.angles();
-            let new_pan = (cur_pan + pan_error * 20.0).clamp(-90.0, 90.0);
-            if (new_pan - cur_pan).abs() > 2.0 {
+            // Clamp step to ±5° per frame so the gimbal doesn't lurch on noisy
+            // MiDaS frames. Deadband of 8° filters per-frame renormalization
+            // noise (even a static symmetric scene can produce ~0.3 imbalance).
+            let step = (pan_error * 20.0).clamp(-5.0, 5.0);
+            let new_pan = (cur_pan + step).clamp(-90.0, 90.0);
+            if (new_pan - cur_pan).abs() > 8.0 {
                 if let Err(e) = gimbal.set_pan(new_pan).await {
                     warn!("Gimbal pan error: {e}");
                 }
