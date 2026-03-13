@@ -115,7 +115,10 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     let pose = null;
     let frontiers = [];
     let lidarRays = null;
+    let lastPan = 0;       // gimbal pan in degrees; 0 = forward
     let flashFrames = 0;
+    let flashColor = '#ff4444';
+    let flashLabel = '';
 
     // ── Canvas elements ────────────────────────────────────────────────────
     const bgC = document.getElementById('map-bg');
@@ -232,7 +235,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       fgX.save();
       fgX.translate(rx, ry);
       fgX.rotate(-theta);   // negate: Y is flipped
-      fgX.fillStyle = flashFrames > 0 ? '#ff4444' : '#00ff44';
+      fgX.fillStyle = flashFrames > 0 ? flashColor : '#00ff44';
       if (flashFrames > 0) flashFrames--;
       fgX.beginPath();
       fgX.moveTo( sz,  0);
@@ -241,6 +244,29 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       fgX.closePath();
       fgX.fill();
       fgX.restore();
+
+      // Camera / gimbal pan direction — yellow line from robot centre.
+      // Shows where the camera is looking relative to the heading triangle.
+      const panRad = lastPan * Math.PI / 180;
+      const lookAngle = theta + panRad;
+      const lookLen = sz * 3.5;
+      fgX.strokeStyle = '#ffee00';
+      fgX.lineWidth = 2;
+      fgX.beginPath();
+      fgX.moveTo(rx, ry);
+      fgX.lineTo(rx + Math.cos(lookAngle) * lookLen, ry - Math.sin(lookAngle) * lookLen);
+      fgX.stroke();
+
+      // Episode-end label (CRASH / TIMEOUT).
+      if (flashFrames > 0 && flashLabel) {
+        fgX.save();
+        fgX.font = 'bold 28px monospace';
+        fgX.textAlign = 'center';
+        fgX.fillStyle = flashColor;
+        fgX.globalAlpha = flashFrames / 60;
+        fgX.fillText(flashLabel, fgC.width / 2, fgC.height / 2);
+        fgX.restore();
+      }
     }
 
     // ── Telemetry helpers ──────────────────────────────────────────────────
@@ -287,7 +313,11 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
             case 'executive/state': {
               const lbl = stateLabel(msg.data);
               document.getElementById('mode').textContent = lbl;
-              if (lbl === 'SafetyStopped') flashFrames = 30;
+              if (lbl === 'SafetyStopped') {
+                flashColor = '#ffaa00'; flashLabel = 'TIMEOUT'; flashFrames = 60;
+              } else if (lbl === 'Fault') {
+                flashColor = '#ff2200'; flashLabel = 'CRASH';   flashFrames = 60;
+              }
               break;
             }
             case 'sensor/ultrasonic': {
@@ -303,6 +333,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               break;
             }
             case 'gimbal/pan':
+              lastPan = msg.data || 0;
               document.getElementById('pan').textContent = fmt(msg.data, 1);
               break;
           }

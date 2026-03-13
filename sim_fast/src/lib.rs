@@ -156,7 +156,9 @@ impl FastSim {
     }
 
     /// Advance the simulation by one time step.
-    pub fn step(&mut self, action: u8) -> SimStep {
+    /// `pan_deg` shifts the camera's field of view: >0 = looking right, <0 = left.
+    /// Use `step()` for pan=0 (backward-compatible).
+    pub fn step_with_pan(&mut self, action: u8, pan_deg: f32) -> SimStep {
         let act = Action::from_u8(action);
         let (vx, vy, omega) = action_to_velocity(act);
 
@@ -179,20 +181,36 @@ impl FastSim {
         self.t_ms += (DT_S * 1000.0) as u64;
 
         let done = collision || self.step_count >= MAX_STEPS;
-        self.make_step(collision)
+        self.make_step_pan(collision, pan_deg)
             .with_done(done)
+    }
+
+    /// Advance the simulation by one time step with the camera pointing forward.
+    pub fn step(&mut self, action: u8) -> SimStep {
+        self.step_with_pan(action, 0.0)
+    }
+
+    /// Return the centered (pan=0) scan at the current robot position without
+    /// advancing physics.  Used by navigation heuristics that must see the full
+    /// forward corridor regardless of where the visual gimbal is pointing.
+    pub fn nav_scan(&self) -> PseudoLidarScan {
+        self.cast_lidar_pan(0.0)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    fn make_step(&self, collision: bool) -> SimStep {
+    fn make_step_pan(&self, collision: bool, pan_deg: f32) -> SimStep {
         SimStep {
-            scan:      self.cast_lidar(),
+            scan:      self.cast_lidar_pan(pan_deg),
             imu:       self.synthetic_imu(),
             pose:      self.pose(),
             collision,
             done: false, // caller sets this
         }
+    }
+
+    fn make_step(&self, collision: bool) -> SimStep {
+        self.make_step_pan(collision, 0.0)
     }
 
     fn pose(&self) -> Pose2D {
@@ -219,11 +237,17 @@ impl FastSim {
 
     // ── Raycasting ────────────────────────────────────────────────────────────
 
-    fn cast_lidar(&self) -> PseudoLidarScan {
+    /// Cast a pseudo-lidar scan with the camera centred at `pan_deg` offset.
+    ///
+    /// `pan_deg` > 0 = camera looking right (hardware convention: pan_deg = +90 → raw=0 → right).
+    /// In the robot's angle frame (positive = CCW = left), right = negative, so the fan centre
+    /// shifts by `-pan_deg * π/180`.  Ray `angle_rad` values are always in robot frame.
+    fn cast_lidar_pan(&self, pan_deg: f32) -> PseudoLidarScan {
+        let pan_rad = -pan_deg * std::f32::consts::PI / 180.0;
         let mut rays = Vec::with_capacity(NUM_RAYS);
         for i in 0..NUM_RAYS {
             let frac = i as f32 / (NUM_RAYS - 1) as f32; // 0..1
-            let local_angle = -HALF_FOV_RAD + frac * 2.0 * HALF_FOV_RAD;
+            let local_angle = pan_rad + (-HALF_FOV_RAD + frac * 2.0 * HALF_FOV_RAD);
             let world_angle = self.robot_theta + local_angle;
             let range = self.cast_ray(self.robot_x, self.robot_y, world_angle);
             rays.push(LidarRay {
@@ -234,6 +258,7 @@ impl FastSim {
         }
         PseudoLidarScan { t_ms: self.t_ms, rays }
     }
+
 
     fn cast_ray(&self, ox: f32, oy: f32, angle: f32) -> f32 {
         let dx = angle.cos() * RAY_STEP_M;
