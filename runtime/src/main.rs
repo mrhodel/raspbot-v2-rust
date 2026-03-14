@@ -497,12 +497,24 @@ async fn main() -> anyhow::Result<()> {
     // A new Path from the planner replaces the active path immediately.
     // When the robot reaches the final waypoint (within GOAL_TOLERANCE_M),
     // the path is cleared and CmdVel stops — the motor watchdog zeroes motors.
+    //
+    // Reactive obstacle avoidance: reads nearest_obstacle_m from the pseudo-lidar
+    // bus on every tick.  Forward speed scales to zero as the obstacle closes in;
+    // at OBSTACLE_STOP_M the path is abandoned and a replan is requested by
+    // clearing current_path (the planner will re-run on the next FrontierChoice).
+    // This fires well above the 25 cm hardware safety interlock.
     const CONTROL_HZ: f64 = 10.0;
     const GOAL_TOLERANCE_M: f32 = 0.25; // metres — close enough to declare goal reached
+    /// Nearest-obstacle distance at which forward speed begins scaling down.
+    const OBSTACLE_SLOW_M: f32 = 0.80;
+    /// Nearest-obstacle distance at which forward motion stops and path is abandoned.
+    /// Must be well above the 25 cm hardware safety interlock.
+    const OBSTACLE_STOP_M: f32 = 0.40;
 
     let bus_ctrl       = Arc::clone(&bus);
     let mut ctrl_rx    = control_path_rx;
     let mut rx_pose_c  = bus.slam_pose2d.subscribe();
+    let rx_nearest_c   = bus.nearest_obstacle_m.subscribe();
     let ctrl_handle = tokio::spawn(async move {
         use std::time::Duration;
         use core_types::Path;
@@ -510,6 +522,9 @@ async fn main() -> anyhow::Result<()> {
         let controller = PurePursuitController::new();
         let mut current_path: Option<Path> = None;
         let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / CONTROL_HZ));
+        // Tracks whether we've already cleared the path due to an obstacle so we
+        // don't spam the log and re-clear on every tick while stopped.
+        let mut obstacle_stopped = false;
         loop {
             tokio::select! {
                 biased;
@@ -519,6 +534,7 @@ async fn main() -> anyhow::Result<()> {
                         Some(p) => {
                             info!(waypoints = p.waypoints.len(), "Control: new path, tracking");
                             current_path = Some(p);
+                            obstacle_stopped = false; // fresh path — re-enable avoidance check
                         }
                         None => break,
                     }
@@ -534,10 +550,42 @@ async fn main() -> anyhow::Result<()> {
                         if dx * dx + dy * dy < GOAL_TOLERANCE_M * GOAL_TOLERANCE_M {
                             info!("Control: goal reached");
                             current_path = None;
+                            obstacle_stopped = false;
                             continue;
                         }
                     }
-                    let cmd_vel = controller.compute(&pose, path);
+
+                    // ── Reactive obstacle avoidance ──────────────────────────
+                    // Scale vx [0, 1] based on nearest obstacle in camera FOV.
+                    // omega is unaffected — the robot can still rotate away.
+                    let nearest = *rx_nearest_c.borrow();
+                    let speed_scale = if nearest >= OBSTACLE_SLOW_M {
+                        1.0_f32
+                    } else if nearest <= OBSTACLE_STOP_M {
+                        0.0_f32
+                    } else {
+                        (nearest - OBSTACLE_STOP_M) / (OBSTACLE_SLOW_M - OBSTACLE_STOP_M)
+                    };
+
+                    if speed_scale <= 0.0 {
+                        if !obstacle_stopped {
+                            warn!(
+                                nearest_m = nearest,
+                                stop_threshold_m = OBSTACLE_STOP_M,
+                                "Control: obstacle too close — stopping and requesting replan"
+                            );
+                            obstacle_stopped = true;
+                            current_path = None; // one-shot: planner replans on next FrontierChoice
+                        }
+                        // Motor watchdog will zero motors within 500 ms.
+                        continue;
+                    }
+
+                    let mut cmd_vel = controller.compute(&pose, path);
+                    cmd_vel.vx *= speed_scale;
+                    if speed_scale < 0.99 {
+                        tracing::debug!(nearest_m = nearest, speed_scale, "Control: slowing for obstacle");
+                    }
                     let _ = bus_ctrl.controller_cmd_vel.try_send(cmd_vel);
                 }
             }
