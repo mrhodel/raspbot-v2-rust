@@ -358,10 +358,10 @@ async fn main() -> anyhow::Result<()> {
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
-                                // Forward-arc nearest obstacle: only rays within ±30°
-                                // of centre.  Side walls don't threaten forward motion.
+                                // Nearest obstacle across the full camera FOV.
+                                // Narrow cones (±15°, ±30°) miss angled approaches —
+                                // confirmed on hardware: robot hit box at 45° nose-first.
                                 let near_m = scan.rays.iter()
-                                    .filter(|r| r.angle_rad.abs() <= std::f32::consts::FRAC_PI_6)
                                     .map(|r| r.range_m)
                                     .fold(f32::MAX, f32::min);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
@@ -1681,10 +1681,10 @@ async fn run_slam_debug(
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
-                                // Forward-arc nearest obstacle: only rays within ±30°
-                                // of centre.  Side walls don't threaten forward motion.
+                                // Nearest obstacle across the full camera FOV.
+                                // Narrow cones (±15°, ±30°) miss angled approaches —
+                                // confirmed on hardware: robot hit box at 45° nose-first.
                                 let near_m = scan.rays.iter()
-                                    .filter(|r| r.angle_rad.abs() <= std::f32::consts::FRAC_PI_6)
                                     .map(|r| r.range_m)
                                     .fold(f32::MAX, f32::min);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
