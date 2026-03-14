@@ -30,6 +30,7 @@ planning           = { workspace = true }
 control            = { workspace = true }
 safety             = { workspace = true }
 exploration_rl     = { workspace = true }
+sim_fast           = { workspace = true }
 tokio              = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }

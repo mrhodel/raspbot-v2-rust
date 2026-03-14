@@ -79,6 +79,11 @@ async fn main() -> anyhow::Result<()> {
     let _telem_event_rx  = rx.telemetry_event;
     info!("Message bus created");
 
+    // ── Sim mode — short-circuit before any HAL init ──────────────────────────
+    if mode == "sim" {
+        return run_sim_mode(bus, cfg, plan_frontier_rx, control_path_rx, cmdvel_rx).await;
+    }
+
     // ── Telemetry ─────────────────────────────────────────────────────────────
     let mut telem = TelemetryWriter::open("logs/robot.ndjson").await?;
     telem.event("runtime", "system_boot").await?;
@@ -468,7 +473,7 @@ async fn main() -> anyhow::Result<()> {
     let mut plan_rx     = plan_frontier_rx;
     let mut rx_pose_p   = bus.slam_pose2d.subscribe();
     let plan_handle = tokio::spawn(async move {
-        info!("Planning task started (A*, 2-cell clearance)");
+        info!("Planning task started (A*, 4-cell clearance)");
         let planner = AStarPlanner::new();
         loop {
             let Some(choice) = plan_rx.recv().await else { break };
@@ -872,6 +877,340 @@ fn select_frontier_goal(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// ── Sim mode ──────────────────────────────────────────────────────────────────
+//
+// Runs the full autonomy stack (mapping, planning, control, frontier selection,
+// executive) against a `sim_fast::FastSim` instead of real hardware.
+//
+// The sim driver task replaces all HAL tasks: it reads CmdVel from the same
+// bus channel the motor task would use, steps the sim, and publishes synthetic
+// sensor data (PseudoLidarScan, Pose2D, UltrasonicReading, nearest_obstacle_m)
+// back onto the bus.  Every software task runs unmodified — including the
+// reactive obstacle avoidance in the control task.
+//
+// Usage: `robot sim [seed]`   (seed defaults to 42)
+//
+// SIGUSR1 arms the robot, same as robot-run mode.
+// After a collision the episode auto-resets; the robot stays SafetyStopped
+// until SIGUSR1 re-arms it (mirrors real-robot behaviour so the same care
+// must be taken in sim as on the real floor).
+
+async fn run_sim_mode(
+    bus:              Arc<bus::Bus>,
+    _cfg:             config::RobotConfig,
+    plan_frontier_rx: tokio::sync::mpsc::Receiver<core_types::FrontierChoice>,
+    control_path_rx:  tokio::sync::mpsc::Receiver<core_types::Path>,
+    cmdvel_rx:        tokio::sync::mpsc::Receiver<core_types::CmdVel>,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    let seed: u64 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(42);
+    info!(seed, "Sim mode starting");
+
+    // ── Mapper (shared between mapping + planning tasks) ──────────────────────
+    let mapper = Arc::new(RwLock::new(Mapper::new()));
+
+    // ── Executive task ────────────────────────────────────────────────────────
+    let (arm_tx, mut arm_rx) = tokio::sync::mpsc::channel::<()>(4);
+    let mut rx_safety_exec   = bus.safety_state.subscribe();
+    let bus_exec             = Arc::clone(&bus);
+    tokio::spawn(async move {
+        let mut exec = executive::Executive::new(Arc::clone(&bus_exec));
+        info!("Sim executive task started (Idle) — send SIGUSR1 to arm");
+        loop {
+            tokio::select! {
+                biased;
+                _ = arm_rx.recv() => {
+                    match exec.arm() {
+                        Ok(())  => info!("Sim executive: armed → Exploring"),
+                        Err(e)  => warn!("Sim executive arm rejected: {e}"),
+                    }
+                }
+                Ok(()) = rx_safety_exec.changed() => {
+                    let safety = rx_safety_exec.borrow().clone();
+                    if matches!(safety, SafetyState::EmergencyStop { .. }) {
+                        match exec.state() {
+                            ExecutiveState::Exploring | ExecutiveState::Recovering => {
+                                let _ = exec.transition(ExecutiveState::SafetyStopped);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // SIGUSR1 → arm (same signal as real robot)
+    let arm_tx_sig = arm_tx.clone();
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig = match signal(SignalKind::user_defined1()) {
+            Ok(s)  => s,
+            Err(e) => { warn!("SIGUSR1 handler failed: {e}"); return; }
+        };
+        loop {
+            sig.recv().await;
+            info!("SIGUSR1 received — arming sim robot");
+            let _ = arm_tx_sig.send(()).await;
+        }
+    });
+
+    // ── Frontier selector task ────────────────────────────────────────────────
+    exploration_rl::spawn_selector_task(Arc::clone(&bus)).await;
+
+    // ── Mapping task ──────────────────────────────────────────────────────────
+    let bus_map       = Arc::clone(&bus);
+    let mapper_map    = Arc::clone(&mapper);
+    let mut rx_lidar  = bus.vision_pseudo_lidar.subscribe();
+    let mut rx_pose_m = bus.slam_pose2d.subscribe();
+    tokio::spawn(async move {
+        info!("Sim mapping task started");
+        loop {
+            match rx_lidar.recv().await {
+                Ok(scan) => {
+                    let pose = *rx_pose_m.borrow_and_update();
+                    let (delta, frontiers, stats) = {
+                        let mut m = mapper_map.write().await;
+                        m.update(&scan, &pose)
+                    };
+                    let _ = bus_map.map_grid_delta.send(delta);
+                    let _ = bus_map.map_frontiers.send(frontiers);
+                    let _ = bus_map.map_explored_stats.send(stats);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Sim mapping task lagged {n} scans");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // ── Planning task ─────────────────────────────────────────────────────────
+    let bus_plan      = Arc::clone(&bus);
+    let mapper_plan   = Arc::clone(&mapper);
+    let mut plan_rx   = plan_frontier_rx;
+    let mut rx_pose_p = bus.slam_pose2d.subscribe();
+    tokio::spawn(async move {
+        info!("Sim planning task started (A*, 4-cell clearance)");
+        let planner = AStarPlanner::new();
+        loop {
+            let Some(choice) = plan_rx.recv().await else { break };
+            let pose = *rx_pose_p.borrow_and_update();
+            let maybe_goal = {
+                let m = mapper_plan.read().await;
+                select_frontier_goal(&m, &choice, &pose)
+            };
+            if let Some(goal) = maybe_goal {
+                let m = mapper_plan.read().await;
+                match planner.plan(&m, &pose, goal) {
+                    Some(path) => {
+                        info!(waypoints = path.waypoints.len(), "Sim planning: path found");
+                        let _ = bus_plan.planner_path.send(path).await;
+                    }
+                    None => warn!(?choice, "Sim planning: no path to frontier"),
+                }
+            }
+        }
+    });
+
+    // ── Control task ──────────────────────────────────────────────────────────
+    // Identical to robot-run: reactive obstacle avoidance active.
+    const SIM_CONTROL_HZ: f64 = 10.0;
+    const SIM_GOAL_TOLERANCE_M: f32 = 0.25;
+    const SIM_OBSTACLE_SLOW_M: f32 = 0.80;
+    const SIM_OBSTACLE_STOP_M: f32 = 0.40;
+    let bus_ctrl       = Arc::clone(&bus);
+    let mut ctrl_rx    = control_path_rx;
+    let mut rx_pose_c  = bus.slam_pose2d.subscribe();
+    let rx_nearest_c   = bus.nearest_obstacle_m.subscribe();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        use core_types::Path;
+        info!("Sim control task started (pure-pursuit {SIM_CONTROL_HZ} Hz)");
+        let controller = PurePursuitController::new();
+        let mut current_path: Option<Path> = None;
+        let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / SIM_CONTROL_HZ));
+        let mut obstacle_stopped = false;
+        loop {
+            tokio::select! {
+                biased;
+                result = ctrl_rx.recv() => {
+                    match result {
+                        Some(p) => {
+                            info!(waypoints = p.waypoints.len(), "Sim control: new path, tracking");
+                            current_path = Some(p);
+                            obstacle_stopped = false;
+                        }
+                        None => break,
+                    }
+                }
+                _ = tick.tick() => {
+                    let Some(ref path) = current_path else { continue };
+                    let pose = *rx_pose_c.borrow_and_update();
+                    if let Some(&[gx, gy]) = path.waypoints.last() {
+                        let dx = gx - pose.x_m;
+                        let dy = gy - pose.y_m;
+                        if dx * dx + dy * dy < SIM_GOAL_TOLERANCE_M * SIM_GOAL_TOLERANCE_M {
+                            info!("Sim control: goal reached");
+                            current_path = None;
+                            obstacle_stopped = false;
+                            continue;
+                        }
+                    }
+                    let nearest = *rx_nearest_c.borrow();
+                    let speed_scale = if nearest >= SIM_OBSTACLE_SLOW_M {
+                        1.0_f32
+                    } else if nearest <= SIM_OBSTACLE_STOP_M {
+                        0.0_f32
+                    } else {
+                        (nearest - SIM_OBSTACLE_STOP_M) / (SIM_OBSTACLE_SLOW_M - SIM_OBSTACLE_STOP_M)
+                    };
+                    if speed_scale <= 0.0 {
+                        if !obstacle_stopped {
+                            warn!(nearest_m = nearest, "Sim control: obstacle too close — stopping and requesting replan");
+                            obstacle_stopped = true;
+                            current_path = None;
+                        }
+                        continue;
+                    }
+                    let mut cmd_vel = controller.compute(&pose, path);
+                    cmd_vel.vx *= speed_scale;
+                    let _ = bus_ctrl.controller_cmd_vel.try_send(cmd_vel);
+                }
+            }
+        }
+    });
+
+    // ── Sim driver task ───────────────────────────────────────────────────────
+    // Reads CmdVel from the bus, steps FastSim, publishes synthetic sensor data.
+    // On collision: publishes EmergencyStop then auto-resets the episode after
+    // a 2 s pause (mirrors the 5 s safety latch on the real robot).
+    let bus_sim       = Arc::clone(&bus);
+    let arm_tx_sim    = arm_tx.clone();
+    let mut cmdvel_rx = cmdvel_rx;
+    tokio::spawn(async move {
+        use sim_fast::{FastSim, Action};
+        use std::time::Duration;
+        use std::sync::Arc as StdArc;
+        use tokio::sync::Mutex;
+
+        let sim = StdArc::new(Mutex::new(FastSim::new(seed)));
+        let rx_pan = bus_sim.gimbal_pan_deg.subscribe();
+
+        let initial = sim.lock().await.reset();
+        sim_publish(&bus_sim, &initial);
+        info!("Sim driver task started — send SIGUSR1 to arm");
+
+        let mut episode = 0u32;
+        loop {
+            // Drain cmdvel channel — use the last one received.
+            let mut latest_cv: Option<core_types::CmdVel> = None;
+            while let Ok(cv) = cmdvel_rx.try_recv() {
+                latest_cv = Some(cv);
+            }
+
+            let action = latest_cv.map(sim_cmdvel_to_action).unwrap_or(Action::Stop);
+            let pan_deg = *rx_pan.borrow();
+
+            let step = sim.lock().await.step_with_pan(action as u8, pan_deg);
+            sim_publish(&bus_sim, &step);
+
+            if step.collision {
+                episode += 1;
+                warn!(episode, "Sim: COLLISION — resetting episode in 2 s");
+                let _ = bus_sim.safety_state.send(SafetyState::EmergencyStop {
+                    reason: format!("Sim collision (episode {episode})"),
+                });
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Reset and publish the fresh starting state.
+                let reset_step = sim.lock().await.reset();
+                sim_publish(&bus_sim, &reset_step);
+                // Clear the latch: new episode, new space.
+                let _ = bus_sim.safety_state.send(SafetyState::Ok);
+                // Re-arm automatically so exploration continues unattended.
+                // (Same behaviour as hitting SIGUSR1 after a collision.)
+                info!("Sim: auto-re-arming after episode reset");
+                let _ = arm_tx_sim.send(()).await;
+                continue;
+            }
+
+            if step.done {
+                episode += 1;
+                info!(episode, "Sim: max steps reached — resetting");
+                let reset_step = sim.lock().await.reset();
+                sim_publish(&bus_sim, &reset_step);
+                let _ = arm_tx_sim.send(()).await;
+                continue;
+            }
+
+            // 10 Hz pacing — the control task also runs at 10 Hz so we stay in sync.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    info!("Sim mode running — press Ctrl+C to stop");
+    tokio::signal::ctrl_c().await?;
+    info!("Sim mode: shutting down");
+    Ok(())
+}
+
+/// Publish one SimStep's worth of sensor data onto the bus.
+fn sim_publish(bus: &bus::Bus, step: &sim_fast::SimStep) {
+    use core_types::UltrasonicReading;
+    use std::sync::Arc;
+
+    // Pose (ground truth).
+    let _ = bus.slam_pose2d.send(step.pose);
+
+    // Pseudo-lidar scan → mapping + control tasks.
+    let _ = bus.vision_pseudo_lidar.send(Arc::new(step.scan.clone()));
+
+    // Nearest obstacle: min range across all rays.
+    let nearest = step.scan.rays.iter()
+        .map(|r| r.range_m)
+        .fold(f32::MAX, f32::min);
+    let _ = bus.nearest_obstacle_m.send(nearest);
+
+    // Synthetic ultrasonic: forward ray (angle closest to 0).
+    let fwd_range_m = step.scan.rays.iter()
+        .min_by(|a, b| a.angle_rad.abs().partial_cmp(&b.angle_rad.abs()).unwrap())
+        .map(|r| r.range_m)
+        .unwrap_or(3.0);
+    let _ = bus.ultrasonic.send(UltrasonicReading {
+        t_ms:     step.pose.t_ms,
+        range_cm: fwd_range_m * 100.0,
+    });
+
+    // IMU.
+    let _ = bus.imu_raw.send(step.imu);
+}
+
+/// Convert a continuous CmdVel to the nearest discrete sim Action.
+/// Dominant component wins; small commands map to Stop.
+fn sim_cmdvel_to_action(cmd: core_types::CmdVel) -> sim_fast::Action {
+    use sim_fast::Action;
+    const THRESH: f32 = 0.05;
+    let vx = cmd.vx;
+    let vy = cmd.vy;
+    let om = cmd.omega;
+    let dominant = [
+        (vx.abs(),  if vx > 0.0 { Action::Forward     } else { Action::Stop }),
+        (vy.abs(),  if vy > 0.0 { Action::StrafeLeft  } else { Action::StrafeRight }),
+        (om.abs(),  if om > 0.0 { Action::RotateLeft  } else { Action::RotateRight }),
+    ]
+    .into_iter()
+    .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+    .map(|(mag, act)| if mag >= THRESH { act } else { Action::Stop })
+    .unwrap_or(Action::Stop);
+    dominant
+}
 
 // ── Calibrate mode ────────────────────────────────────────────────────────────
 //
