@@ -455,7 +455,7 @@ async fn main() -> anyhow::Result<()> {
             let pose = *rx_pose_p.borrow_and_update();
             let maybe_goal = {
                 let m = mapper_plan.read().await;
-                select_frontier_goal(&m, &choice)
+                select_frontier_goal(&m, &choice, &pose)
             };
             if let Some(goal) = maybe_goal {
                 let m = mapper_plan.read().await;
@@ -739,20 +739,52 @@ fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8) -> MotorCommand {
 // ── Frontier selection ────────────────────────────────────────────────────────
 
 /// Pick a world-frame goal from the mapper's cached frontier list.
-fn select_frontier_goal(mapper: &Mapper, choice: &FrontierChoice) -> Option<[f32; 2]> {
+///
+/// Frontiers within MIN_GOAL_DIST of the robot (e.g. the robot's own cell
+/// whose backward neighbors are unobserved) are excluded so the robot always
+/// drives toward a genuinely unexplored area.
+fn select_frontier_goal(
+    mapper: &Mapper,
+    choice: &FrontierChoice,
+    pose: &core_types::Pose2D,
+) -> Option<[f32; 2]> {
+    const MIN_GOAL_DIST: f32 = 0.30; // metres — skip frontiers trivially close to robot
+
     let frontiers = &mapper.last_frontiers;
     if frontiers.is_empty() {
         return None;
     }
-    let chosen = match choice {
-        FrontierChoice::Nearest | FrontierChoice::RandomValid => frontiers.first(),
-        FrontierChoice::Largest => frontiers.iter().max_by_key(|f| f.size_cells),
-        FrontierChoice::Leftmost => frontiers
-            .iter()
-            .min_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap()),
-        FrontierChoice::Rightmost => frontiers
-            .iter()
-            .max_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap()),
+
+    let dist = |f: &core_types::Frontier| -> f32 {
+        let dx = f.centroid_x_m - pose.x_m;
+        let dy = f.centroid_y_m - pose.y_m;
+        (dx * dx + dy * dy).sqrt()
+    };
+
+    // Candidates at least MIN_GOAL_DIST away; fall back to all frontiers if none qualify.
+    let candidates: Vec<_> = frontiers.iter().filter(|f| dist(f) >= MIN_GOAL_DIST).collect();
+
+    let chosen: Option<&core_types::Frontier> = match choice {
+        FrontierChoice::Nearest | FrontierChoice::RandomValid => {
+            candidates.iter().copied()
+                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
+                .min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap())
+        }
+        FrontierChoice::Largest => {
+            candidates.iter().copied()
+                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
+                .max_by_key(|f| f.size_cells)
+        }
+        FrontierChoice::Leftmost => {
+            candidates.iter().copied()
+                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
+                .min_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap())
+        }
+        FrontierChoice::Rightmost => {
+            candidates.iter().copied()
+                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
+                .max_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap())
+        }
     };
     let goal = chosen.map(|f| [f.centroid_x_m, f.centroid_y_m]);
     if let Some(g) = goal {
