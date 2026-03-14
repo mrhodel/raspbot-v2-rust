@@ -82,6 +82,10 @@ impl PseudoLidarExtractor {
             })
             .collect();
 
+        let min_r = rays.iter().map(|r| r.range_m).fold(f32::MAX, f32::min);
+        let max_r = rays.iter().map(|r| r.range_m).fold(0.0_f32, f32::max);
+        let avg_conf = rays.iter().map(|r| r.confidence).sum::<f32>() / rays.len() as f32;
+        tracing::info!(min_range_m = min_r, max_range_m = max_r, avg_conf, "PseudoLidar extracted");
         PseudoLidarScan { t_ms: depth.t_ms, rays }
     }
 }

@@ -754,7 +754,11 @@ fn select_frontier_goal(mapper: &Mapper, choice: &FrontierChoice) -> Option<[f32
             .iter()
             .max_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap()),
     };
-    chosen.map(|f| [f.centroid_x_m, f.centroid_y_m])
+    let goal = chosen.map(|f| [f.centroid_x_m, f.centroid_y_m]);
+    if let Some(g) = goal {
+        info!(x = g[0], y = g[1], frontiers = frontiers.len(), "Planning: frontier goal selected");
+    }
+    goal
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
