@@ -45,14 +45,35 @@ impl AStarPlanner {
         let (sx, sy) = mapper.world_to_cell(start.x_m, start.y_m);
         let (gx, gy) = mapper.world_to_cell(goal_m[0], goal_m[1]);
 
-        if !self.passable(mapper, sx, sy) {
-            warn!("A*: start cell ({sx},{sy}) is inside an obstacle — cannot plan");
-            return None;
-        }
-        if !self.passable(mapper, gx, gy) {
-            warn!("A*: goal cell ({gx},{gy}) is inside an obstacle — cannot plan");
-            return None;
-        }
+        let (sx, sy) = if self.passable(mapper, sx, sy) {
+            (sx, sy)
+        } else {
+            match self.nearest_passable(mapper, sx, sy) {
+                Some(cell) => {
+                    debug!("A*: start ({sx},{sy}) in clearance zone — nudged to {:?}", cell);
+                    cell
+                }
+                None => {
+                    warn!("A*: start cell ({sx},{sy}) in obstacle and no passable cell nearby");
+                    return None;
+                }
+            }
+        };
+        let (gx, gy) = if self.passable(mapper, gx, gy) {
+            (gx, gy)
+        } else {
+            // BFS outward from goal to find nearest passable cell.
+            match self.nearest_passable(mapper, gx, gy) {
+                Some(cell) => {
+                    debug!("A*: goal ({gx},{gy}) in obstacle — nudged to {:?}", cell);
+                    cell
+                }
+                None => {
+                    warn!("A*: goal cell ({gx},{gy}) in obstacle and no passable cell nearby");
+                    return None;
+                }
+            }
+        };
 
         let mut open: BinaryHeap<Node> = BinaryHeap::new();
         let mut g_cost: HashMap<(i32, i32), f32> = HashMap::new();
@@ -111,6 +132,31 @@ impl AStarPlanner {
             }
         }
         true
+    }
+
+    /// BFS from `(cx,cy)` outward to find the nearest passable cell.
+    /// Searches up to 20 cells radius; returns `None` if none found.
+    fn nearest_passable(&self, mapper: &Mapper, cx: i32, cy: i32) -> Option<(i32, i32)> {
+        use std::collections::VecDeque;
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((cx, cy));
+        visited.insert((cx, cy));
+        const MAX_RADIUS: i32 = 20;
+        while let Some((x, y)) = queue.pop_front() {
+            if (x - cx).abs().max((y - cy).abs()) > MAX_RADIUS {
+                break;
+            }
+            if self.passable(mapper, x, y) {
+                return Some((x, y));
+            }
+            for (nx, ny) in neighbors8(x, y) {
+                if visited.insert((nx, ny)) {
+                    queue.push_back((nx, ny));
+                }
+            }
+        }
+        None
     }
 
     fn reconstruct(

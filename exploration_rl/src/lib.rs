@@ -356,11 +356,30 @@ impl Default for TrainingRunner {
 /// Subscribes to `map_frontiers` and `slam_pose2d`; sends `FrontierChoice`
 /// to the planning task via `bus.decision_frontier`. Call from the runtime.
 pub async fn spawn_selector_task(bus: Arc<bus::Bus>) {
-    let mut rx_frontiers = bus.map_frontiers.subscribe();
-    let mut rx_pose      = bus.slam_pose2d.subscribe();
-    let mut selector     = FrontierSelector::default();
+    let rx_frontiers = bus.map_frontiers.subscribe();
+    let rx_pose      = bus.slam_pose2d.subscribe();
 
+    // Spawn immediately so the caller (run_sim_mode / main) is not blocked.
+    // Model loading happens inside the task with a timeout; if ORT hangs (e.g.
+    // dev machine without ORT_DYLIB_PATH), only this task stalls — the rest of
+    // the runtime keeps running with classical frontier selection as fallback.
     tokio::spawn(async move {
+        let mut rx_frontiers = rx_frontiers;
+        let mut rx_pose      = rx_pose;
+
+        // Load model on a blocking thread with a 5 s timeout.
+        // Fallback constructs a classical-only selector via a guaranteed-absent path
+        // so try_load_model() short-circuits on path.exists() without touching ORT.
+        let classical = || FrontierSelector::new("/.__no_onnx_model__");
+        let mut selector = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(FrontierSelector::default),
+        ).await {
+            Ok(Ok(s))  => s,
+            Ok(Err(_)) => { warn!("FrontierSelector init panicked — using classical"); classical() }
+            Err(_)     => { warn!("FrontierSelector init timed out (ORT unavailable?) — using classical"); classical() }
+        };
+
         info!("Frontier selector task started");
         loop {
             match rx_frontiers.recv().await {

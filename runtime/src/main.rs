@@ -358,7 +358,10 @@ async fn main() -> anyhow::Result<()> {
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
+                                // Forward-arc nearest obstacle: only rays within ±30°
+                                // of centre.  Side walls don't threaten forward motion.
                                 let near_m = scan.rays.iter()
+                                    .filter(|r| r.angle_rad.abs() <= std::f32::consts::FRAC_PI_6)
                                     .map(|r| r.range_m)
                                     .fold(f32::MAX, f32::min);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
@@ -473,23 +476,50 @@ async fn main() -> anyhow::Result<()> {
     let mut plan_rx     = plan_frontier_rx;
     let mut rx_pose_p   = bus.slam_pose2d.subscribe();
     let plan_handle = tokio::spawn(async move {
+        use tokio::time::Instant;
+        const GOAL_BLACKLIST_SECS: u64 = 10;
         info!("Planning task started (A*, 4-cell clearance)");
         let planner = AStarPlanner::new();
+        // (goal_m, expiry): goals to skip — filled when A* fails OR same goal repeats.
+        let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
+        let mut last_goal: Option<[f32; 2]> = None;
         loop {
             let Some(choice) = plan_rx.recv().await else { break };
+            let now = Instant::now();
+            goal_blacklist.retain(|(_, exp)| *exp > now);
+            let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
+
             let pose = *rx_pose_p.borrow_and_update();
             let maybe_goal = {
                 let m = mapper_plan.read().await;
-                select_frontier_goal(&m, &choice, &pose)
+                select_frontier_goal(&m, &choice, &pose, &bl)
             };
             if let Some(goal) = maybe_goal {
+                // Blacklist a goal that's selected twice in a row — stuck loop.
+                if last_goal.map_or(false, |lg| {
+                    let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
+                    (dx*dx + dy*dy).sqrt() < 0.10
+                }) {
+                    warn!(x = goal[0], y = goal[1], "Planning: same goal repeated — blacklisting");
+                    let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                    goal_blacklist.push((goal, exp));
+                    last_goal = None;
+                    continue;
+                }
+                last_goal = Some(goal);
+
                 let m = mapper_plan.read().await;
                 match planner.plan(&m, &pose, goal) {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Planning: path found");
                         let _ = bus_plan.planner_path.send(path).await;
                     }
-                    None => warn!(?choice, "Planning: no path to frontier"),
+                    None => {
+                        warn!(?choice, "Planning: no path to frontier");
+                        let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                        goal_blacklist.push((goal, exp));
+                        last_goal = None;
+                    }
                 }
             } else {
                 warn!(?choice, "Planning: no frontiers available");
@@ -830,8 +860,10 @@ fn select_frontier_goal(
     mapper: &Mapper,
     choice: &FrontierChoice,
     pose: &core_types::Pose2D,
+    blacklist: &[[f32; 2]],
 ) -> Option<[f32; 2]> {
-    const MIN_GOAL_DIST: f32 = 0.30; // metres — skip frontiers trivially close to robot
+    const MIN_GOAL_DIST: f32 = 0.30;    // metres — skip frontiers trivially close to robot
+    const BLACKLIST_RADIUS: f32 = 0.60; // metres — skip frontiers near recently-tried goals
 
     let frontiers = &mapper.last_frontiers;
     if frontiers.is_empty() {
@@ -844,34 +876,52 @@ fn select_frontier_goal(
         (dx * dx + dy * dy).sqrt()
     };
 
-    // Candidates at least MIN_GOAL_DIST away; fall back to all frontiers if none qualify.
-    let candidates: Vec<_> = frontiers.iter().filter(|f| dist(f) >= MIN_GOAL_DIST).collect();
+    let blacklisted = |f: &core_types::Frontier| -> bool {
+        blacklist.iter().any(|b| {
+            let dx = f.centroid_x_m - b[0];
+            let dy = f.centroid_y_m - b[1];
+            (dx * dx + dy * dy).sqrt() < BLACKLIST_RADIUS
+        })
+    };
+
+    // Primary: far enough away and not blacklisted.
+    // Fallback 1: far enough away (ignoring blacklist).
+    // Fallback 2: any frontier (blacklist and distance both waived — stuck situation).
+    let candidates: Vec<_> = frontiers.iter()
+        .filter(|f| dist(f) >= MIN_GOAL_DIST && !blacklisted(f))
+        .collect();
+    let fallback1: Vec<_> = frontiers.iter()
+        .filter(|f| dist(f) >= MIN_GOAL_DIST)
+        .collect();
+
+    let pool: &[&core_types::Frontier] = if !candidates.is_empty() {
+        &candidates
+    } else if !fallback1.is_empty() {
+        &fallback1
+    } else {
+        // completely stuck — use everything
+        return frontiers.iter()
+            .min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap())
+            .map(|f| [f.centroid_x_m, f.centroid_y_m]);
+    };
 
     let chosen: Option<&core_types::Frontier> = match choice {
         FrontierChoice::Nearest | FrontierChoice::RandomValid => {
-            candidates.iter().copied()
-                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
-                .min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap())
+            pool.iter().copied().min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap())
         }
         FrontierChoice::Largest => {
-            candidates.iter().copied()
-                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
-                .max_by_key(|f| f.size_cells)
+            pool.iter().copied().max_by_key(|f| f.size_cells)
         }
         FrontierChoice::Leftmost => {
-            candidates.iter().copied()
-                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
-                .min_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap())
+            pool.iter().copied().min_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap())
         }
         FrontierChoice::Rightmost => {
-            candidates.iter().copied()
-                .chain(if candidates.is_empty() { frontiers.iter() } else { frontiers[..0].iter() })
-                .max_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap())
+            pool.iter().copied().max_by(|a, b| a.centroid_x_m.partial_cmp(&b.centroid_x_m).unwrap())
         }
     };
     let goal = chosen.map(|f| [f.centroid_x_m, f.centroid_y_m]);
     if let Some(g) = goal {
-        info!(x = g[0], y = g[1], frontiers = frontiers.len(), "Planning: frontier goal selected");
+        info!(x = g[0], y = g[1], frontiers = frontiers.len(), blacklisted = frontiers.len() - pool.len(), "Planning: frontier goal selected");
     }
     goal
 }
@@ -912,6 +962,14 @@ async fn run_sim_mode(
         .unwrap_or(42);
     info!(seed, "Sim mode starting");
 
+    // ── Signal handler — registered FIRST before any spawning ─────────────────
+    // Calling signal() here (in the current async context, not inside a spawned
+    // task) installs the OS-level handler immediately, so SIGUSR1 cannot kill
+    // the process even if it arrives before the spawned tasks are scheduled.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigusr1_stream = signal(SignalKind::user_defined1())
+        .map_err(|e| anyhow::anyhow!("SIGUSR1 handler: {e}"))?;
+
     // ── Mapper (shared between mapping + planning tasks) ──────────────────────
     let mapper = Arc::new(RwLock::new(Mapper::new()));
 
@@ -946,16 +1004,11 @@ async fn run_sim_mode(
         }
     });
 
-    // SIGUSR1 → arm (same signal as real robot)
+    // SIGUSR1 → arm (pre-registered stream passed into spawned task)
     let arm_tx_sig = arm_tx.clone();
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sig = match signal(SignalKind::user_defined1()) {
-            Ok(s)  => s,
-            Err(e) => { warn!("SIGUSR1 handler failed: {e}"); return; }
-        };
         loop {
-            sig.recv().await;
+            sigusr1_stream.recv().await;
             info!("SIGUSR1 received — arming sim robot");
             let _ = arm_tx_sig.send(()).await;
         }
@@ -997,23 +1050,49 @@ async fn run_sim_mode(
     let mut plan_rx   = plan_frontier_rx;
     let mut rx_pose_p = bus.slam_pose2d.subscribe();
     tokio::spawn(async move {
+        use tokio::time::Instant;
+        const GOAL_BLACKLIST_SECS: u64 = 10;
         info!("Sim planning task started (A*, 4-cell clearance)");
         let planner = AStarPlanner::new();
+        let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
+        let mut last_goal: Option<[f32; 2]> = None;
         loop {
             let Some(choice) = plan_rx.recv().await else { break };
+            let now = Instant::now();
+            goal_blacklist.retain(|(_, exp)| *exp > now);
+            let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
+
             let pose = *rx_pose_p.borrow_and_update();
             let maybe_goal = {
                 let m = mapper_plan.read().await;
-                select_frontier_goal(&m, &choice, &pose)
+                select_frontier_goal(&m, &choice, &pose, &bl)
             };
             if let Some(goal) = maybe_goal {
+                // Blacklist a goal that's selected twice in a row — stuck loop.
+                if last_goal.map_or(false, |lg| {
+                    let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
+                    (dx*dx + dy*dy).sqrt() < 0.10
+                }) {
+                    warn!(x = goal[0], y = goal[1], "Sim planning: same goal repeated — blacklisting");
+                    let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                    goal_blacklist.push((goal, exp));
+                    last_goal = None;
+                    continue;
+                }
+                last_goal = Some(goal);
+
                 let m = mapper_plan.read().await;
                 match planner.plan(&m, &pose, goal) {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Sim planning: path found");
                         let _ = bus_plan.planner_path.send(path).await;
                     }
-                    None => warn!(?choice, "Sim planning: no path to frontier"),
+                    None => {
+                        warn!(?choice, "Sim planning: no path to frontier");
+                        let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                        goal_blacklist.push((goal, exp));
+                        last_goal = None;
+                    }
                 }
             }
         }
@@ -1172,8 +1251,9 @@ fn sim_publish(bus: &bus::Bus, step: &sim_fast::SimStep) {
     // Pseudo-lidar scan → mapping + control tasks.
     let _ = bus.vision_pseudo_lidar.send(Arc::new(step.scan.clone()));
 
-    // Nearest obstacle: min range across all rays.
+    // Forward-arc nearest obstacle: only rays within ±30° of centre.
     let nearest = step.scan.rays.iter()
+        .filter(|r| r.angle_rad.abs() <= std::f32::consts::FRAC_PI_6)
         .map(|r| r.range_m)
         .fold(f32::MAX, f32::min);
     let _ = bus.nearest_obstacle_m.send(nearest);
@@ -1363,7 +1443,10 @@ async fn run_slam_debug(
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
+                                // Forward-arc nearest obstacle: only rays within ±30°
+                                // of centre.  Side walls don't threaten forward motion.
                                 let near_m = scan.rays.iter()
+                                    .filter(|r| r.angle_rad.abs() <= std::f32::consts::FRAC_PI_6)
                                     .map(|r| r.range_m)
                                     .fold(f32::MAX, f32::min);
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
