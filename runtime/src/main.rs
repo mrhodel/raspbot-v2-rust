@@ -410,6 +410,10 @@ async fn main() -> anyhow::Result<()> {
         );
         let monitor      = SafetyMonitor::new();
         let watchdog_dur = tokio::time::Duration::from_millis(monitor.watchdog_timeout_ms);
+        // Latch: once EmergencyStop fires, hold it for at least this duration even if
+        // the US returns a good reading (e.g. blind spot <3 cm → driver returns 400 cm).
+        const EMSTOP_LATCH: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+        let mut emstop_until: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 result = rx_us.recv() => {
@@ -419,12 +423,26 @@ async fn main() -> anyhow::Result<()> {
                             warn!("Safety task lagged {n} readings");
                         }
                         Ok(reading) => {
-                            let (state, maybe_stop) = monitor.evaluate(&reading);
-                            let _ = bus_safety.safety_state.send(state);
-                            if let Some(cmd) = maybe_stop {
-                                warn!(range_cm = reading.range_cm, "Safety: sending motor stop");
-                                if bus_safety.motor_command.try_send(cmd).is_err() {
-                                    error!("Safety: motor_command channel full — stop dropped!");
+                            // Check whether a previous EmergencyStop latch is still active.
+                            let now = tokio::time::Instant::now();
+                            if emstop_until.map_or(false, |u| now < u) {
+                                // Still latched: re-publish EmergencyStop regardless of reading.
+                                // The motor_command channel may already be draining; try_send is
+                                // fire-and-forget (motor watchdog also zeros on its own tick).
+                                let state = SafetyState::EmergencyStop {
+                                    reason: "EmergencyStop latched (blind-spot protection)".into(),
+                                };
+                                let _ = bus_safety.safety_state.send(state);
+                                let _ = bus_safety.motor_command.try_send(MotorCommand::stop(reading.t_ms));
+                            } else {
+                                let (state, maybe_stop) = monitor.evaluate(&reading);
+                                let _ = bus_safety.safety_state.send(state);
+                                if let Some(cmd) = maybe_stop {
+                                    warn!(range_cm = reading.range_cm, "Safety: EMERGENCY STOP — latching for {}s", EMSTOP_LATCH.as_secs());
+                                    emstop_until = Some(now + EMSTOP_LATCH);
+                                    if bus_safety.motor_command.try_send(cmd).is_err() {
+                                        error!("Safety: motor_command channel full — stop dropped!");
+                                    }
                                 }
                             }
                         }
@@ -432,6 +450,8 @@ async fn main() -> anyhow::Result<()> {
                 }
                 _ = tokio::time::sleep(watchdog_dur) => {
                     warn!("Safety: watchdog timeout — no US reading");
+                    let now = tokio::time::Instant::now();
+                    emstop_until = Some(now + EMSTOP_LATCH);
                     let (state, cmd) = monitor.evaluate_timeout(0);
                     let _ = bus_safety.safety_state.send(state);
                     let _ = bus_safety.motor_command.try_send(cmd);
@@ -563,8 +583,10 @@ async fn main() -> anyhow::Result<()> {
                 // Priority 3: controller CmdVel — only while armed AND not in emergency stop.
                 // Checks safety_state directly (not via executive) to avoid the race where
                 // executive_state hasn't transitioned to SafetyStopped yet.
+                // IMPORTANT: when suppressed we still zero the motors explicitly because
+                // CmdVel arriving at 10 Hz preempts the 500 ms watchdog sleep, so the
+                // watchdog never fires and motors keep spinning at their last commanded speed.
                 Some(cmd_vel) = cmdvel_rx.recv() => {
-                    watchdog_logged = false;
                     let armed = matches!(
                         *rx_exec_m.borrow(),
                         ExecutiveState::Exploring | ExecutiveState::Recovering
@@ -574,12 +596,20 @@ async fn main() -> anyhow::Result<()> {
                         SafetyState::EmergencyStop { .. }
                     );
                     if armed && safe {
+                        watchdog_logged = false;
                         let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor error (ctrl): {e}");
                         }
-                    } else if armed && !safe {
-                        warn!("Motor task: CmdVel suppressed — safety stop active");
+                    } else {
+                        // Not armed or safety stop active — zero motors and log once per stretch.
+                        if !watchdog_logged {
+                            warn!(armed, safe, "Motor task: CmdVel suppressed — zeroing motors");
+                            watchdog_logged = true;
+                        }
+                        if let Err(e) = motor.send_command(MotorCommand::stop(0)).await {
+                            error!("Motor suppressed-stop failed: {e}");
+                        }
                     }
                 }
                 // Watchdog: no command for MOTOR_WATCHDOG_MS → zero all motors.

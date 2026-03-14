@@ -15,7 +15,9 @@ use core_types::{MotorCommand, SafetyState, UltrasonicReading};
 use tracing::warn;
 
 /// Robot halts if anything is closer than this.
-pub const STOP_THRESHOLD_CM: f32 = 15.0;
+/// 25 cm gives clearance for the camera gimbal which protrudes past the chassis
+/// front, and provides additional stopping distance at max_duty=35.
+pub const STOP_THRESHOLD_CM: f32 = 25.0;
 /// Duration (ms) without a reading before the watchdog fires.
 pub const WATCHDOG_TIMEOUT_MS: u64 = 500;
 
