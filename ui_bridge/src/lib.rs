@@ -90,8 +90,9 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     <div><span class="label">HDG   </span><span id="hdg" class="val">--</span>&deg;</div>
     <div><span class="label">CONF  </span><span id="conf" class="val">--</span></div>
     <div><span class="label">PAN   </span><span id="pan" class="val">--</span>&deg;</div>
-    <div><span class="label">CELLS </span><span id="cells" class="val">0</span></div>
-    <div><span class="label">WS    </span><span id="ws_st" class="warn">connecting</span></div>
+    <div><span class="label">CELLS  </span><span id="cells" class="val">0</span></div>
+    <div><span class="label">CRASHES</span><span id="crashes" class="val">0</span></div>
+    <div><span class="label">WS     </span><span id="ws_st" class="warn">connecting</span></div>
     <div id="legend">
       <h3 style="margin-top:8px">LEGEND</h3>
       <div><span class="ls" style="background:#0f2010"></span>free</div>
@@ -109,6 +110,8 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // ── Map state ──────────────────────────────────────────────────────────
     // Cells store absolute log-odds values from GridDelta.
     const grid = new Map();   // "cx,cy" → log_odds (absolute)
+    let crashCount = 0;
+    let lastExecState = null;
     let minCX = null, maxCX = null, minCY = null, maxCY = null;
 
     // ── Overlay state ──────────────────────────────────────────────────────
@@ -313,11 +316,16 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
             case 'executive/state': {
               const lbl = stateLabel(msg.data);
               document.getElementById('mode').textContent = lbl;
-              if (lbl === 'SafetyStopped') {
+              if (lbl === 'SafetyStopped' && lastExecState !== 'SafetyStopped') {
                 flashColor = '#ffaa00'; flashLabel = 'TIMEOUT'; flashFrames = 60;
-              } else if (lbl === 'Fault') {
+              } else if (lbl === 'Fault' && lastExecState !== 'Fault') {
                 flashColor = '#ff2200'; flashLabel = 'CRASH';   flashFrames = 60;
+                crashCount++;
+                const el = document.getElementById('crashes');
+                el.textContent = crashCount;
+                el.className = 'err';
               }
+              lastExecState = lbl;
               break;
             }
             case 'sensor/ultrasonic': {

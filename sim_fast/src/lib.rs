@@ -59,7 +59,8 @@ const SPEED_M_S: f32 = 0.30;
 const OMEGA_RAD_S: f32 = 1.0;
 
 /// Episode ends after this many steps (in addition to collision).
-const MAX_STEPS: u32 = 2_000;
+/// At 10 Hz this is 10 minutes per episode.
+const MAX_STEPS: u32 = 6_000;
 
 /// Number of random rectangular obstacles per episode.
 const NUM_OBSTACLES: usize = 18;

@@ -60,9 +60,10 @@ impl Executive {
     ///
     /// From `Idle`          → `Exploring` (one step).
     /// From `SafetyStopped` → `Idle` → `Exploring` (reset then re-arm).
+    /// From `Fault`         → `Idle` → `Exploring` (post-crash auto-recovery in sim).
     /// Any other state returns `Err`.
     pub fn arm(&mut self) -> Result<(), String> {
-        if matches!(self.state, ExecutiveState::SafetyStopped) {
+        if matches!(self.state, ExecutiveState::SafetyStopped | ExecutiveState::Fault { .. }) {
             self.transition(ExecutiveState::Idle)?;
         }
         self.transition(ExecutiveState::Exploring)

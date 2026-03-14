@@ -18,9 +18,9 @@ use core_types::{Path, Pose2D};
 use mapping::{Mapper, OCC_THRESH};
 use tracing::{debug, warn};
 
-/// Obstacle clearance radius in grid cells (5 cm/cell → 4 cells = 20 cm).
-/// Raised from 2 to 4 to account for robot body width and camera gimbal protrusion.
-const CLEARANCE_CELLS: i32 = 4;
+/// Obstacle clearance radius in grid cells (5 cm/cell → 5 cells = 25 cm).
+/// Raised from 2→4→5 to keep pure-pursuit corner cuts within the robot radius (15 cm).
+const CLEARANCE_CELLS: i32 = 5;
 
 /// Keep one waypoint per this many cells along the raw path.
 const WAYPOINT_STEP: usize = 10;
