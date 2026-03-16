@@ -42,7 +42,8 @@ const REG_SERVO:     u8  = 0x02;
 const SERVO_PAN:     u8  = 1;
 const SERVO_TILT:    u8  = 2;
 /// Raw servo angle (degrees) when pan_deg = 0 (camera pointing forward).
-const PAN_CENTER:    f32 = 90.0;
+/// Tuned from 90→93: camera was biased ~3° right at raw=90 (confirmed empirically 2026-03-15).
+const PAN_CENTER:    f32 = 93.0;
 /// Firmware cap on tilt servo (Yahboom MCU enforces max 110°).
 const TILT_RAW_MAX:  f32 = 110.0;
 /// Minimum gap between successive servo writes (ms).

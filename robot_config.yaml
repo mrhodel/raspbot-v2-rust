@@ -46,6 +46,7 @@ hal:
     tilt_range: [-30, 30]
     tilt_neutral: 30           # raw servo angle (0-180) that points camera level (tune to ~28)
     move_speed_deg_s: 120      # max angular velocity (software-limited)
+    tilt_home_deg: 25          # camera tilt at startup (degrees, positive=up); tune until horizon is ~upper 40% of frame
 
   camera:
     # Raspbot V2 ships with a 1MP USB camera on the 2-DOF gimbal.
@@ -174,9 +175,36 @@ rl:
 agent:
   loop_hz: 10                  # main control loop frequency
   learn_in_run_mode: false     # Enable to update policy weights during 'run' mode (not recommended for deployment)
+
   safety:
-    emergency_stop_cm: 15      # unconditional halt if anything < N cm
+    emergency_stop_cm: 25      # unconditional halt if anything < N cm (25 = gimbal protrusion clearance)
     low_battery_voltage: 6.8   # volts (if voltage monitor available)
+    us_slow_m: 0.70            # US range at which speed scaling begins
+    us_stop_m: 0.30            # US range → full stop
+    emstop_latch_s: 5.0        # emergency stop latch duration (seconds)
+    escape_delay_ms: 200       # pause before escape reverse (ms)
+    escape_duration_ms: 400    # escape reverse duration (ms)
+    escape_rotation_ms: 600    # escape rotation duration (ms)
+    clear_hold_s: 0.8          # hysteresis before clearing obstacle_stopped
+
+  crash:
+    accel_threshold_m_s2: 15.0  # horizontal accel (m/s²) that counts as a crash impact
+    debounce_ms: 2000           # minimum ms between two crash events
+
+  motor:
+    watchdog_ms: 500            # motors zero if no command for this many ms
+
+  gimbal:
+    sweep_amp_deg: 20.0         # sinusoidal sweep amplitude (degrees)
+    sweep_period_s: 4.0         # sinusoidal sweep period (seconds)
+    reactive_gain: 10.0         # gain on depth-derived open-side bias
+    reactive_cap_deg: 10.0      # max reactive correction per frame (degrees)
+    pan_limit_deg: 30.0         # hard pan limit from centre (degrees)
+
+  navigation:
+    max_consecutive_failures: 15  # planning failures before goal blacklisted
+    goal_blacklist_s: 10          # seconds a blacklisted goal stays blocked
+
   exploration:
     frontier_min_size: 3       # minimum frontier cells to pursue
     rescan_interval_s: 5.0     # full gimbal sweep period (suppressed during EXECUTE)
@@ -186,6 +214,18 @@ agent:
     level: INFO                # DEBUG | INFO | WARNING
     log_dir: logs/
     save_map_interval_s: 30
+
+# ── Simulation ────────────────────────────────────────────────────
+sim:
+  seed: 42                     # default maze seed (overridden by --seed CLI flag)
+  obstacles: 18                # number of random rectangular obstacles (0 = empty room)
+  obstacle_slow_m: 0.80        # MiDaS nearest-obstacle distance that begins speed scaling
+  obstacle_stop_m: 0.25        # MiDaS nearest-obstacle distance → full stop
+  # Sensor noise parameters — calibrate against logs/robot.ndjson deceleration curves
+  imu_noise_gyro_rad_s: 0.01   # Gaussian sigma on simulated gyro axes (rad/s)
+  imu_noise_accel_m_s2: 0.05   # Gaussian sigma on simulated lateral accel axes (m/s²)
+  range_dropout: 0.08          # fraction of pseudo-lidar rays dropped per scan
+  range_noise_m: 0.07          # Gaussian sigma on pseudo-lidar range (metres)
 
 # ── IMU Bias Calibration ──────────────────────────────────────────
 # Run "robot calibrate" with robot flat and stationary to regenerate.

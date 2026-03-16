@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use bus::Bus;
 use config::RobotConfig;
@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Sim mode — short-circuit before any HAL init ──────────────────────────
     if mode == "sim" {
-        return run_sim_mode(bus, cfg, plan_frontier_rx, control_path_rx, cmdvel_rx).await;
+        return run_sim_mode(bus, cfg, plan_frontier_rx, control_path_rx, motor_cmd_rx, cmdvel_rx).await;
     }
 
     // ── Telemetry ─────────────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
         return run_calibrate(imu).await;
     }
     if mode == "slam-debug" {
-        return run_slam_debug(camera, imu, bus, &cfg).await;
+        return run_slam_debug(camera, imu, gimbal, bus, &cfg).await;
     }
     if mode != "robot-run" && mode != "robot-debug" {
         warn!("Unknown mode '{mode}' — running full autonomy stack (robot-run)");
@@ -243,6 +243,13 @@ async fn main() -> anyhow::Result<()> {
                                 let _ = exec.transition(ExecutiveState::SafetyStopped);
                             }
                             _ => {}
+                        }
+                    } else {
+                        // Safety cleared — auto-recover from SafetyStopped so the robot
+                        // resumes exploration without requiring a manual re-arm.
+                        if matches!(exec.state(), ExecutiveState::SafetyStopped) {
+                            info!("Executive: safety cleared — auto-recovering to Exploring");
+                            let _ = exec.arm();
                         }
                     }
                 }
@@ -302,6 +309,45 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ── Crash detection task (IMU-based) ─────────────────────────────────────
+    // Monitors horizontal acceleration for sudden spikes that indicate a wall
+    // impact.  Only counts while the robot is armed (Exploring/Recovering) to
+    // avoid false positives from manual handling.
+    //
+    // Threshold: 15 m/s² horizontal (~1.5 g).  Normal cornering is < 3 m/s²;
+    // a wall impact at typical nav speeds produces 10–30 m/s².
+    // Debounce: 2 s between events so a single impact counts once.
+    {
+        const CRASH_ACCEL_THRESHOLD: f32 = 15.0; // m/s²
+        const CRASH_DEBOUNCE_MS: u64 = 2_000;
+        let bus_crash  = Arc::clone(&bus);
+        let mut rx_imu_c  = bus.imu_raw.subscribe();
+        let rx_exec_crash = bus.executive_state.subscribe();
+        tokio::spawn(async move {
+            let mut last_crash_ms: u64 = 0;
+            loop {
+                match rx_imu_c.recv().await {
+                    Ok(s) => {
+                        let armed = matches!(
+                            *rx_exec_crash.borrow(),
+                            ExecutiveState::Exploring | ExecutiveState::Recovering
+                        );
+                        if !armed { continue; }
+                        let horiz = (s.accel_x * s.accel_x + s.accel_y * s.accel_y).sqrt();
+                        if horiz > CRASH_ACCEL_THRESHOLD && s.t_ms > last_crash_ms + CRASH_DEBOUNCE_MS {
+                            last_crash_ms = s.t_ms;
+                            let n = *bus_crash.collision_count.borrow() + 1;
+                            let _ = bus_crash.collision_count.send(n);
+                            warn!(horiz_accel_m_s2 = horiz, collision_n = n, "Crash detected — IMU impact spike");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed)    => break,
+                }
+            }
+        });
+    }
+
     // ── Ultrasonic task ───────────────────────────────────────────────────────
     let bus_us = Arc::clone(&bus);
     let mut ultrasonic = ultrasonic;
@@ -344,6 +390,14 @@ async fn main() -> anyhow::Result<()> {
         info!("Perception task started");
         let mut last_infer = std::time::Instant::now();
         const MAX_INFER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        // Rolling minimum over the last N MiDaS frames.  MiDaS on real hardware
+        // produces noisy frame-to-frame readings (e.g. 0.3 m → 1.5 m → 0.3 m for
+        // the same static scene) which cause false clears and drive the robot into
+        // obstacles.  Publishing the rolling min means a genuine obstacle stays
+        // visible for ~N frames even if one noisy frame reads much farther away.
+        // N=5 at ~3 Hz ≈ 1.7 s of memory — enough to cover 4–5 frame MiDaS lag.
+        const NEAR_HIST_LEN: usize = 5;
+        let mut near_hist: std::collections::VecDeque<f32> = std::collections::VecDeque::with_capacity(NEAR_HIST_LEN);
         loop {
             match rx_gray.recv().await {
                 Ok(gray) => {
@@ -357,16 +411,33 @@ async fn main() -> anyhow::Result<()> {
                         };
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
-                                let scan = lidar_extractor.extract(&depth);
-                                // Nearest obstacle across the full camera FOV.
-                                // Narrow cones (±15°, ±30°) miss angled approaches —
-                                // confirmed on hardware: robot hit box at 45° nose-first.
-                                let near_m = scan.rays.iter()
-                                    .map(|r| r.range_m)
-                                    .fold(f32::MAX, f32::min);
+                                let mut scan = lidar_extractor.extract(&depth);
+                                // Nearest obstacle in camera frame (before pan offset).
+                                let (near_m, near_cam_rad) = nearest_in_fov(&scan);
+                                // Convert pan to robot-frame offset and apply to all rays
+                                // so the mapper correctly places walls in world frame.
+                                // Convention: pan_deg > 0 = looking right (negative in
+                                // robot angle frame where CCW/left is positive).
+                                let pan_deg = *bus_perc.gimbal_pan_deg.borrow();
+                                let pan_rad = -pan_deg * std::f32::consts::PI / 180.0;
+                                for ray in &mut scan.rays { ray.angle_rad += pan_rad; }
+                                let near_angle_rad = near_cam_rad + pan_rad; // robot frame
+                                // Rolling minimum: keep the closest reading seen in the last
+                                // NEAR_HIST_LEN frames so a single noisy far reading can't
+                                // cause a false clear and allow forward motion into an obstacle.
+                                near_hist.push_back(near_m);
+                                if near_hist.len() > NEAR_HIST_LEN { near_hist.pop_front(); }
+                                let near_m_min = near_hist.iter().cloned().fold(f32::MAX, f32::min);
+                                // Log approach timeline (raw near_m for diagnostics).
+                                if near_m < 1.5 || near_m_min < 1.5 {
+                                    let near_deg = near_angle_rad.to_degrees();
+                                    let side = if near_deg > 5.0 { "left" } else if near_deg < -5.0 { "right" } else { "center" };
+                                    info!(nearest_m = near_m_min, nearest_raw_m = near_m, angle_deg = near_deg, side, "Perception: nearest obstacle");
+                                }
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
-                                let _ = bus_perc.nearest_obstacle_m.send(near_m);
+                                let _ = bus_perc.nearest_obstacle_m.send(near_m_min);
+                                let _ = bus_perc.nearest_obstacle_angle_rad.send(near_angle_rad);
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }
@@ -381,92 +452,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── Mapping task ──────────────────────────────────────────────────────────
-    let bus_map        = Arc::clone(&bus);
-    let mapper_map     = Arc::clone(&mapper);
-    let mut rx_lidar   = bus.vision_pseudo_lidar.subscribe();
-    let mut rx_pose_m  = bus.slam_pose2d.subscribe();
-    let map_handle = tokio::spawn(async move {
-        info!("Mapping task started");
-        loop {
-            match rx_lidar.recv().await {
-                Ok(scan) => {
-                    let pose = *rx_pose_m.borrow_and_update();
-                    let (delta, frontiers, stats) = {
-                        let mut m = mapper_map.write().await;
-                        m.update(&scan, &pose)
-                    };
-                    let _ = bus_map.map_grid_delta.send(delta);
-                    let _ = bus_map.map_frontiers.send(frontiers);
-                    let _ = bus_map.map_explored_stats.send(stats);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("Mapping task lagged {n} scans");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    let map_handle = spawn_mapping_task(Arc::clone(&bus), Arc::clone(&mapper));
 
     // ── Safety task ───────────────────────────────────────────────────────────
-    let bus_safety = Arc::clone(&bus);
-    let mut rx_us  = bus.ultrasonic.subscribe();
-    let safety_handle = tokio::spawn(async move {
-        info!(
-            threshold_cm = safety::STOP_THRESHOLD_CM,
-            watchdog_ms  = safety::WATCHDOG_TIMEOUT_MS,
-            "Safety task started"
-        );
-        let monitor      = SafetyMonitor::new();
-        let watchdog_dur = tokio::time::Duration::from_millis(monitor.watchdog_timeout_ms);
-        // Latch: once EmergencyStop fires, hold it for at least this duration even if
-        // the US returns a good reading (e.g. blind spot <3 cm → driver returns 400 cm).
-        const EMSTOP_LATCH: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-        let mut emstop_until: Option<tokio::time::Instant> = None;
-        loop {
-            tokio::select! {
-                result = rx_us.recv() => {
-                    match result {
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("Safety task lagged {n} readings");
-                        }
-                        Ok(reading) => {
-                            // Check whether a previous EmergencyStop latch is still active.
-                            let now = tokio::time::Instant::now();
-                            if emstop_until.map_or(false, |u| now < u) {
-                                // Still latched: re-publish EmergencyStop regardless of reading.
-                                // The motor_command channel may already be draining; try_send is
-                                // fire-and-forget (motor watchdog also zeros on its own tick).
-                                let state = SafetyState::EmergencyStop {
-                                    reason: "EmergencyStop latched (blind-spot protection)".into(),
-                                };
-                                let _ = bus_safety.safety_state.send(state);
-                                let _ = bus_safety.motor_command.try_send(MotorCommand::stop(reading.t_ms));
-                            } else {
-                                let (state, maybe_stop) = monitor.evaluate(&reading);
-                                let _ = bus_safety.safety_state.send(state);
-                                if let Some(cmd) = maybe_stop {
-                                    warn!(range_cm = reading.range_cm, "Safety: EMERGENCY STOP — latching for {}s", EMSTOP_LATCH.as_secs());
-                                    emstop_until = Some(now + EMSTOP_LATCH);
-                                    if bus_safety.motor_command.try_send(cmd).is_err() {
-                                        error!("Safety: motor_command channel full — stop dropped!");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(watchdog_dur) => {
-                    warn!("Safety: watchdog timeout — no US reading");
-                    let now = tokio::time::Instant::now();
-                    emstop_until = Some(now + EMSTOP_LATCH);
-                    let (state, cmd) = monitor.evaluate_timeout(0);
-                    let _ = bus_safety.safety_state.send(state);
-                    let _ = bus_safety.motor_command.try_send(cmd);
-                }
-            }
-        }
-    });
+    let emergency_stop_cm  = cfg.agent.safety.emergency_stop_cm;
+    let safety_handle = spawn_safety_task(Arc::clone(&bus), emergency_stop_cm, true);
 
     // ── Planning task ─────────────────────────────────────────────────────────
     // Triggered by FrontierChoice from exploration_rl (Phase 10).
@@ -483,6 +473,12 @@ async fn main() -> anyhow::Result<()> {
         // (goal_m, expiry): goals to skip — filled when A* fails OR same goal repeats.
         let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
         let mut last_goal: Option<[f32; 2]> = None;
+        let mut last_path_sent_at: Option<Instant> = None;
+        // How many consecutive times the same goal must be selected before it is
+        // blacklisted.  2 is too eager — a replan after an obstacle stop often
+        // re-selects the nearest frontier before the robot has moved at all.
+        const SAME_GOAL_BLACKLIST_COUNT: u32 = 3;
+        let mut same_goal_streak: u32 = 0;
         // Safety valve: if every frontier fails A* repeatedly the blacklist
         // saturates and the robot is permanently stuck.  After this many
         // consecutive failures, clear the blacklist entirely for a fresh pass.
@@ -500,15 +496,24 @@ async fn main() -> anyhow::Result<()> {
                 select_frontier_goal(&m, &choice, &pose, &bl)
             };
             if let Some(goal) = maybe_goal {
-                // Blacklist a goal that's selected twice in a row — stuck loop.
-                if last_goal.map_or(false, |lg| {
+                // Blacklist a goal selected SAME_GOAL_BLACKLIST_COUNT times in a
+                // row without making progress.  A single repeat is normal after an
+                // obstacle stop before the robot moves; only blacklist on persistence.
+                let same = last_goal.map_or(false, |lg| {
                     let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
                     (dx*dx + dy*dy).sqrt() < 0.10
-                }) {
-                    warn!(x = goal[0], y = goal[1], "Planning: same goal repeated — blacklisting");
+                });
+                if same {
+                    same_goal_streak += 1;
+                } else {
+                    same_goal_streak = 0;
+                }
+                if same_goal_streak >= SAME_GOAL_BLACKLIST_COUNT {
+                    warn!(x = goal[0], y = goal[1], streak = same_goal_streak, "Planning: same goal repeated — blacklisting");
                     let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
                     goal_blacklist.push((goal, exp));
                     last_goal = None;
+                    same_goal_streak = 0;
                     consecutive_failures += 1;
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                         warn!(consecutive_failures, "Planning: blacklist saturated — clearing for fresh pass");
@@ -517,13 +522,31 @@ async fn main() -> anyhow::Result<()> {
                     }
                     continue;
                 }
+                // Don't interrupt an active path with a different goal.
+                const PATH_COMMIT_S: u64 = 10;
+                let goal_matches_last = last_goal.map_or(false, |lg| {
+                    let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
+                    (dx*dx + dy*dy).sqrt() < 0.25
+                });
+                let path_committed = !goal_matches_last
+                    && last_path_sent_at.map_or(false, |t| {
+                        now.duration_since(t) < std::time::Duration::from_secs(PATH_COMMIT_S)
+                    });
+                if path_committed {
+                    continue;
+                }
                 last_goal = Some(goal);
 
-                let m = mapper_plan.read().await;
-                match planner.plan(&m, &pose, goal) {
+                let planned = {
+                    let m = mapper_plan.read().await;
+                    planner.plan_with_clearance(&m, &pose, goal, 7)
+                        .or_else(|| planner.plan_with_clearance(&m, &pose, goal, 5))
+                };
+                match planned {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Planning: path found");
                         consecutive_failures = 0;
+                        last_path_sent_at = Some(now);
                         let _ = bus_plan.planner_path.send(path).await;
                     }
                     None => {
@@ -546,104 +569,20 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── Control task ──────────────────────────────────────────────────────────
-    // Runs pure-pursuit at CONTROL_HZ against the live pose watch.
-    // A new Path from the planner replaces the active path immediately.
-    // When the robot reaches the final waypoint (within GOAL_TOLERANCE_M),
-    // the path is cleared and CmdVel stops — the motor watchdog zeroes motors.
-    //
-    // Reactive obstacle avoidance: reads nearest_obstacle_m from the pseudo-lidar
-    // bus on every tick.  Forward speed scales to zero as the obstacle closes in;
-    // at OBSTACLE_STOP_M the path is abandoned and a replan is requested by
-    // clearing current_path (the planner will re-run on the next FrontierChoice).
-    // This fires well above the 25 cm hardware safety interlock.
-    const CONTROL_HZ: f64 = 10.0;
-    const GOAL_TOLERANCE_M: f32 = 0.25; // metres — close enough to declare goal reached
-    /// Nearest-obstacle distance at which forward speed begins scaling down.
-    const OBSTACLE_SLOW_M: f32 = 0.80;
-    /// Nearest-obstacle distance at which forward motion stops and path is abandoned.
-    /// Must be well above the 25 cm hardware safety interlock.
-    const OBSTACLE_STOP_M: f32 = 0.40;
-
-    let bus_ctrl       = Arc::clone(&bus);
-    let mut ctrl_rx    = control_path_rx;
-    let mut rx_pose_c  = bus.slam_pose2d.subscribe();
-    let rx_nearest_c   = bus.nearest_obstacle_m.subscribe();
-    let ctrl_handle = tokio::spawn(async move {
-        use std::time::Duration;
-        use core_types::Path;
-        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.3 m)");
-        let controller = PurePursuitController::new();
-        let mut current_path: Option<Path> = None;
-        let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / CONTROL_HZ));
-        // Tracks whether we've already cleared the path due to an obstacle so we
-        // don't spam the log and re-clear on every tick while stopped.
-        let mut obstacle_stopped = false;
-        loop {
-            tokio::select! {
-                biased;
-                // New path from planner — replace immediately.
-                result = ctrl_rx.recv() => {
-                    match result {
-                        Some(p) => {
-                            info!(waypoints = p.waypoints.len(), "Control: new path, tracking");
-                            current_path = Some(p);
-                            obstacle_stopped = false; // fresh path — re-enable avoidance check
-                        }
-                        None => break,
-                    }
-                }
-                // Control tick — re-compute CmdVel from current pose.
-                _ = tick.tick() => {
-                    let Some(ref path) = current_path else { continue };
-                    let pose = *rx_pose_c.borrow_and_update();
-                    // Goal check: within tolerance of the final waypoint → done.
-                    if let Some(&[gx, gy]) = path.waypoints.last() {
-                        let dx = gx - pose.x_m;
-                        let dy = gy - pose.y_m;
-                        if dx * dx + dy * dy < GOAL_TOLERANCE_M * GOAL_TOLERANCE_M {
-                            info!("Control: goal reached");
-                            current_path = None;
-                            obstacle_stopped = false;
-                            continue;
-                        }
-                    }
-
-                    // ── Reactive obstacle avoidance ──────────────────────────
-                    // Scale vx [0, 1] based on nearest obstacle in camera FOV.
-                    // omega is unaffected — the robot can still rotate away.
-                    let nearest = *rx_nearest_c.borrow();
-                    let speed_scale = if nearest >= OBSTACLE_SLOW_M {
-                        1.0_f32
-                    } else if nearest <= OBSTACLE_STOP_M {
-                        0.0_f32
-                    } else {
-                        (nearest - OBSTACLE_STOP_M) / (OBSTACLE_SLOW_M - OBSTACLE_STOP_M)
-                    };
-
-                    if speed_scale <= 0.0 {
-                        if !obstacle_stopped {
-                            warn!(
-                                nearest_m = nearest,
-                                stop_threshold_m = OBSTACLE_STOP_M,
-                                "Control: obstacle too close — stopping and requesting replan"
-                            );
-                            obstacle_stopped = true;
-                            current_path = None; // one-shot: planner replans on next FrontierChoice
-                        }
-                        // Motor watchdog will zero motors within 500 ms.
-                        continue;
-                    }
-
-                    let mut cmd_vel = controller.compute(&pose, path);
-                    cmd_vel.vx *= speed_scale;
-                    if speed_scale < 0.99 {
-                        tracing::debug!(nearest_m = nearest, speed_scale, "Control: slowing for obstacle");
-                    }
-                    let _ = bus_ctrl.controller_cmd_vel.try_send(cmd_vel);
-                }
-            }
-        }
-    });
+    // Real: slow=2.00 m, stop=1.00 m — raised from 0.60 to account for 1.5s camera
+    // lag at ~0.17 m/s forward speed (0.25 m travel during lag).  When camera reads
+    // 1.0 m the robot is actually ~0.55 m from the obstacle — enough to stop safely.
+    // Real mode has no episode reset; pass a dummy watch whose sender is dropped
+    // so the episode arm in spawn_control_task never fires.
+    let (_episode_dummy_tx, episode_dummy_rx) = tokio::sync::watch::channel(0u32);
+    // MiDaS obstacle avoidance disabled for real mode (f32::MAX thresholds = never triggered).
+    // On real hardware MiDaS readings are too noisy for reactive stopping — the rolling min
+    // consistently reads 0.1–0.5m on clear paths, causing constant false stops.
+    // US (70 cm slow, 30 cm stop) is the sole reactive obstacle sensor in real mode.
+    // MiDaS still feeds the occupancy map / frontier selector via PseudoLidar.
+    // obstacle_slow_m=0.0: `nearest >= 0.0` is always true → base_scale=1.0 → MiDaS never stops.
+    // US (70 cm slow, 30 cm stop) is the sole reactive obstacle sensor in real mode.
+    let ctrl_handle = spawn_control_task(Arc::clone(&bus), control_path_rx, 0.0, 0.0, episode_dummy_rx);
 
     // ── Motor execution task ──────────────────────────────────────────────────
     // Drains both the safety motor_command channel and the controller cmdvel
@@ -731,48 +670,48 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // ── Gimbal task ───────────────────────────────────────────────────────────
-    // Homes the gimbal at startup, then pans reactively toward the more open
-    // half of the depth map (simple left/right free-space heuristic).
+    // Homes the gimbal at startup, then drives a sinusoidal sweep (±20°, 4 s)
+    // with a reactive bias (up to ±10°) toward the more open depth half.
+    // Step cap ±5°/frame, total clamped to ±30°.
     let mut gimbal = gimbal;
+    let tilt_home = cfg.hal.gimbal.tilt_home_deg;
     let mut rx_depth_g = bus.vision_depth.subscribe();
     let bus_gimbal = Arc::clone(&bus);
     let gimbal_handle = tokio::spawn(async move {
         info!("Gimbal task started");
-        if let Err(e) = gimbal.set_angles(0.0, 0.0).await {
+        if let Err(e) = gimbal.set_angles(0.0, tilt_home).await {
             warn!("Gimbal home failed: {e}");
         }
+        let gimbal_t0 = std::time::Instant::now();
         loop {
             let depth = match rx_depth_g.recv().await {
                 Ok(d)  => d,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed)    => break,
             };
-            // Simple reactive pan: compare average depth of left vs right half.
-            // MiDaS values: higher = closer.  Pan toward the more open (lower) side.
+            // Compute open_bias from MiDaS pixels: higher pixel value = closer.
+            // open_bias > 0 means right is more open.  See gimbal_pan_target docs.
             let w = depth.width as usize;
             let h = depth.mask_start_row.min(depth.height) as usize;
-            if w < 2 || h == 0 { continue; }
-            let mid = w / 2;
-            let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
-            for row in 0..h {
-                for col in 0..mid    { left_sum  += depth.data[row * w + col]; }
-                for col in mid..w    { right_sum += depth.data[row * w + col]; }
-            }
-            let n = (h * mid) as f32;
-            // right_avg > left_avg → right side more blocked → pan left (negative).
-            let pan_error = (left_sum - right_sum) / n;
-            let (cur_pan, _) = gimbal.angles();
-            // Clamp step to ±5° per frame so the gimbal doesn't lurch on noisy
-            // MiDaS frames. Deadband of 8° filters per-frame renormalization
-            // noise (even a static symmetric scene can produce ~0.3 imbalance).
-            let step = (pan_error * 20.0).clamp(-5.0, 5.0);
-            let new_pan = (cur_pan + step).clamp(-90.0, 90.0);
-            if (new_pan - cur_pan).abs() > 8.0 {
-                if let Err(e) = gimbal.set_pan(new_pan).await {
-                    warn!("Gimbal pan error: {e}");
+            let open_bias = if w >= 2 && h > 0 {
+                let mid = w / 2;
+                let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
+                for row in 0..h {
+                    for col in 0..mid { left_sum  += depth.data[row * w + col]; }
+                    for col in mid..w { right_sum += depth.data[row * w + col]; }
                 }
+                (left_sum - right_sum) / (h * mid) as f32  // positive = right more open
+            } else { 0.0 };
+
+            let t_s = gimbal_t0.elapsed().as_secs_f32();
+            let (cur_pan, _) = gimbal.angles();
+            let new_pan = gimbal_pan_target(open_bias, t_s, cur_pan);
+            if let Err(e) = gimbal.set_pan(new_pan).await {
+                warn!("Gimbal pan error: {e}");
             }
-            let _ = bus_gimbal.gimbal_pan_deg.send(gimbal.angles().0);
+            let (cur_pan_out, cur_tilt_out) = gimbal.angles();
+            let _ = bus_gimbal.gimbal_pan_deg.send(cur_pan_out);
+            let _ = bus_gimbal.gimbal_tilt_deg.send(cur_tilt_out);
         }
     });
 
@@ -799,9 +738,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("Milestone 2 system running — press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await?;
-    info!("Shutdown signal received");
+    info!("Milestone 2 system running — press Ctrl+C or send SIGTERM to stop");
+    // Wait for either SIGINT (Ctrl+C) or SIGTERM (pkill / systemd stop).
+    // Both paths must zero the motors before exiting.
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sig_term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { info!("SIGINT received"); }
+            _ = sig_term.recv()         => { info!("SIGTERM received"); }
+        }
+    }
+    info!("Shutdown signal received — stopping motors");
 
     drop(exec_handle);
     drop(cam_handle);
@@ -867,6 +815,300 @@ fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8) -> MotorCommand {
     }
 }
 
+// ── Shared task factories ─────────────────────────────────────────────────────
+
+/// Spawn the occupancy-mapping task.
+///
+/// Subscribes to `vision_pseudo_lidar` and `slam_pose2d`, updates the shared
+/// mapper on each new scan, and publishes grid deltas, frontier lists, and
+/// exploration statistics.  Used by both real-robot and sim modes.
+fn spawn_mapping_task(
+    bus: Arc<bus::Bus>,
+    mapper: Arc<RwLock<Mapper>>,
+) -> tokio::task::JoinHandle<()> {
+    let bus_map       = Arc::clone(&bus);
+    let mapper_map    = Arc::clone(&mapper);
+    let mut rx_lidar  = bus.vision_pseudo_lidar.subscribe();
+    let mut rx_pose_m = bus.slam_pose2d.subscribe();
+    tokio::spawn(async move {
+        info!("Mapping task started");
+        loop {
+            match rx_lidar.recv().await {
+                Ok(scan) => {
+                    let pose = *rx_pose_m.borrow_and_update();
+                    let (delta, frontiers, stats) = {
+                        let mut m = mapper_map.write().await;
+                        m.update(&scan, &pose)
+                    };
+                    let _ = bus_map.map_grid_delta.send(delta);
+                    let _ = bus_map.map_frontiers.send(frontiers);
+                    let _ = bus_map.map_explored_stats.send(stats);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Mapping task lagged {n} scans");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Spawn the pure-pursuit control task.
+///
+/// - `obstacle_slow_m`: depth at which forward speed begins to ramp down.
+///   Real=1.20 m (large slow zone compensates for 4-5 frame camera lag);
+///   Sim=0.80 m (tighter — sim depth is noiseless).
+/// - `obstacle_stop_m`: depth at which forward motion stops and the path is
+///   abandoned.  Real=0.60 m (raised from 0.40 to account for camera lag and
+///   MiDaS noise); Sim=0.25 m (matches A* minimum clearance).
+/// - `episode_rx`: watch channel that fires on episode reset (sim only).
+///   For real mode pass a watch receiver whose sender is immediately dropped —
+///   `Ok(()) = changed()` in the select! arm never matches on a closed watch,
+///   so the arm is effectively disabled.
+///
+/// Both real and sim use the same behaviour:
+///   - 10 Hz pure-pursuit, 0.3 m lookahead.
+///   - Angle-weighted speed scaling: side obstacles don't zero forward speed.
+///   - Hard stop (vx=0) only inside `obstacle_stop_m`, regardless of angle.
+///   - Hysteresis on clear: `obstacle_stopped` only clears after 5 consecutive
+///     frames above `obstacle_stop_m * 2.0`, preventing false-clear from noisy
+///     MiDaS depth readings causing immediate resume into the obstacle.
+fn spawn_control_task(
+    bus: Arc<bus::Bus>,
+    ctrl_rx: tokio::sync::mpsc::Receiver<core_types::Path>,
+    obstacle_slow_m: f32,
+    obstacle_stop_m: f32,
+    mut episode_rx: tokio::sync::watch::Receiver<u32>,
+) -> tokio::task::JoinHandle<()> {
+    const CONTROL_HZ: f64 = 10.0;
+    const GOAL_TOLERANCE_M: f32 = 0.25;
+
+    let bus_ctrl           = Arc::clone(&bus);
+    let mut ctrl_rx        = ctrl_rx;
+    let mut rx_pose_c      = bus.slam_pose2d.subscribe();
+    let rx_nearest_c       = bus.nearest_obstacle_m.subscribe();
+    let rx_nearest_angle_c = bus.nearest_obstacle_angle_rad.subscribe();
+    let mut rx_safety_ctrl = bus.safety_state.subscribe();
+    let mut rx_us_ctrl     = bus.ultrasonic.subscribe();
+    tokio::spawn(async move {
+        use std::time::Duration;
+        use core_types::Path;
+        // US-based speed scaling — independent of MiDaS, always forward-facing.
+        // Slow zone: 70 cm → 30 cm linearly; below 30 cm: vx=0.
+        // us_scale also applied to omega to prevent sweeping into obstacles while rotating.
+        // The US emergency stop still fires at 15 cm (safety task), this is the soft pre-stop.
+        const US_SLOW_M: f32 = 0.70;
+        const US_STOP_M: f32 = 0.30;
+        let mut latest_us_m: f32 = f32::MAX;
+        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.3 m)");
+        let controller = PurePursuitController::with_lookahead(0.3);
+        let mut current_path: Option<Path> = None;
+        let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / CONTROL_HZ));
+        let mut obstacle_stopped = false;
+        // Hysteresis: only clear obstacle_stopped after the nearest obstacle has
+        // been above the clear threshold (2× stop distance) for a minimum wall-
+        // clock duration.  Using time rather than tick count avoids counting the
+        // same stale borrow() value multiple times when perception updates slower
+        // than the control tick rate (~3 Hz MiDaS vs 10 Hz control).
+        let clear_hysteresis_m = obstacle_stop_m * 2.0;
+        const CLEAR_HOLD_S: f32 = 0.8; // must stay clear for 0.8 s before resuming (~2-3 MiDaS frames)
+        let mut clear_since: Option<std::time::Instant> = None;
+        loop {
+            tokio::select! {
+                biased;
+                // Episode reset (sim) — clear path and latch flag.
+                // For real mode the sender is dropped so changed() always returns
+                // Err; the Ok(()) pattern never matches and the arm is skipped.
+                Ok(()) = episode_rx.changed() => {
+                    episode_rx.borrow_and_update();
+                    current_path = None;
+                    obstacle_stopped = false;
+                    clear_since = None;
+                }
+                // US range update — track latest for speed scaling in tick arm.
+                Ok(reading) = rx_us_ctrl.recv() => {
+                    latest_us_m = reading.range_cm / 100.0;
+                }
+                // Emergency stop from US safety task — clear path on rising edge.
+                Ok(()) = rx_safety_ctrl.changed() => {
+                    let is_estop = matches!(
+                        *rx_safety_ctrl.borrow_and_update(),
+                        SafetyState::EmergencyStop { .. }
+                    );
+                    if is_estop && !obstacle_stopped {
+                        warn!("Control: EmergencyStop — clearing path for replan after latch");
+                        current_path = None;
+                        obstacle_stopped = true;
+                        clear_since = None;
+                    } else if !is_estop {
+                        obstacle_stopped = false;
+                        clear_since = None;
+                    }
+                }
+                // New path from planner — replace immediately (unless in emergency stop).
+                result = ctrl_rx.recv() => {
+                    match result {
+                        Some(p) => {
+                            if obstacle_stopped {
+                                debug!(waypoints = p.waypoints.len(), "Control: dropping path — EmergencyStop active");
+                            } else {
+                                info!(waypoints = p.waypoints.len(), "Control: new path, tracking");
+                                current_path = Some(p);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                // Control tick — re-compute CmdVel from current pose.
+                _ = tick.tick() => {
+                    // Auto-clear depth stop with time hysteresis — nearest must stay above
+                    // clear_hysteresis_m (2× stop distance) continuously for CLEAR_HOLD_S
+                    // before resuming.  Any dip below the threshold resets the timer, preventing
+                    // noisy MiDaS readings from causing a false clear.  Using wall-clock time
+                    // avoids counting the same stale borrow() value across multiple ticks.
+                    let nearest = *rx_nearest_c.borrow();
+                    if obstacle_stopped {
+                        // If US is still in the stop zone, actively reverse to create distance.
+                        // Without this the robot parks at 17-29 cm (above 15 cm safety threshold
+                        // so escape never fires) and gets stuck indefinitely.
+                        if latest_us_m < US_STOP_M {
+                            let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: -0.15, vy: 0.0, omega: 0.0 });
+                            clear_since = None; // don't start clear timer while still in stop zone
+                            continue;
+                        }
+                        if nearest > clear_hysteresis_m {
+                            let since = clear_since.get_or_insert_with(std::time::Instant::now);
+                            if since.elapsed().as_secs_f32() >= CLEAR_HOLD_S {
+                                info!(clear_hysteresis_m, CLEAR_HOLD_S, "Control: obstacle cleared (hysteresis satisfied)");
+                                obstacle_stopped = false;
+                                clear_since = None;
+                            }
+                        } else {
+                            clear_since = None; // reset timer on any dip below threshold
+                        }
+                    }
+
+                    let Some(ref path) = current_path else { continue };
+                    let pose = *rx_pose_c.borrow_and_update();
+
+                    // Goal check: within tolerance of the final waypoint → done.
+                    if let Some(&[gx, gy]) = path.waypoints.last() {
+                        let dx = gx - pose.x_m;
+                        let dy = gy - pose.y_m;
+                        if dx * dx + dy * dy < GOAL_TOLERANCE_M * GOAL_TOLERANCE_M {
+                            info!("Control: goal reached");
+                            current_path = None;
+                            obstacle_stopped = false;
+                            continue;
+                        }
+                    }
+
+                    // ── Reactive obstacle avoidance ──────────────────────────
+                    // Scale vx [0, 1] based on nearest obstacle in camera FOV.
+                    // omega is unaffected — the robot can still rotate away.
+                    let nearest_angle = *rx_nearest_angle_c.borrow();
+                    let base_scale = if nearest >= obstacle_slow_m {
+                        1.0_f32
+                    } else if nearest <= obstacle_stop_m {
+                        0.0_f32
+                    } else {
+                        (nearest - obstacle_stop_m) / (obstacle_slow_m - obstacle_stop_m)
+                    };
+                    let angle_factor = nearest_angle.cos().max(0.0_f32);
+                    // Hard stop in the stop zone; angle weighting only in slowdown zone.
+                    let speed_scale = if base_scale <= 0.0 {
+                        0.0
+                    } else {
+                        1.0 - (1.0 - base_scale) * angle_factor
+                    };
+
+                    // US-based speed scaling (forward sensor, independent of gimbal).
+                    // Takes minimum with MiDaS scale — whichever is more restrictive wins.
+                    let us_scale = if latest_us_m >= US_SLOW_M {
+                        1.0_f32
+                    } else if latest_us_m <= US_STOP_M {
+                        0.0_f32
+                    } else {
+                        (latest_us_m - US_STOP_M) / (US_SLOW_M - US_STOP_M)
+                    };
+                    let combined_scale = speed_scale.min(us_scale);
+                    if us_scale < 1.0 {
+                        info!(us_m = latest_us_m, us_scale, combined_scale, "Control: US slowing");
+                    }
+
+                    let mut cmd_vel = controller.compute(&pose, path);
+                    cmd_vel.vx *= combined_scale;
+                    // Also scale omega by us_scale — prevents sweeping the US sensor into an
+                    // obstacle while rotating (e.g. omega=0.4 sweeps forward-facing US across
+                    // a box, causing sudden 49→15 cm reading with no time to brake).
+                    cmd_vel.omega *= us_scale;
+
+                    if combined_scale < 1.0 {
+                        let obs_deg     = nearest_angle.to_degrees();
+                        let heading_deg = pose.theta_rad.to_degrees();
+                        let turn_dir    = if cmd_vel.omega.abs() < 0.05 { "straight" }
+                                          else if cmd_vel.omega > 0.0   { "turning-left" }
+                                          else                           { "turning-right" };
+                        let obs_side = if obs_deg > 5.0 { "left" } else if obs_deg < -5.0 { "right" } else { "center" };
+                        let toward = (cmd_vel.omega > 0.05 && nearest_angle > 0.05)
+                                  || (cmd_vel.omega < -0.05 && nearest_angle < -0.05);
+                        if combined_scale <= 0.0 {
+                            // Hard stop: US at ≤20 cm, OR MiDaS obstacle in forward arc / turning toward.
+                            // For US-triggered stops: always halt (forward sensor, no angle ambiguity).
+                            // For MiDaS-triggered stops: require forward arc, forward intent, or turning toward.
+                            let us_stopped     = us_scale <= 0.0;
+                            let in_forward_arc = nearest_angle.abs() <= 30f32.to_radians();
+                            let has_forward    = cmd_vel.vx.abs() > 0.05;
+                            if us_stopped || in_forward_arc || has_forward || toward {
+                                if !obstacle_stopped {
+                                    warn!(
+                                        nearest_m   = nearest,
+                                        us_m        = latest_us_m,
+                                        us_stopped,
+                                        obs_deg,
+                                        obs_side,
+                                        heading_deg,
+                                        omega       = cmd_vel.omega,
+                                        turn_dir,
+                                        turning_toward_obstacle = toward,
+                                        "Control: obstacle STOP — replan"
+                                    );
+                                    obstacle_stopped = true;
+                                    clear_since = None;
+                                    current_path = None;
+                                    // Immediately zero velocity — without this the motor task
+                                    // keeps executing the last CmdVel and the robot coasts into
+                                    // the obstacle while we wait for the next tick.
+                                    let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: 0.0, vy: 0.0, omega: 0.0 });
+                                }
+                                continue;
+                            }
+                            // Side obstacle during rotation, US clear — send omega only.
+                        }
+                        info!(
+                            nearest_m   = nearest,
+                            speed_scale,
+                            us_scale,
+                            combined_scale,
+                            obs_deg,
+                            obs_side,
+                            heading_deg,
+                            vx          = cmd_vel.vx,
+                            omega       = cmd_vel.omega,
+                            turn_dir,
+                            turning_toward_obstacle = toward,
+                            "Control: slowing"
+                        );
+                    }
+
+                    tracing::debug!(nearest_m = nearest, vx = cmd_vel.vx, omega = cmd_vel.omega, "Control: cmd_vel");
+                    let _ = bus_ctrl.controller_cmd_vel.try_send(cmd_vel);
+                }
+            }
+        }
+    })
+}
+
 // ── Frontier selection ────────────────────────────────────────────────────────
 
 /// Pick a world-frame goal from the mapper's cached frontier list.
@@ -880,7 +1122,7 @@ fn select_frontier_goal(
     pose: &core_types::Pose2D,
     blacklist: &[[f32; 2]],
 ) -> Option<[f32; 2]> {
-    const MIN_GOAL_DIST: f32 = 0.30;    // metres — skip frontiers trivially close to robot
+    const MIN_GOAL_DIST: f32 = 0.75;    // metres — push robot toward meaningfully distant frontiers
     const BLACKLIST_RADIUS: f32 = 0.60; // metres — skip frontiers near recently-tried goals
 
     let frontiers = &mapper.last_frontiers;
@@ -892,6 +1134,20 @@ fn select_frontier_goal(
         let dx = f.centroid_x_m - pose.x_m;
         let dy = f.centroid_y_m - pose.y_m;
         (dx * dx + dy * dy).sqrt()
+    };
+
+    // Heading-weighted score for Nearest selection.
+    // A frontier in the robot's current heading direction gets up to 50% discount,
+    // so the robot keeps moving forward rather than turning to a slightly-closer
+    // frontier off to the side.
+    let heading_score = |f: &core_types::Frontier| -> f32 {
+        const HEADING_WEIGHT: f32 = 0.5;
+        let dx = f.centroid_x_m - pose.x_m;
+        let dy = f.centroid_y_m - pose.y_m;
+        let d = (dx * dx + dy * dy).sqrt().max(0.001);
+        let angle_to = dy.atan2(dx);
+        let alignment = (angle_to - pose.theta_rad).cos().max(0.0);
+        d * (1.0 - HEADING_WEIGHT * alignment)
     };
 
     let blacklisted = |f: &core_types::Frontier| -> bool {
@@ -925,7 +1181,7 @@ fn select_frontier_goal(
 
     let chosen: Option<&core_types::Frontier> = match choice {
         FrontierChoice::Nearest | FrontierChoice::RandomValid => {
-            pool.iter().copied().min_by(|a, b| dist(a).partial_cmp(&dist(b)).unwrap())
+            pool.iter().copied().min_by(|a, b| heading_score(a).partial_cmp(&heading_score(b)).unwrap())
         }
         FrontierChoice::Largest => {
             pool.iter().copied().max_by_key(|f| f.size_cells)
@@ -945,6 +1201,127 @@ fn select_frontier_goal(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// ── Safety task (shared between robot-run and sim) ────────────────────────────
+//
+// Reads from `bus.ultrasonic`, evaluates each reading against `emergency_stop_cm`,
+// latches EmergencyStop for 5 s on a trip, and spawns an escape reverse maneuver.
+// Used in both `run_robot_mode` (via real US readings) and `run_sim_mode` (via
+// synthetic US readings published by `sim_publish`).
+
+fn spawn_safety_task(bus: Arc<bus::Bus>, emergency_stop_cm: f32, enable_watchdog: bool) -> tokio::task::JoinHandle<()> {
+    let bus_safety = Arc::clone(&bus);
+    let mut rx_us  = bus.ultrasonic.subscribe();
+    let escape_reverse_spd: i8 = 35; // duty cycle for escape reverse (matches reverse_speed in config)
+    tokio::spawn(async move {
+        let mut monitor  = SafetyMonitor::new();
+        monitor.stop_threshold_cm = emergency_stop_cm;
+        info!(
+            threshold_cm = monitor.stop_threshold_cm,
+            watchdog_ms  = monitor.watchdog_timeout_ms,
+            "Safety task started"
+        );
+        let watchdog_dur = tokio::time::Duration::from_millis(monitor.watchdog_timeout_ms);
+        // Latch: once EmergencyStop fires, hold it for at least this duration even if
+        // the US returns a good reading (e.g. blind spot <3 cm → driver returns 400 cm).
+        const EMSTOP_LATCH: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+        // Escape: after EmergencyStop the robot reverses briefly to clear the obstacle.
+        // The escape window suppresses re-stop commands so the reverse isn't interrupted.
+        const ESCAPE_DELAY:    tokio::time::Duration = tokio::time::Duration::from_millis(200);
+        const ESCAPE_DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(400);  // was 1500 — too far on real HW
+        const ESCAPE_ROTATION: tokio::time::Duration = tokio::time::Duration::from_millis(600);  // was 1200
+        let mut emstop_until:  Option<tokio::time::Instant> = None;
+        let mut escape_until:  Option<tokio::time::Instant> = None;
+        loop {
+            tokio::select! {
+                result = rx_us.recv() => {
+                    match result {
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Safety task lagged {n} readings");
+                        }
+                        Ok(reading) => {
+                            // Check whether a previous EmergencyStop latch is still active.
+                            let now = tokio::time::Instant::now();
+                            if emstop_until.map_or(false, |u| now < u) {
+                                // Still latched: keep motors stopped but do NOT re-publish
+                                // EmergencyStop on the state bus.  The watch channel already
+                                // holds EmergencyStop from the initial send; re-sending on every
+                                // US poll tick causes changed() to fire on all receivers every
+                                // ~150ms, creating a spam loop in the control task that repeatedly
+                                // resets obstacle_stopped.  The motor task uses borrow() so it
+                                // still sees EmergencyStop without a repeated notification.
+                                if escape_until.map_or(true, |u| now >= u) {
+                                    let _ = bus_safety.motor_command.try_send(MotorCommand::stop(reading.t_ms));
+                                }
+                            } else {
+                                let (state, maybe_stop) = monitor.evaluate(&reading);
+                                let _ = bus_safety.safety_state.send(state);
+                                if let Some(cmd) = maybe_stop {
+                                    warn!(range_cm = reading.range_cm, "Safety: EMERGENCY STOP — latching for {}s", EMSTOP_LATCH.as_secs());
+                                    emstop_until = Some(now + EMSTOP_LATCH);
+                                    escape_until = Some(now + ESCAPE_DELAY + ESCAPE_DURATION + ESCAPE_ROTATION);
+                                    // Count each fresh EmergencyStop as a near-miss.
+                                    let n = *bus_safety.estop_count.borrow() + 1;
+                                    let _ = bus_safety.estop_count.send(n);
+                                    if bus_safety.motor_command.try_send(cmd).is_err() {
+                                        error!("Safety: motor_command channel full — stop dropped!");
+                                    }
+                                    // Spawn escape maneuver: wait for stop to take effect,
+                                    // reverse to clear the obstacle, then stop again.
+                                    let bus_esc = Arc::clone(&bus_safety);
+                                    let spd = escape_reverse_spd;
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(ESCAPE_DELAY).await;
+                                        // Reverse: send repeatedly so sim sustains the command each tick.
+                                        info!("Safety: escape — reversing for {}ms", ESCAPE_DURATION.as_millis());
+                                        let reverse = MotorCommand { t_ms: 0, fl: -spd, fr: -spd, rl: -spd, rr: -spd };
+                                        let deadline = tokio::time::Instant::now() + ESCAPE_DURATION;
+                                        while tokio::time::Instant::now() < deadline {
+                                            let _ = bus_esc.motor_command.try_send(reverse);
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        }
+                                        // Rotate to break heading deadlock: turn away from the
+                                        // nearest-obstacle angle. Positive angle = obstacle to
+                                        // left → rotate right (CW); negative → rotate left (CCW).
+                                        let obs_angle = *bus_esc.nearest_obstacle_angle_rad.borrow();
+                                        let (fl, fr, rl, rr): (i8, i8, i8, i8) = if obs_angle >= 0.0 {
+                                            (spd, -spd, spd, -spd)   // CW: obstacle left → turn right
+                                        } else {
+                                            (-spd, spd, -spd, spd)   // CCW: obstacle right → turn left
+                                        };
+                                        info!(obs_angle_rad = obs_angle, cw = (obs_angle >= 0.0),
+                                              "Safety: escape — rotating for {}ms", ESCAPE_ROTATION.as_millis());
+                                        let rotate = MotorCommand { t_ms: 0, fl, fr, rl, rr };
+                                        let deadline = tokio::time::Instant::now() + ESCAPE_ROTATION;
+                                        while tokio::time::Instant::now() < deadline {
+                                            let _ = bus_esc.motor_command.try_send(rotate);
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                        }
+                                        let _ = bus_esc.motor_command.try_send(MotorCommand::stop(0));
+                                        info!("Safety: escape complete");
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(watchdog_dur), if enable_watchdog => {
+                    warn!("Safety: watchdog timeout — no US reading");
+                    let now = tokio::time::Instant::now();
+                    // Only arm a fresh latch; don't extend an existing one so the
+                    // latch can expire naturally (e.g. during episode reset).
+                    if emstop_until.map_or(true, |u| now >= u) {
+                        emstop_until = Some(now + EMSTOP_LATCH);
+                    }
+                    let (state, cmd) = monitor.evaluate_timeout(0);
+                    let _ = bus_safety.safety_state.send(state);
+                    let _ = bus_safety.motor_command.try_send(cmd);
+                }
+            }
+        }
+    })
+}
 
 // ── Sim mode ──────────────────────────────────────────────────────────────────
 //
@@ -966,19 +1343,27 @@ fn select_frontier_goal(
 
 async fn run_sim_mode(
     bus:              Arc<bus::Bus>,
-    _cfg:             config::RobotConfig,
+    cfg:              config::RobotConfig,
     plan_frontier_rx: tokio::sync::mpsc::Receiver<core_types::FrontierChoice>,
     control_path_rx:  tokio::sync::mpsc::Receiver<core_types::Path>,
+    motor_cmd_rx:     tokio::sync::mpsc::Receiver<core_types::MotorCommand>,
     cmdvel_rx:        tokio::sync::mpsc::Receiver<core_types::CmdVel>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    let seed: u64 = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(42);
-    info!(seed, "Sim mode starting");
+    // Usage: `robot sim [explore] [seed]`
+    // `explore` keeps the map and maze across collisions (single infinite episode).
+    // Without `explore`, each collision/timeout resets the maze and map (training mode).
+    let mut args_iter = std::env::args().skip(2);
+    let arg2 = args_iter.next();
+    let explore_mode = arg2.as_deref() == Some("explore");
+    let seed: u64 = if explore_mode {
+        args_iter.next().and_then(|s| s.parse().ok()).unwrap_or(42)
+    } else {
+        arg2.and_then(|s| s.parse().ok()).unwrap_or(42)
+    };
+    info!(seed, explore = explore_mode, "Sim mode starting");
 
     // ── Signal handler — registered FIRST before any spawning ─────────────────
     // Calling signal() here (in the current async context, not inside a spawned
@@ -997,6 +1382,10 @@ async fn run_sim_mode(
     // maze is explored.
     let (episode_reset_tx, episode_reset_rx) =
         tokio::sync::watch::channel(0u32);
+
+    // Used by the planning task to request a position-only respawn in explore
+    // mode when A* can find no path to any frontier (map connectivity broken).
+    let (force_respawn_tx, force_respawn_rx) = tokio::sync::mpsc::channel::<()>(1);
 
     // ── Executive task ────────────────────────────────────────────────────────
     let (arm_tx, mut arm_rx)         = tokio::sync::mpsc::channel::<()>(4);
@@ -1023,12 +1412,17 @@ async fn run_sim_mode(
                 }
                 Ok(()) = rx_safety_exec.changed() => {
                     let safety = rx_safety_exec.borrow().clone();
-                    if let SafetyState::EmergencyStop { reason } = safety {
+                    if matches!(safety, SafetyState::EmergencyStop { .. }) {
                         match exec.state() {
                             ExecutiveState::Exploring | ExecutiveState::Recovering => {
-                                let _ = exec.transition(ExecutiveState::Fault { reason });
+                                let _ = exec.transition(ExecutiveState::SafetyStopped);
                             }
                             _ => {}
+                        }
+                    } else {
+                        if matches!(exec.state(), ExecutiveState::SafetyStopped) {
+                            info!("Sim executive: safety cleared — auto-recovering to Exploring");
+                            let _ = exec.arm();
                         }
                     }
                 }
@@ -1049,32 +1443,11 @@ async fn run_sim_mode(
     // ── Frontier selector task ────────────────────────────────────────────────
     exploration_rl::spawn_selector_task(Arc::clone(&bus)).await;
 
+    // ── Safety task (shared with robot-run) ───────────────────────────────────
+    spawn_safety_task(Arc::clone(&bus), cfg.agent.safety.emergency_stop_cm, false);
+
     // ── Mapping task ──────────────────────────────────────────────────────────
-    let bus_map       = Arc::clone(&bus);
-    let mapper_map    = Arc::clone(&mapper);
-    let mut rx_lidar  = bus.vision_pseudo_lidar.subscribe();
-    let mut rx_pose_m = bus.slam_pose2d.subscribe();
-    tokio::spawn(async move {
-        info!("Sim mapping task started");
-        loop {
-            match rx_lidar.recv().await {
-                Ok(scan) => {
-                    let pose = *rx_pose_m.borrow_and_update();
-                    let (delta, frontiers, stats) = {
-                        let mut m = mapper_map.write().await;
-                        m.update(&scan, &pose)
-                    };
-                    let _ = bus_map.map_grid_delta.send(delta);
-                    let _ = bus_map.map_frontiers.send(frontiers);
-                    let _ = bus_map.map_explored_stats.send(stats);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    warn!("Sim mapping task lagged {n} scans");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    spawn_mapping_task(Arc::clone(&bus), Arc::clone(&mapper));
 
     // ── Planning task ─────────────────────────────────────────────────────────
     let bus_plan      = Arc::clone(&bus);
@@ -1083,15 +1456,22 @@ async fn run_sim_mode(
     let mut rx_pose_p = bus.slam_pose2d.subscribe();
     let mut rx_scan_p = bus.vision_pseudo_lidar.subscribe();
     let mut episode_rx_plan = episode_reset_rx.clone();
+    let timeout_tx_plan = timeout_tx.clone();
+    let force_respawn_tx_plan = force_respawn_tx.clone();
     tokio::spawn(async move {
         use tokio::time::Instant;
         const GOAL_BLACKLIST_SECS: u64 = 10;
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
+        // After this many fruitless escape cycles (robot isolated from all frontiers),
+        // force an episode reset rather than cycling indefinitely until MAX_STEPS.
+        const MAX_ESCAPE_FAILURES: u32 = 3;
         info!("Sim planning task started (A*, 4-cell clearance)");
         let planner = AStarPlanner::new();
         let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
         let mut last_goal: Option<[f32; 2]> = None;
+        let mut last_path_sent_at: Option<Instant> = None;
         let mut consecutive_failures: u32 = 0;
+        let mut escape_failures: u32 = 0;
         let mut last_scan: Option<std::sync::Arc<core_types::PseudoLidarScan>> = None;
         loop {
             let choice;
@@ -1102,7 +1482,9 @@ async fn run_sim_mode(
                     info!(ep, "Sim planning: episode reset — clearing state");
                     goal_blacklist.clear();
                     consecutive_failures = 0;
+                    escape_failures = 0;
                     last_goal = None;
+                    last_path_sent_at = None;
                     while plan_rx.try_recv().is_ok() {}
                     continue;
                 }
@@ -1127,40 +1509,63 @@ async fn run_sim_mode(
                 select_frontier_goal(&m, &choice, &pose, &bl)
             };
             if let Some(goal) = maybe_goal {
-                // Blacklist a goal that's selected twice in a row — stuck loop.
-                if last_goal.map_or(false, |lg| {
+                // If the same goal is selected again AND we sent a path for it recently,
+                // skip replanning — the control task is already following this path.
+                // If more than 3 s have passed without a path send (e.g. control cleared
+                // the path due to an obstacle stop), replan even for the same goal.
+                const REPLAN_HOLD_S: u64 = 3;
+                let goal_matches_last = last_goal.map_or(false, |lg| {
                     let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
-                    (dx*dx + dy*dy).sqrt() < 0.10
-                }) {
-                    warn!(x = goal[0], y = goal[1], "Sim planning: same goal repeated — blacklisting");
-                    let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                    (dx*dx + dy*dy).sqrt() < 0.25
+                });
+                let path_sent_recently = last_path_sent_at.map_or(false, |t| {
+                    now.duration_since(t) < std::time::Duration::from_secs(REPLAN_HOLD_S)
+                });
+                let path_sent_and_expired = goal_matches_last
+                    && last_path_sent_at.map_or(false, |t| {
+                        let age = now.duration_since(t).as_secs();
+                        age >= REPLAN_HOLD_S && age < REPLAN_HOLD_S * 6
+                    });
+                if goal_matches_last && path_sent_recently {
+                    continue;
+                }
+                // Don't interrupt an active path with a different goal — commit to it
+                // until PATH_COMMIT_S elapses (or an obstacle stop clears it, which
+                // resets last_path_sent_at via the 5s latch expiry).
+                const PATH_COMMIT_S: u64 = 10;
+                let path_committed = !goal_matches_last
+                    && last_path_sent_at.map_or(false, |t| {
+                        now.duration_since(t) < std::time::Duration::from_secs(PATH_COMMIT_S)
+                    });
+                if path_committed {
+                    continue;
+                }
+                // If the hold expired and we're re-selecting the same goal, the robot
+                // already visited it (or got stuck near it) but the frontier wasn't
+                // cleared. Blacklist it to force a different target.
+                if path_sent_and_expired {
+                    warn!(x = goal[0], y = goal[1], "Sim planning: frontier persists after visit — blacklisting");
+                    let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 4);
                     goal_blacklist.push((goal, exp));
                     last_goal = None;
-                    consecutive_failures += 1;
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                        if let Some(ref scan) = last_scan {
-                            sim_escape(&bus_plan, &pose, scan, consecutive_failures).await;
-                        }
-                        goal_blacklist.clear();
-                        consecutive_failures = 0;
-                        last_goal = None;
-                        // Drain queued frontier choices and pause so the escape path
-                        // isn't immediately overwritten by a replanned frontier path.
-                        while plan_rx.try_recv().is_ok() {}
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                        while plan_rx.try_recv().is_ok() {}
-                    }
+                    last_path_sent_at = None;
                     continue;
                 }
                 last_goal = Some(goal);
 
-                let m = mapper_plan.read().await;
-                match planner.plan(&m, &pose, goal) {
+                // Try A* with decreasing clearance: 7→5 cells.
+                // 5 cells (25 cm) equals the depth sensor stop distance — the minimum
+                // safe clearance. Clearance=3 routes paths inside the stop zone, so the
+                // control task immediately blocks every path received (stuck loop).
+                let planned = {
+                    let m = mapper_plan.read().await;
+                    planner.plan_with_clearance(&m, &pose, goal, 7)
+                        .or_else(|| planner.plan_with_clearance(&m, &pose, goal, 5))
+                };
+                match planned {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Sim planning: path found");
-                        // Do NOT reset consecutive_failures here — a path being found
-                        // doesn't mean the goal is reachable by the robot.  Only reset
-                        // when the escape fires so repeated same-goal cycles accumulate.
+                        last_path_sent_at = Some(now);
                         let _ = bus_plan.planner_path.send(path).await;
                     }
                     None => {
@@ -1170,12 +1575,36 @@ async fn run_sim_mode(
                         last_goal = None;
                         consecutive_failures += 1;
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                            let mut escaped = false;
                             if let Some(ref scan) = last_scan {
-                                sim_escape(&bus_plan, &pose, scan, consecutive_failures).await;
+                                if let Some(target) = sim_escape(&bus_plan, &pose, scan, consecutive_failures).await {
+                                    let escape_path = {
+                                        let m = mapper_plan.read().await;
+                                        planner.plan(&m, &pose, target)
+                                    };
+                                    match escape_path {
+                                        Some(path) => {
+                                            info!(waypoints = path.waypoints.len(), wx = target[0], wy = target[1], "Sim escape: A* path validated — injecting");
+                                            let _ = bus_plan.planner_path.send(path).await;
+                                            escaped = true;
+                                        }
+                                        None => warn!(wx = target[0], wy = target[1], "Sim escape: A* failed on escape target — staying still"),
+                                    }
+                                }
                             }
+                            if !escaped { escape_failures += 1; }
                             goal_blacklist.clear();
                             consecutive_failures = 0;
                             last_goal = None;
+                            if escape_failures >= MAX_ESCAPE_FAILURES && !explore_mode {
+                                warn!(escape_failures, "Sim planning: robot isolated — forcing episode reset");
+                                escape_failures = 0;
+                                let _ = timeout_tx_plan.send(()).await;
+                            } else if escape_failures >= MAX_ESCAPE_FAILURES {
+                                warn!(escape_failures, "Sim planning: robot isolated (explore mode — forcing respawn)");
+                                escape_failures = 0;
+                                let _ = force_respawn_tx_plan.try_send(());
+                            }
                             while plan_rx.try_recv().is_ok() {}
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             while plan_rx.try_recv().is_ok() {}
@@ -1187,73 +1616,26 @@ async fn run_sim_mode(
     });
 
     // ── Control task ──────────────────────────────────────────────────────────
-    // Identical to robot-run: reactive obstacle avoidance active.
-    const SIM_CONTROL_HZ: f64 = 10.0;
-    const SIM_GOAL_TOLERANCE_M: f32 = 0.25;
-    let bus_ctrl       = Arc::clone(&bus);
-    let mut ctrl_rx    = control_path_rx;
-    let mut rx_pose_c  = bus.slam_pose2d.subscribe();
-    let mut episode_rx_ctrl = episode_reset_rx.clone();
-    tokio::spawn(async move {
-        use std::time::Duration;
-        use core_types::Path;
-        info!("Sim control task started (pure-pursuit {SIM_CONTROL_HZ} Hz)");
-        // 0.3 m lookahead: tighter path tracking to reduce corner cutting near walls.
-        let controller = PurePursuitController::with_lookahead(0.3);
-        let rx_nearest_c = bus_ctrl.nearest_obstacle_m.subscribe();
-        let mut current_path: Option<Path> = None;
-        let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / SIM_CONTROL_HZ));
-        loop {
-            tokio::select! {
-                biased;
-                Ok(()) = episode_rx_ctrl.changed() => {
-                    episode_rx_ctrl.borrow_and_update();
-                    current_path = None;
-                }
-                result = ctrl_rx.recv() => {
-                    match result {
-                        Some(p) => {
-                            info!(waypoints = p.waypoints.len(), "Sim control: new path, tracking");
-                            current_path = Some(p);
-                        }
-                        None => break,
-                    }
-                }
-                _ = tick.tick() => {
-                    let Some(ref path) = current_path else { continue };
-                    let pose = *rx_pose_c.borrow_and_update();
-                    if let Some(&[gx, gy]) = path.waypoints.last() {
-                        let dx = gx - pose.x_m;
-                        let dy = gy - pose.y_m;
-                        if dx * dx + dy * dy < SIM_GOAL_TOLERANCE_M * SIM_GOAL_TOLERANCE_M {
-                            info!("Sim control: goal reached");
-                            current_path = None;
-                            continue;
-                        }
-                    }
-                    // Forward brake: zero vx but keep omega so the robot can
-                    // rotate away from the wall rather than freezing in place.
-                    let nearest = *rx_nearest_c.borrow();
-                    let mut cmd_vel = controller.compute(&pose, path);
-                    if nearest < 0.25 {
-                        cmd_vel.vx = 0.0;
-                    }
-                    let _ = bus_ctrl.controller_cmd_vel.try_send(cmd_vel);
-                }
-            }
-        }
-    });
+    // obstacle_stop_m=0.25 (5 cells) matches A* minimum clearance — paths never
+    // route the robot closer than the stop distance.
+    // episode_rx clears current_path and obstacle_stopped on every episode reset.
+    spawn_control_task(Arc::clone(&bus), control_path_rx, 0.80, 0.25, episode_reset_rx.clone());
 
     // ── Sim driver task ───────────────────────────────────────────────────────
     // Reads CmdVel from the bus, steps FastSim, publishes synthetic sensor data.
-    // On collision: publishes EmergencyStop then auto-resets the episode after
-    // a 2 s pause (mirrors the 5 s safety latch on the real robot).
+    // On collision: auto-resets the episode after a brief pause; the safety task
+    // handles EmergencyStop via the synthetic UltrasonicReading published by
+    // sim_publish (mirrors the 5 s safety latch on the real robot).
     let bus_sim        = Arc::clone(&bus);
     let arm_tx_sim     = arm_tx.clone();
     let timeout_tx_sim = timeout_tx.clone();
     let mapper_sim     = Arc::clone(&mapper);
     let mut cmdvel_rx  = cmdvel_rx;
+    let mut motor_cmd_rx = motor_cmd_rx;
     let rx_exec_sim    = bus.executive_state.subscribe();
+    // Receives a respawn request from the planning task when A* can find
+    // no path to any frontier (map connectivity broken in explore mode).
+    let mut force_respawn_rx = force_respawn_rx;
     tokio::spawn(async move {
         use sim_fast::{FastSim, Action};
         use std::time::Duration;
@@ -1268,10 +1650,19 @@ async fn run_sim_mode(
         apply_sensor_noise(&mut initial.scan, &mut noise_rng);
         let _ = bus_sim.gimbal_pan_deg.send(pan_deg);
         sim_publish(&bus_sim, &initial);
+        sim_publish_ground_truth(&bus_sim, &*sim.lock().await);
         info!("Sim driver task started — send SIGUSR1 to arm");
 
         let mut episode = 0u32;
+        let mut crash_count = 0u32;
+        let mut sweep_frame: u64 = 0;
         loop {
+            // Priority: safety motor commands (stop / escape reverse) override CmdVel.
+            let mut latest_safety_cmd: Option<core_types::MotorCommand> = None;
+            while let Ok(cmd) = motor_cmd_rx.try_recv() {
+                latest_safety_cmd = Some(cmd);
+            }
+
             // Drain cmdvel channel — use the last one received.
             let mut latest_cv: Option<core_types::CmdVel> = None;
             while let Ok(cv) = cmdvel_rx.try_recv() {
@@ -1282,7 +1673,22 @@ async fn run_sim_mode(
             let exec_state = rx_exec_sim.borrow().clone();
             let active = matches!(exec_state,
                 ExecutiveState::Exploring | ExecutiveState::Recovering);
-            let action = if active {
+            let action = if let Some(ref cmd) = latest_safety_cmd {
+                // Convert MotorCommand to sim Action.
+                // sim_fast has no Backward action; reverse → Stop.
+                // Rotation commands: mixed-sign fl/fr → RotateLeft/Right.
+                if cmd.fl == 0 && cmd.fr == 0 && cmd.rl == 0 && cmd.rr == 0 {
+                    Action::Stop
+                } else if cmd.fl <= 0 && cmd.fr <= 0 {
+                    Action::Stop        // reverse in sim: halt (no Backward action)
+                } else if cmd.fl > 0 && cmd.fr < 0 {
+                    Action::RotateRight // CW: escape when obstacle is to the left
+                } else if cmd.fl < 0 && cmd.fr > 0 {
+                    Action::RotateLeft  // CCW: escape when obstacle is to the right
+                } else {
+                    Action::Forward
+                }
+            } else if active {
                 latest_cv.map(sim_cmdvel_to_action).unwrap_or(Action::Stop)
             } else {
                 Action::Stop
@@ -1290,39 +1696,87 @@ async fn run_sim_mode(
 
             let mut step = sim.lock().await.step_with_pan(action as u8, pan_deg);
             apply_sensor_noise(&mut step.scan, &mut noise_rng);
-            // Reactive gimbal pan — mirrors the real gimbal task and sim_viz.
-            pan_deg = sim_reactive_pan(&step.scan, pan_deg);
+            // Reactive gimbal sweep — mirrors the real gimbal task.
+            pan_deg = sim_reactive_pan(&step.scan, pan_deg, sweep_frame);
             let _ = bus_sim.gimbal_pan_deg.send(pan_deg);
             sim_publish(&bus_sim, &step);
 
-            if step.collision {
-                episode += 1;
-                warn!(episode, "Sim: COLLISION — resetting episode in 2 s");
-                let _ = bus_sim.safety_state.send(SafetyState::EmergencyStop {
-                    reason: format!("Sim collision (episode {episode})"),
-                });
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                // Reset the maze and the navigation stack's stale map/state.
+            // Planning task signals a forced respawn when A* finds no path
+            // to any frontier (map connectivity broken) in explore mode.
+            if explore_mode && force_respawn_rx.try_recv().is_ok() {
+                warn!("Sim: planning stuck — forced respawn (explore mode, map preserved)");
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 pan_deg = 0.0;
-                let mut reset_step = sim.lock().await.reset();
-                apply_sensor_noise(&mut reset_step.scan, &mut noise_rng);
-                // Clear the occupancy grid — new maze, new walls.
-                *mapper_sim.write().await = Mapper::new();
-                // Notify planning + control tasks to flush stale state.
-                let _ = episode_reset_tx.send(episode);
+                sweep_frame = 0;
+                let mut respawn_step = sim.lock().await.respawn();
+                apply_sensor_noise(&mut respawn_step.scan, &mut noise_rng);
                 let _ = bus_sim.gimbal_pan_deg.send(pan_deg);
-                sim_publish(&bus_sim, &reset_step);
-                // Clear the latch: new episode, new space.
+                sim_publish(&bus_sim, &respawn_step);
                 let _ = bus_sim.safety_state.send(SafetyState::Ok);
-                // Re-arm automatically so exploration continues unattended.
-                // (Same behaviour as hitting SIGUSR1 after a collision.)
-                info!("Sim: auto-re-arming after episode reset");
                 let _ = arm_tx_sim.send(()).await;
                 continue;
             }
 
-            if step.done {
+            if step.collision {
+                crash_count += 1;
+                let _ = bus_sim.collision_count.send(crash_count);
+                if explore_mode {
+                    // Single-episode mode: keep the maze and map intact.
+                    // Respawn the robot at the centre, clear the safety latch,
+                    // and re-arm — no state reset in planning/control.
+                    warn!(
+                        crash_count,
+                        robot_x   = step.pose.x_m,
+                        robot_y   = step.pose.y_m,
+                        theta_deg = (step.pose.theta_rad.to_degrees()) as i32,
+                        action    = ?action,
+                        "Sim: COLLISION — respawning (explore mode, map preserved)"
+                    );
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    pan_deg = 0.0;
+                    sweep_frame = 0;
+                    let mut respawn_step = sim.lock().await.respawn();
+                    apply_sensor_noise(&mut respawn_step.scan, &mut noise_rng);
+                    let _ = bus_sim.gimbal_pan_deg.send(pan_deg);
+                    sim_publish(&bus_sim, &respawn_step);
+                    let _ = bus_sim.safety_state.send(SafetyState::Ok);
+                    let _ = arm_tx_sim.send(()).await;
+                } else {
+                    episode += 1;
+                    // Log position + action + nearest wall for post-mortem diagnosis.
+                    warn!(
+                        episode,
+                        robot_x       = step.pose.x_m,
+                        robot_y       = step.pose.y_m,
+                        theta_deg     = (step.pose.theta_rad.to_degrees()) as i32,
+                        action        = ?action,
+                        "Sim: COLLISION — resetting episode"
+                    );
+                    // The safety task handles EmergencyStop via the synthetic UltrasonicReading
+                    // published by sim_publish; we wait briefly for the escape maneuver to run.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    // Reset the maze and the navigation stack's stale map/state.
+                    pan_deg = 0.0;
+                    sweep_frame = 0;
+                    let mut reset_step = sim.lock().await.reset();
+                    apply_sensor_noise(&mut reset_step.scan, &mut noise_rng);
+                    // Clear the occupancy grid — new maze, new walls.
+                    *mapper_sim.write().await = Mapper::new();
+                    // Notify planning + control tasks to flush stale state.
+                    let _ = episode_reset_tx.send(episode);
+                    let _ = bus_sim.gimbal_pan_deg.send(pan_deg);
+                    sim_publish(&bus_sim, &reset_step);
+                    sim_publish_ground_truth(&bus_sim, &*sim.lock().await);
+                    // Clear the latch: new episode, new space.
+                    let _ = bus_sim.safety_state.send(SafetyState::Ok);
+                    info!("Sim: auto-re-arming after episode reset");
+                    let _ = arm_tx_sim.send(()).await;
+                }
+                continue;
+            }
+
+            if step.done && !explore_mode {
                 episode += 1;
                 info!(episode, "Sim: episode timeout — resetting");
                 // Tell the executive to transition Exploring → SafetyStopped
@@ -1330,6 +1784,7 @@ async fn run_sim_mode(
                 let _ = timeout_tx_sim.send(()).await;
                 tokio::time::sleep(Duration::from_millis(800)).await;
                 pan_deg = 0.0;
+                sweep_frame = 0;
                 let mut reset_step = sim.lock().await.reset();
                 apply_sensor_noise(&mut reset_step.scan, &mut noise_rng);
                 // Clear the occupancy grid — new maze, new walls.
@@ -1338,10 +1793,12 @@ async fn run_sim_mode(
                 let _ = episode_reset_tx.send(episode);
                 let _ = bus_sim.gimbal_pan_deg.send(pan_deg);
                 sim_publish(&bus_sim, &reset_step);
+                sim_publish_ground_truth(&bus_sim, &*sim.lock().await);
                 let _ = arm_tx_sim.send(()).await;
                 continue;
             }
 
+            sweep_frame += 1;
             // 10 Hz pacing — the control task also runs at 10 Hz so we stay in sync.
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1350,26 +1807,104 @@ async fn run_sim_mode(
     // ── UI Bridge — same port 9000 WebSocket telemetry as real robot ─────────
     start_ui_bridge(Arc::clone(&bus), UiBridgeConfig::default()).await?;
 
-    info!("Sim mode running — press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await?;
+    info!("Sim mode running — press Ctrl+C or send SIGTERM to stop");
+    {
+        use tokio::signal::unix::SignalKind;
+        let mut sig_term = tokio::signal::unix::signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { info!("SIGINT received"); }
+            _ = sig_term.recv()         => { info!("SIGTERM received"); }
+        }
+    }
     info!("Sim mode: shutting down");
     Ok(())
 }
 
+// ── Shared perception / gimbal helpers ───────────────────────────────────────
+//
+// These functions are called from BOTH the real-robot path and the sim path.
+// ⚠  Any change to constants, thresholds, or sign conventions must be
+//    verified in BOTH call sites and kept in sync deliberately.
+
+/// Return `(range_m, angle_rad)` of the nearest obstacle within the usable FOV.
+///
+/// Rays within ±50° of the camera centre are considered.  The outer ±5° band
+/// (±50°–±55°) is excluded because lens vignette produces a persistent
+/// high-depth artifact at the edges regardless of scene content.
+///
+/// # Dual-path usage
+/// - **Real robot**: called in the perception task after `PseudoLidarExtractor::extract()`,
+///   before the pan-offset correction is applied.  The angle returned is in
+///   *camera frame*; the caller adds the pan offset to convert to robot frame.
+/// - **Sim**: called in `sim_publish()`.  Ray angles are already in robot frame
+///   (pan baked in by `FastSim::cast_lidar_pan`), so the returned angle is
+///   already in robot frame.
+fn nearest_in_fov(scan: &core_types::PseudoLidarScan) -> (f32, f32) {
+    scan.rays.iter()
+        .filter(|r| r.angle_rad.abs() <= 50f32.to_radians())
+        .min_by(|a, b| a.range_m.partial_cmp(&b.range_m).unwrap())
+        .map(|r| (r.range_m, r.angle_rad))
+        .unwrap_or((f32::MAX, 0.0))
+}
+
+/// Compute the target gimbal pan angle (degrees) for one control frame.
+///
+/// Combines a sinusoidal sweep with a reactive bias toward the more open side:
+///
+/// | Component | Value |
+/// |-----------|-------|
+/// | Sweep amplitude | ±20° |
+/// | Sweep period    | 4 s  |
+/// | Reactive cap    | ±10° |
+/// | Step cap        | ±5°/frame |
+/// | Total range     | ±30° |
+///
+/// # Arguments
+/// - `open_bias` — positive means the **right** side is more open than the left.
+///   How to compute this differs by data source:
+///   - **Real robot** (MiDaS pixels, higher = closer):
+///     `open_bias = (left_sum - right_sum) / n`
+///   - **Sim** (pseudo-lidar range_m, higher = more open):
+///     `open_bias = right_avg - left_avg`
+///   Both yield the same sign convention: positive → pan right.
+/// - `t_s`     — elapsed time in seconds (monotonically increasing per episode).
+/// - `cur_pan` — current gimbal pan in degrees.
+///
+/// # Dual-path usage
+/// - **Real robot**: called in the gimbal task, `t_s` from `Instant::elapsed()`.
+/// - **Sim**: called in `sim_reactive_pan()`, `t_s = sweep_frame as f32 * 0.1`.
+fn gimbal_pan_target(open_bias: f32, t_s: f32, cur_pan: f32) -> f32 {
+    const SWEEP_AMP: f32     = 20.0; // degrees
+    const SWEEP_PERIOD_S: f32 = 4.0; // seconds
+    const REACTIVE_GAIN: f32  = 10.0;
+    const REACTIVE_CAP: f32   = 10.0; // degrees
+    const STEP_CAP: f32       = 5.0;  // degrees per frame
+    const PAN_LIMIT: f32      = 30.0; // degrees
+
+    let sweep    = SWEEP_AMP * (2.0 * std::f32::consts::PI * t_s / SWEEP_PERIOD_S).sin();
+    let reactive = (open_bias * REACTIVE_GAIN).clamp(-REACTIVE_CAP, REACTIVE_CAP);
+    let target   = (sweep + reactive).clamp(-PAN_LIMIT, PAN_LIMIT);
+    let step     = (target - cur_pan).clamp(-STEP_CAP, STEP_CAP);
+    cur_pan + step
+}
+
 // ── Sim gimbal helpers ────────────────────────────────────────────────────────
 
-/// Reactive gimbal pan — identical to sim_viz and the real gimbal task.
-/// Splits the 48-ray scan at its midpoint into right/left halves and pans
-/// toward the more open side.  Deadband 8°, step cap ±5°/frame, limit ±30°.
-fn sim_reactive_pan(scan: &core_types::PseudoLidarScan, cur_pan: f32) -> f32 {
+/// Sim gimbal pan — delegates to `gimbal_pan_target` with pseudo-lidar inputs.
+///
+/// Computes `open_bias` from ray range averages (higher range = more open),
+/// converts `sweep_frame` to seconds, then calls the shared function.
+/// See `gimbal_pan_target` for tuning constants and full documentation.
+fn sim_reactive_pan(scan: &core_types::PseudoLidarScan, cur_pan: f32, sweep_frame: u64) -> f32 {
     let n = scan.rays.len();
-    if n < 2 { return cur_pan; }
-    let mid = n / 2;
-    let right_avg = scan.rays[..mid].iter().map(|r| r.range_m).sum::<f32>() / mid as f32;
-    let left_avg  = scan.rays[mid..].iter().map(|r| r.range_m).sum::<f32>() / (n - mid) as f32;
-    let step = ((right_avg - left_avg) * 20.0).clamp(-5.0, 5.0);
-    let new_pan = (cur_pan + step).clamp(-30.0, 30.0);
-    if (new_pan - cur_pan).abs() > 8.0 { new_pan } else { cur_pan }
+    let open_bias = if n >= 2 {
+        let mid       = n / 2;
+        let right_avg = scan.rays[..mid].iter().map(|r| r.range_m).sum::<f32>() / mid as f32;
+        let left_avg  = scan.rays[mid..].iter().map(|r| r.range_m).sum::<f32>() / (n - mid) as f32;
+        right_avg - left_avg  // positive = right more open = pan right
+    } else { 0.0 };
+    let t_s = sweep_frame as f32 * 0.1; // 10 Hz sim step → seconds
+    gimbal_pan_target(open_bias, t_s, cur_pan)
 }
 
 // ── Sim sensor noise helpers ───────────────────────────────────────────────
@@ -1407,20 +1942,23 @@ fn apply_sensor_noise(scan: &mut core_types::PseudoLidarScan, rng: &mut u64) {
 /// Stuck-recovery escape maneuver for sim mode.
 ///
 /// Scans all rays, divides them into 8 sectors, picks the sector with the
-/// highest average clear range, and sends a single-waypoint escape path
-/// 70 % of the way toward the clearest ray in that sector (min 0.5 m).
-/// After the escape path, the normal frontier-selector loop resumes.
+/// highest average clear range.  Returns the world-frame escape target
+/// `[wx, wy]` for the caller to validate with A* before sending a path.
+/// Returns `None` if no scan rays are available.
+///
+/// Side-effects: pans the gimbal toward the escape direction and sleeps 250 ms
+/// so the camera preview settles before the body starts turning.
 async fn sim_escape(
     bus: &bus::Bus,
     pose: &core_types::Pose2D,
     scan: &core_types::PseudoLidarScan,
     failures: u32,
-) {
+) -> Option<[f32; 2]> {
     const N: usize = 8;
     let rays = &scan.rays;
     if rays.is_empty() {
         warn!(failures, "Sim escape: no scan available — skipping");
-        return;
+        return None;
     }
 
     // Accumulate average range per sector (rays ordered by angle index).
@@ -1462,7 +2000,13 @@ async fn sim_escape(
         "Sim escape: panning camera then injecting escape path"
     );
 
-    // Step 1: pan the camera to preview the escape direction before moving.
+    // Step 1: stop the robot immediately so it doesn't drive into a wall while
+    // we compute and validate the escape path.  Without this, the robot
+    // continues its last CmdVel during the 250 ms gimbal-settle pause and can
+    // collide before the new path takes effect (observed: Forward at -161°).
+    let _ = bus.controller_cmd_vel.try_send(core_types::CmdVel { t_ms: pose.t_ms, vx: 0.0, vy: 0.0, omega: 0.0 });
+
+    // Step 2: pan the camera to preview the escape direction before moving.
     // Gimbal is clamped to ±30°; directions behind the robot clamp to the
     // nearest edge so the camera at least hints at the intended turn.
     let pan_deg = best_ray.angle_rad.to_degrees().clamp(-30.0, 30.0);
@@ -1471,13 +2015,14 @@ async fn sim_escape(
     // Brief pause so the gimbal visually settles before the body starts turning.
     tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
 
-    // Step 2: send the escape waypoint; the control task rotates the body to
-    // follow it, and the reactive gimbal pan re-centres as the robot turns.
-    let path = core_types::Path { t_ms: pose.t_ms, waypoints: vec![[wx, wy]] };
-    let _ = bus.planner_path.send(path).await;
+    // Return the target — the planning task validates with A* before use.
+    Some([wx, wy])
 }
 
 /// Publish one SimStep's worth of sensor data onto the bus.
+///
+/// Nearest obstacle is computed from the ±50° camera FOV rays, identical to
+/// the real robot perception path.
 fn sim_publish(bus: &bus::Bus, step: &sim_fast::SimStep) {
     use core_types::UltrasonicReading;
     use std::sync::Arc;
@@ -1488,13 +2033,10 @@ fn sim_publish(bus: &bus::Bus, step: &sim_fast::SimStep) {
     // Pseudo-lidar scan → mapping + control tasks.
     let _ = bus.vision_pseudo_lidar.send(Arc::new(step.scan.clone()));
 
-    // Nearest obstacle across the full visible arc (±55°).
-    // A* clearance keeps the robot away from walls during normal navigation,
-    // so braking on the full FOV is safe and needed to catch side-wall corners.
-    let nearest = step.scan.rays.iter()
-        .map(|r| r.range_m)
-        .fold(f32::MAX, f32::min);
-    let _ = bus.nearest_obstacle_m.send(nearest);
+    // Nearest obstacle — robot-frame angles (pan baked in by step_with_pan).
+    let (near_m, near_angle_rad) = nearest_in_fov(&step.scan);
+    let _ = bus.nearest_obstacle_m.send(near_m);
+    let _ = bus.nearest_obstacle_angle_rad.send(near_angle_rad);
 
     // Synthetic ultrasonic: forward ray (angle closest to 0).
     let fwd_range_m = step.scan.rays.iter()
@@ -1508,6 +2050,13 @@ fn sim_publish(bus: &bus::Bus, step: &sim_fast::SimStep) {
 
     // IMU.
     let _ = bus.imu_raw.send(step.imu);
+}
+
+/// Publish the sim ground-truth wall grid after each episode reset.
+fn sim_publish_ground_truth(bus: &bus::Bus, sim: &sim_fast::FastSim) {
+    use std::sync::Arc;
+    let walls: Vec<u8> = sim.wall_grid().iter().map(|&w| w as u8).collect();
+    let _ = bus.sim_ground_truth.send(Arc::new(walls));
 }
 
 /// Convert a continuous CmdVel to the nearest discrete sim Action.
@@ -1600,10 +2149,18 @@ async fn run_calibrate(mut imu: Box<dyn hal::Imu>) -> anyhow::Result<()> {
 async fn run_slam_debug(
     camera:  Box<dyn hal::Camera>,
     imu:     Box<dyn hal::Imu>,
+    gimbal:  Box<dyn hal::Gimbal>,
     bus:     Arc<Bus>,
     cfg:     &RobotConfig,
 ) -> anyhow::Result<()> {
     info!("SLAM debug — camera + IMU + telemetry only (no planning / motor control)");
+
+    // Home gimbal so tilt_home_deg takes effect even in slam-debug mode.
+    let mut gimbal = gimbal;
+    let tilt_home = cfg.hal.gimbal.tilt_home_deg;
+    if let Err(e) = gimbal.set_angles(0.0, tilt_home).await {
+        warn!("Gimbal home failed: {e}");
+    }
 
     let mut telem = TelemetryWriter::open("logs/slam_debug.ndjson").await?;
     telem.event("runtime", "slam_debug_start").await?;
@@ -1681,15 +2238,18 @@ async fn run_slam_debug(
                         match tokio::task::block_in_place(|| depth_infer.infer(&rgb_stub)) {
                             Ok(depth) => {
                                 let scan = lidar_extractor.extract(&depth);
-                                // Nearest obstacle across the full camera FOV.
-                                // Narrow cones (±15°, ±30°) miss angled approaches —
-                                // confirmed on hardware: robot hit box at 45° nose-first.
-                                let near_m = scan.rays.iter()
-                                    .map(|r| r.range_m)
-                                    .fold(f32::MAX, f32::min);
+                                // Nearest obstacle — camera frame, no pan offset (slam_debug
+                                // intentionally skips gimbal correction for raw MiDaS analysis).
+                                let (near_m, near_angle_rad) = nearest_in_fov(&scan);
+                                if near_m < 1.5 {
+                                    let near_deg = near_angle_rad.to_degrees();
+                                    let side = if near_deg > 5.0 { "left" } else if near_deg < -5.0 { "right" } else { "center" };
+                                    info!(nearest_m = near_m, angle_deg = near_deg, side, "Perception: nearest obstacle");
+                                }
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
                                 let _ = bus_perc.nearest_obstacle_m.send(near_m);
+                                let _ = bus_perc.nearest_obstacle_angle_rad.send(near_angle_rad);
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }

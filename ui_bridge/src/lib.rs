@@ -71,8 +71,8 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     .warn { color: #fa0; }
     .err  { color: #f44; }
     h3 { margin: 0 0 4px; color: #fff; font-size: 11px; letter-spacing: 2px; border-bottom: 1px solid #444; padding-bottom: 4px; }
-    #legend { margin-top: 12px; font-size: 11px; }
-    .ls { display:inline-block; width:12px; height:12px; margin-right:4px; vertical-align:middle; }
+    #legend { margin-top: 12px; font-size: 11px; color: #aaa; }
+    .ls { display:inline-block; width:12px; height:12px; margin-right:4px; vertical-align:middle; border: 1px solid #555; }
   </style>
 </head>
 <body>
@@ -90,14 +90,17 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     <div><span class="label">HDG   </span><span id="hdg" class="val">--</span>&deg;</div>
     <div><span class="label">CONF  </span><span id="conf" class="val">--</span></div>
     <div><span class="label">PAN   </span><span id="pan" class="val">--</span>&deg;</div>
+    <div><span class="label">TILT  </span><span id="tilt" class="val">--</span>&deg;</div>
     <div><span class="label">CELLS  </span><span id="cells" class="val">0</span></div>
-    <div><span class="label">CRASHES</span><span id="crashes" class="val">0</span></div>
+    <div><span class="label">RUN TIME </span><span id="runtime" class="val">--:--</span></div>
+    <div><span class="label">CRASHES  </span><span id="crashes" class="val">0</span></div>
+    <div><span class="label">NEAR MISS </span><span id="estops" class="val">0</span></div>
     <div><span class="label">WS     </span><span id="ws_st" class="warn">connecting</span></div>
     <div id="legend">
       <h3 style="margin-top:8px">LEGEND</h3>
-      <div><span class="ls" style="background:#0f2010"></span>free</div>
-      <div><span class="ls" style="background:#1a1a1a"></span>unknown</div>
-      <div><span class="ls" style="background:#b0b0b0"></span>obstacle</div>
+      <div><span class="ls" style="background:#1a4a1e"></span>free</div>
+      <div><span class="ls" style="background:#555"></span>unknown</div>
+      <div><span class="ls" style="background:#c0c0c0"></span>obstacle</div>
       <div><span class="ls" style="background:#00cccc"></span>frontier</div>
       <div><span class="ls" style="background:#00ff44"></span>robot</div>
     </div>
@@ -112,7 +115,25 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     const grid = new Map();   // "cx,cy" → log_odds (absolute)
     let crashCount = 0;
     let lastExecState = null;
+    let simStartMs = null;   // server epoch ms when sim process started
     let minCX = null, maxCX = null, minCY = null, maxCY = null;
+
+    // ── Ground-truth sim walls ──────────────────────────────────────────────
+    let truWalls = null;   // Uint8Array, 200×200, truWalls[y*200+x]=1 means wall
+    let truW = 0, truH = 0, truRes = 0.05;
+
+    function drawTrueWalls() {
+      if (!truWalls || minCX === null) return;
+      bgX.fillStyle = '#2e2e2e';
+      for (let y = 0; y < truH; y++) {
+        for (let x = 0; x < truW; x++) {
+          if (truWalls[y * truW + x]) {
+            const [px, py] = cellPx(x, y);
+            bgX.fillRect(px, py, PX, PX);
+          }
+        }
+      }
+    }
 
     // ── Overlay state ──────────────────────────────────────────────────────
     let pose = null;
@@ -161,6 +182,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     function redrawBg() {
       bgX.fillStyle = '#1a1a1a';
       bgX.fillRect(0, 0, bgC.width, bgC.height);
+      drawTrueWalls();
       for (const [key, lo] of grid) {
         const c = key.split(',');
         drawCell(+c[0], +c[1], lo);
@@ -183,6 +205,18 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
           if (cy > maxCY) { maxCY = cy; boundsChanged = true; }
         }
       }
+      // If ground truth is loaded, never let the canvas shrink below the
+      // full sim grid — this prevents a resize from blacking out the walls.
+      if (truWalls) {
+        if (minCX === null) {
+          minCX = 0; maxCX = truW - 1; minCY = 0; maxCY = truH - 1; boundsChanged = true;
+        } else {
+          if (minCX > 0)         { minCX = 0;         boundsChanged = true; }
+          if (maxCX < truW - 1)  { maxCX = truW - 1;  boundsChanged = true; }
+          if (minCY > 0)         { minCY = 0;         boundsChanged = true; }
+          if (maxCY < truH - 1)  { maxCY = truH - 1;  boundsChanged = true; }
+        }
+      }
 
       const w = (maxCX - minCX + 2) * PX;
       const h = (maxCY - minCY + 2) * PX;
@@ -202,6 +236,13 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // ── Overlay (robot + frontiers + lidar rays) ───────────────────────────
     function drawOverlay() {
       requestAnimationFrame(drawOverlay);
+      // Update run-time clock every frame.
+      if (simStartMs !== null) {
+        const secs = Math.floor((Date.now() - simStartMs) / 1000);
+        const m = Math.floor(secs / 60).toString().padStart(2, '0');
+        const s = (secs % 60).toString().padStart(2, '0');
+        document.getElementById('runtime').textContent = m + ':' + s;
+      }
       fgX.clearRect(0, 0, fgC.width, fgC.height);
       if (!pose || minCX === null) return;
 
@@ -251,7 +292,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       // Camera / gimbal pan direction — yellow line from robot centre.
       // Shows where the camera is looking relative to the heading triangle.
       const panRad = lastPan * Math.PI / 180;
-      const lookAngle = theta + panRad;
+      const lookAngle = theta - panRad;  // pan_deg>0=right → subtract (CCW-positive frame)
       const lookLen = sz * 3.5;
       fgX.strokeStyle = '#ffee00';
       fgX.lineWidth = 2;
@@ -320,10 +361,6 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
                 flashColor = '#ffaa00'; flashLabel = 'TIMEOUT'; flashFrames = 60;
               } else if (lbl === 'Fault' && lastExecState !== 'Fault') {
                 flashColor = '#ff2200'; flashLabel = 'CRASH';   flashFrames = 60;
-                crashCount++;
-                const el = document.getElementById('crashes');
-                el.textContent = crashCount;
-                el.className = 'err';
               }
               lastExecState = lbl;
               break;
@@ -344,6 +381,50 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               lastPan = msg.data || 0;
               document.getElementById('pan').textContent = fmt(msg.data, 1);
               break;
+            case 'gimbal/tilt':
+              document.getElementById('tilt').textContent = fmt(msg.data, 1);
+              break;
+            case 'sim/start_time':
+              simStartMs = msg.data || null;
+              break;
+            case 'robot/collision': {
+              const prev = crashCount;
+              crashCount = msg.data || 0;
+              if (crashCount > prev) {
+                flashColor = '#ff2200'; flashLabel = 'CRASH'; flashFrames = 60;
+              }
+              const el = document.getElementById('crashes');
+              el.textContent = crashCount;
+              el.className = crashCount > 0 ? 'err' : 'val';
+              break;
+            }
+            case 'robot/estop': {
+              const estopCount = msg.data || 0;
+              const el = document.getElementById('estops');
+              el.textContent = estopCount;
+              el.className = estopCount > 0 ? 'warn' : 'val';
+              break;
+            }
+            case 'sim/ground_truth': {
+              truW = msg.width; truH = msg.height; truRes = msg.res;
+              truWalls = new Uint8Array(msg.walls);
+              // Reset occupancy map so the new maze starts fresh.
+              // Don't touch canvas sizing here — applyDelta owns that.
+              // Resetting minCX=null forces applyDelta to rebuild from
+              // ground-truth bounds on next delta, preventing a size mismatch
+              // that would black out the map on reload.
+              grid.clear();
+              minCX = null; maxCX = null; minCY = null; maxCY = null;
+              // Trigger an immediate redraw using ground-truth bounds so
+              // the walls are visible before any occupancy data arrives.
+              minCX = 0; maxCX = truW - 1; minCY = 0; maxCY = truH - 1;
+              const w = (truW + 1) * PX, h = (truH + 1) * PX;
+              bgC.width = fgC.width = w;
+              bgC.height = fgC.height = h;
+              bgX.clearRect(0, 0, w, h);
+              drawTrueWalls();
+              break;
+            }
           }
         } catch(e) {}
       };
@@ -388,6 +469,11 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       <div><span class="label">HDG  </span><span id="hdg" class="val">--</span>&deg;</div>
       <div><span class="label">CONF </span><span id="conf" class="val">--</span></div>
       <div><span class="label">PAN  </span><span id="pan" class="val">--</span>&deg;</div>
+      <div><span class="label">TILT </span><span id="tilt" class="val">--</span>&deg;</div>
+      <div><span class="label">CELLS </span><span id="cells" class="val">0</span></div>
+      <div><span class="label">RUN TIME </span><span id="runtime" class="val">--:--</span></div>
+      <div><span class="label">CRASHES </span><span id="crashes" class="val">0</span></div>
+      <div><span class="label">NEAR MISS </span><span id="estops" class="val">0</span></div>
       <div><span class="label">WS   </span><span id="ws_st" class="warn">connecting</span></div>
     </div>
   </div>
@@ -400,6 +486,9 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       img.onerror = () => { img.src = ''; setTimeout(startStream, 2000); };
     }
     startStream();
+
+    let crashCount = 0;
+    let simStartMs = null;
 
     function fmt(v, d) { return (v != null && v.toFixed) ? v.toFixed(d) : '--'; }
 
@@ -460,10 +549,51 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
             case 'gimbal/pan':
               document.getElementById('pan').textContent = fmt(msg.data, 1);
               break;
+            case 'gimbal/tilt':
+              document.getElementById('tilt').textContent = fmt(msg.data, 1);
+              break;
+            case 'sim/start_time':
+              simStartMs = msg.data || null;
+              break;
+            case 'robot/collision': {
+              const prev = crashCount;
+              crashCount = msg.data || 0;
+              const el = document.getElementById('crashes');
+              el.textContent = crashCount;
+              el.className = crashCount > 0 ? 'err' : 'val';
+              break;
+            }
+            case 'robot/estop': {
+              const estopCount = msg.data || 0;
+              const el = document.getElementById('estops');
+              el.textContent = estopCount;
+              el.className = estopCount > 0 ? 'warn' : 'val';
+              break;
+            }
+            case 'map/grid_delta': {
+              // Track cell count for CELLS telemetry field.
+              if (msg.data && msg.data.cells) {
+                if (!window._gridSet) window._gridSet = new Set();
+                for (const [cx, cy] of msg.data.cells) window._gridSet.add(cx + ',' + cy);
+                document.getElementById('cells').textContent = window._gridSet.size;
+              }
+              break;
+            }
           }
         } catch(e) {}
       };
     }
+
+    // Run-time clock update.
+    setInterval(() => {
+      if (simStartMs !== null) {
+        const secs = Math.floor((Date.now() - simStartMs) / 1000);
+        const m = Math.floor(secs / 60).toString().padStart(2, '0');
+        const s = (secs % 60).toString().padStart(2, '0');
+        document.getElementById('runtime').textContent = m + ':' + s;
+      }
+    }, 1000);
+
     connect();
   </script>
 </body>
@@ -479,6 +609,24 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     let (fanout_tx, _) = broadcast::channel::<Arc<String>>(FANOUT_CAP);
     let fanout_tx = Arc::new(fanout_tx);
 
+    // Cache the latest sim/ground_truth JSON so new WS clients immediately
+    // receive it on connect (broadcast misses messages sent before subscribe).
+    let last_ground_truth: Arc<std::sync::Mutex<Option<Arc<String>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // Sim process start time — sent once to every new client so the browser
+    // can compute elapsed time without resetting on refresh or episode reset.
+    let sim_start_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let sim_start_json: Arc<String> = Arc::new(
+        serde_json::to_string(&serde_json::json!({
+            "topic": "sim/start_time",
+            "data":  sim_start_ms,
+        })).expect("static JSON"),
+    );
+
     // ── Pose ticker: sample slam_pose2d watch at 10 Hz and fan out ───────
     // Keeping the watch poll in a dedicated task avoids a known footgun
     // where `watch::changed()` in a multi-arm `select!` fires only once:
@@ -491,6 +639,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
         let rx_pose = bus_pose.slam_pose2d.subscribe();
         let rx_exec = bus_pose.executive_state.subscribe();
         let rx_pan  = bus_pose.gimbal_pan_deg.subscribe();
+        let rx_tilt = bus_pose.gimbal_tilt_deg.subscribe();
         let rx_near = bus_pose.nearest_obstacle_m.subscribe();
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -499,6 +648,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
             let pose  = *rx_pose.borrow();
             let state = rx_exec.borrow().clone();
             let pan   = *rx_pan.borrow();
+            let tilt  = *rx_tilt.borrow();
             let near  = *rx_near.borrow();
             if let Ok(msg) = serde_json::to_string(&serde_json::json!({
                 "topic": "slam/pose2d",
@@ -519,6 +669,12 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
             })) {
                 let _ = fanout_pose.send(Arc::new(msg));
             }
+            if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                "topic": "gimbal/tilt",
+                "data":  tilt,
+            })) {
+                let _ = fanout_pose.send(Arc::new(msg));
+            }
             // Only publish when we have a real reading (f32::MAX = no inference yet).
             if near < f32::MAX {
                 if let Ok(msg) = serde_json::to_string(&serde_json::json!({
@@ -534,13 +690,17 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     // ── Aggregator task: subscribe to bus, serialize, fan out ────────────
     let fanout_agg = Arc::clone(&fanout_tx);
     let bus_agg = Arc::clone(&bus);
+    let gt_cache_agg = Arc::clone(&last_ground_truth);
     tokio::spawn(async move {
-        let mut rx_grid     = bus_agg.map_grid_delta.subscribe();
-        let mut rx_frontier = bus_agg.map_frontiers.subscribe();
-        let mut rx_exec     = bus_agg.executive_state.subscribe();
-        let mut rx_health   = bus_agg.health_runtime.subscribe();
-        let mut rx_us       = bus_agg.ultrasonic.subscribe();
-        let mut rx_lidar    = bus_agg.vision_pseudo_lidar.subscribe();
+        let mut rx_grid       = bus_agg.map_grid_delta.subscribe();
+        let mut rx_frontier   = bus_agg.map_frontiers.subscribe();
+        let mut rx_exec       = bus_agg.executive_state.subscribe();
+        let mut rx_health     = bus_agg.health_runtime.subscribe();
+        let mut rx_us         = bus_agg.ultrasonic.subscribe();
+        let mut rx_lidar      = bus_agg.vision_pseudo_lidar.subscribe();
+        let mut rx_collisions  = bus_agg.collision_count.subscribe();
+        let mut rx_estops      = bus_agg.estop_count.subscribe();
+        let mut rx_sim_truth   = bus_agg.sim_ground_truth.subscribe();
 
         loop {
             tokio::select! {
@@ -597,6 +757,38 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                         let _ = fanout_agg.send(Arc::new(msg));
                     }
                 }
+                Ok(()) = rx_collisions.changed() => {
+                    let count = *rx_collisions.borrow_and_update();
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                        "topic": "robot/collision",
+                        "data":  count,
+                    })) {
+                        let _ = fanout_agg.send(Arc::new(msg));
+                    }
+                }
+                Ok(()) = rx_estops.changed() => {
+                    let count = *rx_estops.borrow_and_update();
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                        "topic": "robot/estop",
+                        "data":  count,
+                    })) {
+                        let _ = fanout_agg.send(Arc::new(msg));
+                    }
+                }
+                Ok(walls) = rx_sim_truth.recv() => {
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                        "topic": "sim/ground_truth",
+                        "width": 200u32,
+                        "height": 200u32,
+                        "res":   0.05f32,
+                        "walls": *walls,
+                    })) {
+                        let msg = Arc::new(msg);
+                        // Cache so new WS clients get it immediately on connect.
+                        if let Ok(mut g) = gt_cache_agg.lock() { *g = Some(Arc::clone(&msg)); }
+                        let _ = fanout_agg.send(msg);
+                    }
+                }
                 else => break,
             }
         }
@@ -612,7 +804,10 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     info!("UI bridge listening on ws://{addr}  (overlay: http://{addr}/)");
 
     let bus_status = Arc::clone(&bus);
+    let bus_listener = Arc::clone(&bus);
     let fanout_listener = Arc::clone(&fanout_tx);
+    let gt_cache_listener = Arc::clone(&last_ground_truth);
+    let sim_start_json_listener = Arc::clone(&sim_start_json);
     let mut connected: u32 = 0;
     let bytes_sent: u64 = 0;
 
@@ -637,7 +832,20 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                         connected += 1;
                         info!("UI bridge: WS client connected from {peer}");
                         let rx = fanout_listener.subscribe();
-                        tokio::spawn(handle_client(stream, rx));
+                        // Build initial-state burst: start time, current counts, ground truth.
+                        let mut initial: Vec<Arc<String>> = vec![Arc::clone(&sim_start_json_listener)];
+                        let crash_count = *bus_listener.collision_count.borrow();
+                        let estop_count = *bus_listener.estop_count.borrow();
+                        if let Ok(m) = serde_json::to_string(&serde_json::json!({"topic":"robot/collision","data":crash_count})) {
+                            initial.push(Arc::new(m));
+                        }
+                        if let Ok(m) = serde_json::to_string(&serde_json::json!({"topic":"robot/estop","data":estop_count})) {
+                            initial.push(Arc::new(m));
+                        }
+                        if let Some(gt) = gt_cache_listener.lock().ok().and_then(|g| g.clone()) {
+                            initial.push(gt);
+                        }
+                        tokio::spawn(handle_client(stream, rx, initial));
 
                         let status = BridgeStatus {
                             t_ms: 0,
@@ -681,6 +889,7 @@ async fn serve_page(mut stream: TcpStream, html: &'static str) {
 async fn handle_client(
     stream: TcpStream,
     mut rx: broadcast::Receiver<Arc<String>>,
+    initial: Vec<Arc<String>>,
 ) {
     let ws = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
@@ -690,6 +899,13 @@ async fn handle_client(
         }
     };
     let (mut sink, _source) = futures_util::StreamExt::split(ws);
+
+    // Replay initial state: start time, counts, ground truth.
+    for msg in initial {
+        if sink.send(Message::Text(msg.as_str().to_owned().into())).await.is_err() {
+            return;
+        }
+    }
 
     loop {
         match rx.recv().await {

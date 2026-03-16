@@ -52,8 +52,11 @@ pub struct Bus {
     pub imu_orientation:      watch::Sender<Orientation>,
     pub slam_pose2d:          watch::Sender<Pose2D>,
     pub safety_state:         watch::Sender<SafetyState>,
-    pub gimbal_pan_deg:       watch::Sender<f32>,
-    pub nearest_obstacle_m:   watch::Sender<f32>,
+    pub gimbal_pan_deg:           watch::Sender<f32>,
+    pub gimbal_tilt_deg:          watch::Sender<f32>,
+    pub nearest_obstacle_m:       watch::Sender<f32>,
+    /// Angle (rad, robot frame: 0=forward, +CCW/left) of the nearest obstacle ray.
+    pub nearest_obstacle_angle_rad: watch::Sender<f32>,
 
     // ── SLAM events (broadcast) ───────────────────────────────────────────
     pub slam_keyframe_event:  broadcast::Sender<KeyframeEvent>,
@@ -65,6 +68,18 @@ pub struct Bus {
 
     // ── Executive (watch) ─────────────────────────────────────────────────
     pub executive_state:      watch::Sender<ExecutiveState>,
+
+    // ── Safety / episode event counters (watch) ───────────────────────────
+    /// Cumulative collision count. In sim: physics wall-contact events.
+    /// On real: IMU-detected impacts (accel spike > threshold while armed).
+    pub collision_count:      watch::Sender<u32>,
+    /// Cumulative US EmergencyStop count — near-misses that the safety
+    /// system caught before a physical contact occurred.
+    pub estop_count:          watch::Sender<u32>,
+
+    // ── Sim ground truth (broadcast, one message per episode reset) ──────
+    /// Flat wall grid: `walls[y * 200 + x] == 1` means wall. 200×200 cells, 0.05 m/cell.
+    pub sim_ground_truth:     broadcast::Sender<Arc<Vec<u8>>>,
 
     // ── Health / bridge (broadcast) ───────────────────────────────────────
     pub health_runtime:       broadcast::Sender<HealthMetrics>,
@@ -116,13 +131,18 @@ impl Bus {
         let (tx_frontiers,  _) = broadcast::channel(cap);
         let (tx_health,     _) = broadcast::channel(cap);
         let (tx_bridge_st,  _) = broadcast::channel(cap);
+        let (tx_sim_truth,  _) = broadcast::channel(4);
 
         let (tx_orientation,   rx_orientation)  = watch::channel(Orientation::default());
         let (tx_pose2d,        rx_pose2d)       = watch::channel(Pose2D::default());
         let (tx_safety,        rx_safety)       = watch::channel(SafetyState::default());
         let (tx_exec_state,    rx_exec_state)   = watch::channel(ExecutiveState::default());
         let (tx_gimbal_pan,    _)               = watch::channel(0.0_f32);
+        let (tx_gimbal_tilt,   _)               = watch::channel(0.0_f32);
         let (tx_nearest,       _)               = watch::channel(f32::MAX);
+        let (tx_nearest_angle, _)               = watch::channel(0.0_f32);
+        let (tx_collisions,    _)               = watch::channel(0_u32);
+        let (tx_estops,        _)               = watch::channel(0_u32);
 
         let (tx_decision,  rx_decision)  = mpsc::channel(cap);
         let (tx_path,      rx_path)      = mpsc::channel(cap);
@@ -143,13 +163,18 @@ impl Bus {
             imu_orientation:     tx_orientation,
             slam_pose2d:         tx_pose2d,
             safety_state:        tx_safety,
-            gimbal_pan_deg:      tx_gimbal_pan,
-            nearest_obstacle_m:  tx_nearest,
+            gimbal_pan_deg:              tx_gimbal_pan,
+            gimbal_tilt_deg:             tx_gimbal_tilt,
+            nearest_obstacle_m:          tx_nearest,
+            nearest_obstacle_angle_rad:  tx_nearest_angle,
             slam_keyframe_event: tx_keyframe,
             map_grid_delta:      tx_grid,
             map_explored_stats:  tx_explored,
             map_frontiers:       tx_frontiers,
             executive_state:     tx_exec_state,
+            collision_count:     tx_collisions,
+            estop_count:         tx_estops,
+            sim_ground_truth:    tx_sim_truth,
             health_runtime:      tx_health,
             ui_bridge_status:    tx_bridge_st,
             decision_frontier:   tx_decision,

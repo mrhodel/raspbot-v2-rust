@@ -18,12 +18,13 @@ use core_types::{Path, Pose2D};
 use mapping::{Mapper, OCC_THRESH};
 use tracing::{debug, warn};
 
-/// Obstacle clearance radius in grid cells (5 cm/cell → 5 cells = 25 cm).
-/// Raised from 2→4→5 to keep pure-pursuit corner cuts within the robot radius (15 cm).
-const CLEARANCE_CELLS: i32 = 5;
+/// Default obstacle clearance radius in grid cells (5 cm/cell → 7 cells = 35 cm).
+/// Used when calling `plan()`; use `plan_with_clearance()` to override.
+const CLEARANCE_CELLS: i32 = 7;
 
-/// Keep one waypoint per this many cells along the raw path.
-const WAYPOINT_STEP: usize = 10;
+/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 4 cells = 20 cm).
+/// Denser waypoints keep pure-pursuit on the planned line and reduce corner-cutting.
+const WAYPOINT_STEP: usize = 4;
 
 /// Maximum A* nodes to expand before giving up.
 const MAX_NODES: usize = 50_000;
@@ -37,18 +38,24 @@ impl AStarPlanner {
         Self
     }
 
-    /// Find a collision-free path from `start` pose to `goal_m` (world coords).
+    /// Find a collision-free path using the default clearance (`CLEARANCE_CELLS`).
+    pub fn plan(&self, mapper: &Mapper, start: &Pose2D, goal_m: [f32; 2]) -> Option<Path> {
+        self.plan_with_clearance(mapper, start, goal_m, CLEARANCE_CELLS)
+    }
+
+    /// Find a collision-free path from `start` pose to `goal_m` (world coords)
+    /// using the given `clearance` radius in grid cells.
     ///
     /// Returns `None` if the goal is unreachable within `MAX_NODES` expansions,
     /// or if the start / goal cell is itself inside an inflated obstacle.
-    pub fn plan(&self, mapper: &Mapper, start: &Pose2D, goal_m: [f32; 2]) -> Option<Path> {
+    pub fn plan_with_clearance(&self, mapper: &Mapper, start: &Pose2D, goal_m: [f32; 2], clearance: i32) -> Option<Path> {
         let (sx, sy) = mapper.world_to_cell(start.x_m, start.y_m);
         let (gx, gy) = mapper.world_to_cell(goal_m[0], goal_m[1]);
 
-        let (sx, sy) = if self.passable(mapper, sx, sy) {
+        let (sx, sy) = if self.passable(mapper, sx, sy, clearance) {
             (sx, sy)
         } else {
-            match self.nearest_passable(mapper, sx, sy) {
+            match self.nearest_passable(mapper, sx, sy, clearance) {
                 Some(cell) => {
                     debug!("A*: start ({sx},{sy}) in clearance zone — nudged to {:?}", cell);
                     cell
@@ -59,11 +66,11 @@ impl AStarPlanner {
                 }
             }
         };
-        let (gx, gy) = if self.passable(mapper, gx, gy) {
+        let (gx, gy) = if self.passable(mapper, gx, gy, clearance) {
             (gx, gy)
         } else {
             // BFS outward from goal to find nearest passable cell.
-            match self.nearest_passable(mapper, gx, gy) {
+            match self.nearest_passable(mapper, gx, gy, clearance) {
                 Some(cell) => {
                     debug!("A*: goal ({gx},{gy}) in obstacle — nudged to {:?}", cell);
                     cell
@@ -100,7 +107,7 @@ impl AStarPlanner {
             let g = g_cost[&(cx, cy)];
 
             for (nx, ny) in neighbors8(cx, cy) {
-                if !self.passable(mapper, nx, ny) {
+                if !self.passable(mapper, nx, ny, clearance) {
                     continue;
                 }
                 // Diagonal moves cost √2, cardinal moves cost 1.
@@ -122,10 +129,10 @@ impl AStarPlanner {
         None
     }
 
-    /// True if `(cx,cy)` and all cells within `CLEARANCE_CELLS` are passable.
-    fn passable(&self, mapper: &Mapper, cx: i32, cy: i32) -> bool {
-        for dx in -CLEARANCE_CELLS..=CLEARANCE_CELLS {
-            for dy in -CLEARANCE_CELLS..=CLEARANCE_CELLS {
+    /// True if `(cx,cy)` and all cells within `clearance` are free of obstacles.
+    fn passable(&self, mapper: &Mapper, cx: i32, cy: i32, clearance: i32) -> bool {
+        for dx in -clearance..=clearance {
+            for dy in -clearance..=clearance {
                 if mapper.grid.get(cx + dx, cy + dy) >= OCC_THRESH {
                     return false;
                 }
@@ -136,7 +143,7 @@ impl AStarPlanner {
 
     /// BFS from `(cx,cy)` outward to find the nearest passable cell.
     /// Searches up to 20 cells radius; returns `None` if none found.
-    fn nearest_passable(&self, mapper: &Mapper, cx: i32, cy: i32) -> Option<(i32, i32)> {
+    fn nearest_passable(&self, mapper: &Mapper, cx: i32, cy: i32, clearance: i32) -> Option<(i32, i32)> {
         use std::collections::VecDeque;
         let mut visited = std::collections::HashSet::new();
         let mut queue = VecDeque::new();
@@ -147,7 +154,7 @@ impl AStarPlanner {
             if (x - cx).abs().max((y - cy).abs()) > MAX_RADIUS {
                 break;
             }
-            if self.passable(mapper, x, y) {
+            if self.passable(mapper, x, y, clearance) {
                 return Some((x, y));
             }
             for (nx, ny) in neighbors8(x, y) {

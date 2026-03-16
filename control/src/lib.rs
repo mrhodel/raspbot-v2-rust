@@ -43,9 +43,24 @@ impl PurePursuitController {
             return CmdVel { t_ms: pose.t_ms, vx: 0.0, vy: 0.0, omega: 0.0 };
         }
 
-        // Lookahead point: first waypoint beyond lookahead distance, else last.
-        let target = path
-            .waypoints
+        // Find which waypoint we're closest to — this is our position on the
+        // path.  Searching from there forward prevents re-targeting already-
+        // passed waypoints that are still ≥ lookahead_m behind the robot.
+        let closest_idx = path.waypoints
+            .iter()
+            .enumerate()
+            .min_by(|(_, &[ax, ay]), (_, &[bx, by])| {
+                let da2 = (ax - pose.x_m).powi(2) + (ay - pose.y_m).powi(2);
+                let db2 = (bx - pose.x_m).powi(2) + (by - pose.y_m).powi(2);
+                da2.partial_cmp(&db2).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // Lookahead point: first waypoint from closest onward that is beyond
+        // lookahead distance.  Falls back to the final waypoint when all
+        // remaining waypoints are within the lookahead circle.
+        let target = path.waypoints[closest_idx..]
             .iter()
             .find(|&&[wx, wy]| {
                 let dx = wx - pose.x_m;
@@ -61,13 +76,20 @@ impl PurePursuitController {
         let angle_world = dy.atan2(dx);
         let heading_err = wrap_angle(angle_world - pose.theta_rad);
 
-        // Forward speed: reduce as heading error grows, scale by distance.
+        // Forward speed: cos.max(0) — zero only when waypoint is behind.
+        // Avoids stop-and-pivot for heading errors up to ±90°; stops only
+        // when a U-turn is needed (waypoint behind the robot).
         let vx = MAX_VX
             * heading_err.cos().max(0.0)
             * (dist / self.lookahead_m).min(1.0);
 
-        // Angular rate: proportional to heading error.
-        let omega = (MAX_OMEGA * heading_err).clamp(-MAX_OMEGA, MAX_OMEGA);
+        // Angular rate: proportional to heading error, but capped so the
+        // turning radius never falls below MIN_RADIUS_M while moving forward.
+        // When stopped (vx≈0) the full MAX_OMEGA is allowed so the robot can
+        // spin to face a waypoint that is behind it.
+        const MIN_RADIUS_M: f32 = 0.35;
+        let omega_cap = if vx > 0.15 { (vx / MIN_RADIUS_M).min(MAX_OMEGA) } else { MAX_OMEGA };
+        let omega = (MAX_OMEGA * heading_err).clamp(-omega_cap, omega_cap);
 
         CmdVel { t_ms: pose.t_ms, vx, vy: 0.0, omega }
     }

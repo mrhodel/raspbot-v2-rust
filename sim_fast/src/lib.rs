@@ -59,8 +59,8 @@ const SPEED_M_S: f32 = 0.30;
 const OMEGA_RAD_S: f32 = 1.0;
 
 /// Episode ends after this many steps (in addition to collision).
-/// At 10 Hz this is 10 minutes per episode.
-const MAX_STEPS: u32 = 6_000;
+/// At 10 Hz this is 200 seconds (~3.3 minutes) per episode.
+const MAX_STEPS: u32 = 2_000;
 
 /// Number of random rectangular obstacles per episode.
 const NUM_OBSTACLES: usize = 18;
@@ -131,6 +131,9 @@ pub struct FastSim {
 }
 
 impl FastSim {
+    /// Returns the ground-truth wall grid: flat `bool` slice, row-major `y * GRID_CELLS + x`.
+    pub fn wall_grid(&self) -> &[bool] { &self.grid }
+
     /// Create a new simulator with the given random seed.
     pub fn new(seed: u64) -> Self {
         let mut sim = Self {
@@ -153,6 +156,21 @@ impl FastSim {
         self.t_ms = 0;
         self.last_omega = 0.0;
         self.generate_maze();
+        self.make_step(false)
+    }
+
+    /// Reposition the robot to the centre of the **current** maze without
+    /// regenerating walls.  Used in single-episode explore mode so the
+    /// occupancy map survives a collision respawn.
+    pub fn respawn(&mut self) -> SimStep {
+        self.step_count = 0;
+        self.last_omega = 0.0;
+        let start_x = ARENA_M * 0.5;
+        let start_y = ARENA_M * 0.5;
+        let (rx, ry) = self.nearest_free(start_x, start_y);
+        self.robot_x = rx;
+        self.robot_y = ry;
+        self.robot_theta = self.rng.next_f32() * 2.0 * std::f32::consts::PI;
         self.make_step(false)
     }
 
@@ -366,7 +384,6 @@ impl FastSim {
         );
     }
 
-    /// Find the nearest free-and-clear cell to `(world_x, world_y)`.
     fn nearest_free(&self, world_x: f32, world_y: f32) -> (f32, f32) {
         let cx0 = (world_x / RESOLUTION_M) as i32;
         let cy0 = (world_y / RESOLUTION_M) as i32;

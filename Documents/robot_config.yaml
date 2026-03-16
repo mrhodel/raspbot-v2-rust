@@ -45,6 +45,7 @@ hal:
     # Fine-tune pan by adjusting PAN_CENTER const (90→87) for ~2-3° CW chassis offset.
     tilt_range: [-30, 30]
     tilt_neutral: 30           # raw servo angle (0-180) that points camera level (tune to ~28)
+    tilt_home_deg: 20          # startup tilt angle (deg, positive=up); tune until horizon is in upper ~40% of frame
     move_speed_deg_s: 120      # max angular velocity (software-limited)
 
   camera:
