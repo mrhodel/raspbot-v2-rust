@@ -220,12 +220,11 @@ sim:
   seed: 42                     # default maze seed (overridden by --seed CLI flag)
   obstacles: 18                # number of random rectangular obstacles (0 = empty room)
   obstacle_slow_m: 0.70        # MiDaS nearest-obstacle distance that begins speed scaling
-  obstacle_stop_m: 0.15        # MiDaS nearest-obstacle distance → full stop
+  obstacle_stop_m: 0.05        # MiDaS nearest-obstacle distance → hard stop (above floor noise)
   # After PseudoLidar floor-contamination fix, clear-corridor readings are ~0.90 m+.
-  # 0.70/0.15 gives meaningful deceleration from 70 cm and hard stop at 15 cm,
-  # comfortably below the clear-path floor.  Code also unconditionally fires
-  # obstacle_stopped whenever nearest ≤ obstacle_stop_m (regardless of angle),
-  # preventing side-obstacle rotation-into-wall crashes.
+  # 0.70/0.05: robot starts slowing at 70 cm; at crash-typical distances (10-50 cm)
+  # speed_scale drops to 5-40%, giving rotation time to swing obstacles out of forward arc.
+  # stop_m=0.05 (not 0.15) avoids livelock from floor noise that persists at ~0.10 m.
   # Sensor noise parameters — calibrate against logs/robot.ndjson deceleration curves
   imu_noise_gyro_rad_s: 0.01   # Gaussian sigma on simulated gyro axes (rad/s)
   imu_noise_accel_m_s2: 0.05   # Gaussian sigma on simulated lateral accel axes (m/s²)

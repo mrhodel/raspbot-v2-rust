@@ -877,7 +877,7 @@ fn spawn_mapping_task(
 ///   Sim=0.70 m (tighter — sim depth is less noisy after floor-contamination fix).
 /// - `obstacle_stop_m`: depth at which forward motion stops and the path is
 ///   abandoned.  Real=0.60 m (raised from 0.40 to account for camera lag and
-///   MiDaS noise); Sim=0.15 m (above clear-corridor floor since floor-contamination fix).
+///   MiDaS noise); Sim=0.05 m (floor noise reaches ~0.10 m so 0.05 avoids livelock).
 /// - `episode_rx`: watch channel that fires on episode reset (sim only).
 ///   For real mode pass a watch receiver whose sender is immediately dropped —
 ///   `Ok(()) = changed()` in the select! arm never matches on a closed watch,
@@ -1100,19 +1100,15 @@ fn spawn_control_task(
                         let obs_side = if obs_deg > 5.0 { "left" } else if obs_deg < -5.0 { "right" } else { "center" };
                         // `toward` is already computed above from unscaled omega.
                         if combined_scale <= 0.0 {
-                            // Hard stop: fire obstacle_stopped when ANY of these are true:
-                            //   - US at ≤ emergency_stop_cm
-                            //   - MiDaS obstacle in forward arc (≤ 30°)
-                            //   - navigation turning toward detected obstacle
-                            //   - MiDaS-measured distance ≤ obstacle_stop_m (any angle)
-                            // The last case prevents a crash pattern where nearest drops into
-                            // the stop zone at ~35–45° and `in_forward_arc` is just false:
-                            // the robot sends omega-only, rotates toward the wall, and collides
-                            // before the obstacle crosses the 30° arc threshold.
+                            // Hard stop: US at ≤ emergency_stop_cm, OR MiDaS obstacle in forward
+                            // arc (≤ 30°), OR navigation is turning toward the detected obstacle.
+                            // has_forward / midas_stopped (any-angle stop) are intentionally
+                            // excluded: floor-noise MiDaS readings at ~0.10 m (just above the
+                            // 0.05 m stop_m) reduce combined_scale to near-zero already, so the
+                            // robot crawls, rotation swings the obstacle clear, and no latch fires.
                             let us_stopped     = us_scale <= 0.0;
                             let in_forward_arc = nearest_angle.abs() <= 30f32.to_radians();
-                            let midas_stopped  = base_scale <= 0.0; // nearest ≤ obstacle_stop_m
-                            if us_stopped || in_forward_arc || toward || midas_stopped {
+                            if us_stopped || in_forward_arc || toward {
                                 if !obstacle_stopped {
                                     warn!(
                                         nearest_m   = nearest,
