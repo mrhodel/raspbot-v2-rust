@@ -40,6 +40,13 @@ pub const OCC_THRESH:  f32 =  0.5;
 /// Minimum ray confidence required to update the grid.
 const MIN_CONFIDENCE: f32 = 0.1;
 
+/// Rays at or beyond this range are "no obstacle detected" sentinels emitted
+/// by the pseudo-lidar when depth contrast is below threshold.  Walking their
+/// full 60-cell Bresenham trace applies MISS updates through confirmed obstacle
+/// cells, eroding them.  Skip these rays entirely — the immediate-vicinity
+/// Bresenham intermediates of shorter obstacle rays still mark corridors free.
+const MAX_RANGE_M: f32 = 3.0;
+
 // ── OccupancyGrid ─────────────────────────────────────────────────────────────
 
 /// Sparse log-odds occupancy grid. Cells absent from the map are unknown (0.0).
@@ -123,14 +130,31 @@ impl Mapper {
         // Track touched cells so each appears once in the delta.
         let mut touched: HashMap<(i32, i32), ()> = HashMap::new();
 
+        // First pass: collect HIT endpoint cells for all valid obstacle rays.
+        // A HIT cell must not receive a MISS from an adjacent ray's Bresenham
+        // walk in the same scan — that would net the cell below OCC_THRESH and
+        // render it as uncertain instead of occupied.
+        let mut hit_endpoints: HashSet<(i32, i32)> = HashSet::new();
         for ray in &scan.rays {
-            if ray.confidence < MIN_CONFIDENCE {
+            if ray.confidence < MIN_CONFIDENCE
+                || ray.range_m < 0.05
+                || ray.range_m >= MAX_RANGE_M
+            {
                 continue;
             }
-            // Skip degenerate near-zero range rays.  A range_m ≈ 0 means the
-            // Bresenham trace ends at the robot's own cell, marking it occupied
-            // every frame and masking real obstacles behind it.
-            if ray.range_m < 0.05 {
+            let world_angle = pose.theta_rad + ray.angle_rad;
+            let ex = pose.x_m + ray.range_m * world_angle.cos();
+            let ey = pose.y_m + ray.range_m * world_angle.sin();
+            hit_endpoints.insert((world_to_cell(ex, res), world_to_cell(ey, res)));
+        }
+
+        // Second pass: apply Bresenham updates.
+        // Max-range rays are skipped — they carry no reliable obstacle depth.
+        for ray in &scan.rays {
+            if ray.confidence < MIN_CONFIDENCE
+                || ray.range_m < 0.05
+                || ray.range_m >= MAX_RANGE_M
+            {
                 continue;
             }
             let world_angle = pose.theta_rad + ray.angle_rad;
@@ -140,13 +164,16 @@ impl Mapper {
             let hy = world_to_cell(end_y, res);
 
             for (cx, cy) in bresenham(rx, ry, hx, hy) {
-                let delta = if cx == hx && cy == hy {
-                    LOG_ODDS_HIT
-                } else {
-                    LOG_ODDS_MISS
-                };
-                self.grid.apply(cx, cy, delta);
-                touched.insert((cx, cy), ());
+                if cx == hx && cy == hy {
+                    self.grid.apply(cx, cy, LOG_ODDS_HIT);
+                    touched.insert((cx, cy), ());
+                } else if !hit_endpoints.contains(&(cx, cy)) {
+                    // Only apply MISS to cells that are not a HIT endpoint for
+                    // another ray — prevents adjacent Bresenham traces from
+                    // immediately overwriting obstacle cells with MISS.
+                    self.grid.apply(cx, cy, LOG_ODDS_MISS);
+                    touched.insert((cx, cy), ());
+                }
             }
         }
 
