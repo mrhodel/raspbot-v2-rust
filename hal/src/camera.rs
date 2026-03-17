@@ -140,9 +140,7 @@ mod usb {
             // Spawn MJPEG server task when requested.
             if let Some(port) = stream_port {
                 let tx = broadcast_tx.clone();
-                tokio::spawn(async move {
-                    run_mjpeg_server(port, tx).await;
-                });
+                tokio::spawn(crate::mjpeg::run_server(port, tx));
                 info!("V4L2Camera: MJPEG stream → http://0.0.0.0:{port}/");
             }
 
@@ -256,76 +254,8 @@ mod usb {
         rgb
     }
 
-    // ── MJPEG HTTP server ─────────────────────────────────────────────────────
-
-    async fn run_mjpeg_server(
-        port: u16,
-        tx:   tokio::sync::broadcast::Sender<Arc<CameraFrame>>,
-    ) {
-        use tokio::net::TcpListener;
-
-        let listener = match TcpListener::bind(format!("0.0.0.0:{port}")).await {
-            Ok(l)  => l,
-            Err(e) => { warn!("MJPEG server: bind port {port} failed: {e}"); return; }
-        };
-
-        loop {
-            let Ok((socket, addr)) = listener.accept().await else { continue };
-            info!("MJPEG: client connected from {addr}");
-            tokio::spawn(serve_mjpeg_client(socket, tx.subscribe()));
-        }
-    }
-
-    async fn serve_mjpeg_client(
-        mut socket: tokio::net::TcpStream,
-        mut rx:     tokio::sync::broadcast::Receiver<Arc<CameraFrame>>,
-    ) {
-        use tokio::io::AsyncWriteExt;
-
-        let hdr = b"HTTP/1.1 200 OK\r\n\
-                    Content-Type: multipart/x-mixed-replace;boundary=frame\r\n\
-                    Cache-Control: no-cache\r\n\
-                    Connection: close\r\n\r\n";
-        if socket.write_all(hdr).await.is_err() { return; }
-
-        loop {
-            let frame = match rx.recv().await {
-                Ok(f)  => f,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            };
-
-            let jpeg = encode_jpeg(&frame);
-            let part = format!(
-                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
-                jpeg.len()
-            );
-            if socket.write_all(part.as_bytes()).await.is_err() { break; }
-            if socket.write_all(&jpeg).await.is_err()           { break; }
-            if socket.write_all(b"\r\n").await.is_err()         { break; }
-        }
-    }
-
-    /// JPEG-encode an RGB `CameraFrame` at quality 75.
-    fn encode_jpeg(frame: &CameraFrame) -> Vec<u8> {
-        use image::codecs::jpeg::JpegEncoder;
-        use image::RgbImage;
-
-        let Some(img) = RgbImage::from_raw(
-            frame.width, frame.height, frame.data.clone()
-        ) else {
-            warn!("encode_jpeg: frame data size mismatch");
-            return Vec::new();
-        };
-
-        let mut buf = Vec::new();
-        if let Err(e) = JpegEncoder::new_with_quality(&mut buf, 75).encode_image(&img) {
-            warn!("encode_jpeg: {e}");
-            return Vec::new();
-        }
-        buf
-    }
-}
+    // (MJPEG server implementation lives in crate::mjpeg)
+} // mod usb
 
 #[cfg(feature = "usb-camera")]
 pub use usb::V4L2Camera;

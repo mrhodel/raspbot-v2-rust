@@ -66,6 +66,9 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     body { background: #0d0d0d; display: flex; height: 100vh; overflow: hidden; font-family: monospace; }
     #map-wrap { flex: 1; overflow: auto; position: relative; padding: 8px; }
     #map-bg, #map-fg { position: absolute; top: 8px; left: 8px; image-rendering: pixelated; }
+    #cam-panel { width: 320px; background: #111; padding: 8px; display: flex; flex-direction: column; gap: 4px; flex-shrink: 0; border-left: 1px solid #333; }
+    #cam-stream { width: 320px; height: 240px; display: block; object-fit: contain; background: #000; border: 1px solid #444; }
+    #cam-placeholder { width: 320px; height: 240px; background: #1a1a1a; border: 1px solid #333; display: flex; align-items: center; justify-content: center; color: #555; font-size: 12px; }
     #sidebar { width: 170px; background: #111; padding: 8px 12px; font-size: 13px; line-height: 2; flex-shrink: 0; border-left: 1px solid #333; overflow-y: auto; }
     .label { color: #8a8; }
     .val  { color: #0f0; }
@@ -80,6 +83,10 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
   <div id="map-wrap">
     <canvas id="map-bg"></canvas>
     <canvas id="map-fg"></canvas>
+  </div>
+  <div id="cam-panel">
+    <img id="cam-stream" src="" alt="camera">
+    <div id="cam-placeholder">NO FEED</div>
   </div>
   <div id="sidebar">
     <h3>TELEMETRY</h3>
@@ -119,6 +126,8 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // Cells store absolute log-odds values from GridDelta.
     const grid = new Map();   // "cx,cy" → log_odds (absolute)
     let crashCount = 0;
+    let crashMarkers = [];
+    let lastRobotPx = 0, lastRobotPy = 0;
     let lastExecState = null;
     let simStartMs = null;   // server epoch ms when sim process started
     let minCX = null, maxCX = null, minCY = null, maxCY = null;
@@ -129,7 +138,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
 
     function drawTrueWalls() {
       if (!truWalls || minCX === null) return;
-      bgX.fillStyle = '#2e2e2e';
+      bgX.fillStyle = '#606060';   // visible even before the robot scans these cells
       for (let y = 0; y < truH; y++) {
         for (let x = 0; x < truW; x++) {
           if (truWalls[y * truW + x]) {
@@ -179,7 +188,10 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // ── Draw a single cell onto the bg canvas ─────────────────────────────
     function drawCell(cx, cy, lo) {
       const [px, py] = cellPx(cx, cy);
-      bgX.fillStyle = cellColor(lo);
+      const isWall = truWalls && cx >= 0 && cx < truW && cy >= 0 && cy < truH
+                     && truWalls[cy * truW + cx];
+      // Wall cells: show discovery when scanned, but never go darker than base.
+      bgX.fillStyle = (isWall && lo < 0.5) ? '#606060' : cellColor(lo);
       bgX.fillRect(px, py, PX, PX);
     }
 
@@ -187,10 +199,10 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     function redrawBg() {
       bgX.fillStyle = '#1a1a1a';
       bgX.fillRect(0, 0, bgC.width, bgC.height);
-      drawTrueWalls();
+      drawTrueWalls();                          // base pass: unscanned walls
       for (const [key, lo] of grid) {
         const c = key.split(',');
-        drawCell(+c[0], +c[1], lo);
+        drawCell(+c[0], +c[1], lo);            // occupancy; walls clamped above
       }
     }
 
@@ -269,6 +281,21 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       }
 
       // Frontiers (cyan circles, sized by frontier area).
+      // True-wall overlay on fg — drawn after rays so wall cells aren't
+      // visually dominated by the green ray strokes terminating there.
+      if (truWalls) {
+        fgX.fillStyle = 'rgba(120,120,120,0.55)';
+        for (let ty = 0; ty < truH; ty++) {
+          for (let tx = 0; tx < truW; tx++) {
+            if (truWalls[ty * truW + tx]) {
+              const [px, py] = cellPx(tx, ty);
+              fgX.fillRect(px, py, PX, PX);
+            }
+          }
+        }
+      }
+
+      // Frontiers (cyan circles, sized by frontier area).
       for (const f of frontiers) {
         const [fx, fy] = worldPx(f.centroid_x_m, f.centroid_y_m);
         const r = Math.max(3, Math.sqrt(f.size_cells) * PX * 0.3);
@@ -279,8 +306,17 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
         fgX.stroke();
       }
 
+      // Crash markers — permanent red dots drawn under robot
+      fgX.fillStyle = '#ff2200';
+      for (const cm of crashMarkers) {
+        fgX.beginPath();
+        fgX.arc(cm.px, cm.py, 6, 0, Math.PI * 2);
+        fgX.fill();
+      }
+
       // Robot triangle.
       const sz = 8;
+      lastRobotPx = rx; lastRobotPy = ry;
       fgX.save();
       fgX.translate(rx, ry);
       fgX.rotate(-theta);   // negate: Y is flipped
@@ -337,7 +373,17 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       const wsSt = document.getElementById('ws_st');
       wsSt.className = 'warn'; wsSt.textContent = 'connecting';
       ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; };
-      ws.onclose = () => { wsSt.className = 'err'; wsSt.textContent = 'reconnecting'; setTimeout(connect, 2000); };
+      ws.onclose = () => {
+        wsSt.className = 'err'; wsSt.textContent = 'reconnecting';
+        if (simStartMs !== null) {
+          const secs = Math.floor((Date.now() - simStartMs) / 1000);
+          const m = Math.floor(secs / 60).toString().padStart(2,'0');
+          const s = (secs % 60).toString().padStart(2,'0');
+          document.getElementById('runtime').textContent = m + ':' + s + ' (stopped)';
+          simStartMs = null;
+        }
+        setTimeout(connect, 2000);
+      };
       ws.onerror = () => ws.close();
 
       ws.onmessage = (ev) => {
@@ -364,7 +410,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               const lbl = stateLabel(msg.data);
               document.getElementById('mode').textContent = lbl;
               if (lbl === 'SafetyStopped' && lastExecState !== 'SafetyStopped') {
-                flashColor = '#ffaa00'; flashLabel = 'TIMEOUT'; flashFrames = 60;
+                flashColor = '#ffaa00'; flashLabel = 'NEAR MISS'; flashFrames = 60;
               } else if (lbl === 'Fault' && lastExecState !== 'Fault') {
                 flashColor = '#ff2200'; flashLabel = 'CRASH';   flashFrames = 60;
               }
@@ -398,6 +444,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               crashCount = msg.data || 0;
               if (crashCount > prev) {
                 flashColor = '#ff2200'; flashLabel = 'CRASH'; flashFrames = 60;
+                crashMarkers.push({px: lastRobotPx, py: lastRobotPy});
               }
               const el = document.getElementById('crashes');
               el.textContent = crashCount;
@@ -438,6 +485,16 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
 
     connect();
     requestAnimationFrame(drawOverlay);
+
+    // Camera stream (MJPEG on port 8080).
+    (function startCamStream() {
+      const img = document.getElementById('cam-stream');
+      const ph  = document.getElementById('cam-placeholder');
+      img.onload  = () => { img.style.display = 'block'; ph.style.display = 'none'; };
+      img.onerror = () => { img.style.display = 'none';  ph.style.display = 'flex';
+                            setTimeout(startCamStream, 3000); };
+      img.src = 'http://' + host + ':8080/';
+    })();
   </script>
 </body>
 </html>
@@ -714,6 +771,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
         let mut rx_collisions  = bus_agg.collision_count.subscribe();
         let mut rx_estops      = bus_agg.estop_count.subscribe();
         let mut rx_sim_truth   = bus_agg.sim_ground_truth.subscribe();
+        let rx_pose_agg        = bus_agg.slam_pose2d.subscribe();
 
         loop {
             tokio::select! {
@@ -772,9 +830,12 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                 }
                 Ok(()) = rx_collisions.changed() => {
                     let count = *rx_collisions.borrow_and_update();
+                    let pose  = *rx_pose_agg.borrow();
                     if let Ok(msg) = serde_json::to_string(&serde_json::json!({
                         "topic": "robot/collision",
                         "data":  count,
+                        "x": pose.x_m,
+                        "y": pose.y_m,
                     })) {
                         let _ = fanout_agg.send(Arc::new(msg));
                     }

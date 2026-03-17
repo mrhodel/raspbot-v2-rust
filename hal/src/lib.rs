@@ -10,6 +10,7 @@
 pub mod camera;
 pub mod gimbal;
 pub mod imu;
+pub mod mjpeg;
 pub mod motor;
 pub mod ultrasonic;
 

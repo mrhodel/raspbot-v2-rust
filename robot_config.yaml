@@ -218,7 +218,7 @@ agent:
 # ── Simulation ────────────────────────────────────────────────────
 sim:
   seed: 42                     # default maze seed (overridden by --seed CLI flag)
-  obstacles: 18                # number of random rectangular obstacles (0 = empty room)
+  obstacles: 0                 # number of random rectangular obstacles (0 = empty room)
   obstacle_slow_m: 0.70        # MiDaS nearest-obstacle distance that begins speed scaling
   obstacle_stop_m: 0.05        # MiDaS nearest-obstacle distance → hard stop (above floor noise)
   # After PseudoLidar floor-contamination fix, clear-corridor readings are ~0.90 m+.

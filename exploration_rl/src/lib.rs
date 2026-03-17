@@ -43,25 +43,30 @@ pub fn classical_select(
         return None;
     }
 
-    // Prefer the largest frontier with at least MIN_SIZE_CELLS cells.
-    const MIN_SIZE_CELLS: u32 = 4;
-    let large: Vec<&Frontier> = frontiers
-        .iter()
-        .filter(|f| f.size_cells >= MIN_SIZE_CELLS)
-        .collect();
+    // Filter tiny slivers; fall back to all frontiers if none qualify.
+    const MIN_SIZE_CELLS: u32 = 10;
+    let large: Vec<&Frontier> = frontiers.iter().filter(|f| f.size_cells >= MIN_SIZE_CELLS).collect();
+    let pool: Vec<&Frontier>  = if large.is_empty() { frontiers.iter().collect() } else { large };
 
-    if large.is_empty() {
-        return Some(FrontierChoice::Nearest);
-    }
-
-    // Among large frontiers, choose the nearest to avoid long detours early.
-    let nearest = large.iter().min_by(|a, b| {
-        let da = dist_sq(robot_pose, a);
-        let db = dist_sq(robot_pose, b);
-        da.partial_cmp(&db).unwrap()
+    // Score each frontier by size / (1 + dist) — linear distance penalty so
+    // far large frontiers (e.g. perimeter walls) beat nearby small slivers.
+    let best = pool.iter().copied().max_by(|a, b| {
+        let sa = a.size_cells as f32 / (1.0 + dist_sq(robot_pose, a).sqrt());
+        let sb = b.size_cells as f32 / (1.0 + dist_sq(robot_pose, b).sqrt());
+        sa.partial_cmp(&sb).unwrap()
     });
 
-    nearest.map(|_| FrontierChoice::Nearest)
+    best.map(|b| {
+        // If the best-scoring frontier is also the nearest, use Nearest so
+        // select_frontier_goal can apply its heading-alignment discount.
+        let nearest = pool.iter().copied()
+            .min_by(|a, c| dist_sq(robot_pose, a).partial_cmp(&dist_sq(robot_pose, c)).unwrap());
+        match nearest {
+            Some(n) if (n.centroid_x_m - b.centroid_x_m).abs() < 0.01
+                    && (n.centroid_y_m - b.centroid_y_m).abs() < 0.01 => FrontierChoice::Nearest,
+            _ => FrontierChoice::Largest,
+        }
+    })
 }
 
 fn dist_sq(pose: &Pose2D, f: &Frontier) -> f32 {

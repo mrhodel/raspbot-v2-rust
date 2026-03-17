@@ -700,29 +700,24 @@ async fn main() -> anyhow::Result<()> {
             warn!("Gimbal home failed: {e}");
         }
         let gimbal_t0 = std::time::Instant::now();
+        let mut last_bias = 0.0f32;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let depth = match rx_depth_g.recv().await {
-                Ok(d)  => d,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed)    => break,
-            };
-            // Compute open_bias from MiDaS pixels: higher pixel value = closer.
-            // open_bias > 0 means right is more open.  See gimbal_pan_target docs.
-            let w = depth.width as usize;
-            let h = depth.mask_start_row.min(depth.height) as usize;
-            let open_bias = if w >= 2 && h > 0 {
-                let mid = w / 2;
-                let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
-                for row in 0..h {
-                    for col in 0..mid { left_sum  += depth.data[row * w + col]; }
-                    for col in mid..w { right_sum += depth.data[row * w + col]; }
+            interval.tick().await;
+            let mut closed = false;
+            loop {
+                match rx_depth_g.try_recv() {
+                    Ok(d) => { last_bias = depth_open_bias(&d); }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)      => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))  => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed)     => { closed = true; break; }
                 }
-                (left_sum - right_sum) / (h * mid) as f32  // positive = right more open
-            } else { 0.0 };
-
+            }
+            if closed { break; }
             let t_s = gimbal_t0.elapsed().as_secs_f32();
             let (cur_pan, _) = gimbal.angles();
-            let new_pan = gimbal_pan_target(open_bias, t_s, cur_pan);
+            let new_pan = gimbal_pan_target(last_bias, t_s, cur_pan);
             if let Err(e) = gimbal.set_pan(new_pan).await {
                 warn!("Gimbal pan error: {e}");
             }
@@ -1188,7 +1183,8 @@ fn select_frontier_goal(
     // Heading-weighted score for Nearest selection.
     // A frontier in the robot's current heading direction gets up to 50% discount,
     // so the robot keeps moving forward rather than turning to a slightly-closer
-    // frontier off to the side.
+    // frontier off to the side.  Dividing by sqrt(size_cells) makes larger frontiers
+    // look effectively closer, biasing exploration away from small wall slivers.
     let heading_score = |f: &core_types::Frontier| -> f32 {
         const HEADING_WEIGHT: f32 = 0.5;
         let dx = f.centroid_x_m - pose.x_m;
@@ -1196,7 +1192,8 @@ fn select_frontier_goal(
         let d = (dx * dx + dy * dy).sqrt().max(0.001);
         let angle_to = dy.atan2(dx);
         let alignment = (angle_to - pose.theta_rad).cos().max(0.0);
-        d * (1.0 - HEADING_WEIGHT * alignment)
+        let size_weight = (f.size_cells as f32).sqrt().max(1.0);
+        d * (1.0 - HEADING_WEIGHT * alignment) / size_weight
     };
 
     let blacklisted = |f: &core_types::Frontier| -> bool {
@@ -1550,6 +1547,14 @@ async fn run_sim_mode(
         }
     });
 
+    // ── Sim MJPEG server ──────────────────────────────────────────────────────
+    if cfg.hal.camera.stream_enabled {
+        let port      = cfg.hal.camera.stream_port;
+        let frame_tx  = bus.camera_frame_raw.clone();
+        tokio::spawn(hal::mjpeg::run_server(port, frame_tx));
+        info!("Sim MJPEG stream → http://0.0.0.0:{port}/");
+    }
+
     // ── IMU task ──────────────────────────────────────────────────────────────
     let bus_imu = Arc::clone(&bus);
     let mut imu = imu;
@@ -1690,26 +1695,24 @@ async fn run_sim_mode(
             warn!("Sim gimbal home failed: {e}");
         }
         let gimbal_t0 = std::time::Instant::now();
+        let mut last_bias = 0.0f32;
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            let depth = match rx_depth_g.recv().await {
-                Ok(d)  => d,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed)    => break,
-            };
-            let w = depth.width as usize;
-            let h = depth.mask_start_row.min(depth.height) as usize;
-            let open_bias = if w >= 2 && h > 0 {
-                let mid = w / 2;
-                let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
-                for row in 0..h {
-                    for col in 0..mid { left_sum  += depth.data[row * w + col]; }
-                    for col in mid..w { right_sum += depth.data[row * w + col]; }
+            interval.tick().await;
+            let mut closed = false;
+            loop {
+                match rx_depth_g.try_recv() {
+                    Ok(d) => { last_bias = depth_open_bias(&d); }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)      => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))  => continue,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed)     => { closed = true; break; }
                 }
-                (left_sum - right_sum) / (h * mid) as f32
-            } else { 0.0 };
+            }
+            if closed { break; }
             let t_s = gimbal_t0.elapsed().as_secs_f32();
             let (cur_pan, _) = gimbal.angles();
-            let new_pan = gimbal_pan_target(open_bias, t_s, cur_pan);
+            let new_pan = gimbal_pan_target(last_bias, t_s, cur_pan);
             if let Err(e) = gimbal.set_pan(new_pan).await {
                 warn!("Sim gimbal pan error: {e}");
             }
@@ -1803,7 +1806,7 @@ async fn run_sim_mode(
     let force_respawn_tx_plan = force_respawn_tx.clone();
     tokio::spawn(async move {
         use tokio::time::Instant;
-        const GOAL_BLACKLIST_SECS: u64 = 10;
+        const GOAL_BLACKLIST_SECS: u64 = 30;
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
         // After this many fruitless escape cycles (robot isolated from all frontiers),
         // force an episode reset rather than cycling indefinitely until MAX_STEPS.
@@ -1844,14 +1847,20 @@ async fn run_sim_mode(
 
             let now = Instant::now();
             goal_blacklist.retain(|(_, exp)| *exp > now);
-            let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
 
-            let pose = *rx_pose_p.borrow_and_update();
-            let maybe_goal = {
-                let m = mapper_plan.read().await;
-                select_frontier_goal(&m, &choice, &pose, &bl)
-            };
-            if let Some(goal) = maybe_goal {
+            // Inner retry loop: on A* failure, immediately try the next-best
+            // frontier (updated blacklist, same FrontierChoice) rather than
+            // waiting ~1 s for the next plan_rx.recv() cycle.
+            const MAX_INLINE_RETRIES: usize = 5;
+            'planning: for _retry in 0..=MAX_INLINE_RETRIES {
+                let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
+                let pose = *rx_pose_p.borrow_and_update();
+                let maybe_goal = {
+                    let m = mapper_plan.read().await;
+                    select_frontier_goal(&m, &choice, &pose, &bl)
+                };
+                let Some(goal) = maybe_goal else { break 'planning; };
+
                 const REPLAN_HOLD_S: u64 = 3;
                 let goal_matches_last = last_goal.map_or(false, |lg| {
                     let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
@@ -1866,15 +1875,15 @@ async fn run_sim_mode(
                         age >= REPLAN_HOLD_S && age < REPLAN_HOLD_S * 6
                     });
                 if goal_matches_last && path_sent_recently {
-                    continue;
+                    break 'planning;
                 }
-                const PATH_COMMIT_S: u64 = 10;
+                const PATH_COMMIT_S: u64 = 5;
                 let path_committed = !goal_matches_last
                     && last_path_sent_at.map_or(false, |t| {
                         now.duration_since(t) < std::time::Duration::from_secs(PATH_COMMIT_S)
                     });
                 if path_committed {
-                    continue;
+                    break 'planning;
                 }
                 if path_sent_and_expired {
                     warn!(x = goal[0], y = goal[1], "Sim planning: frontier persists after visit — blacklisting");
@@ -1882,7 +1891,7 @@ async fn run_sim_mode(
                     goal_blacklist.push((goal, exp));
                     last_goal = None;
                     last_path_sent_at = None;
-                    continue;
+                    continue 'planning;
                 }
                 last_goal = Some(goal);
 
@@ -1896,9 +1905,11 @@ async fn run_sim_mode(
                         info!(waypoints = path.waypoints.len(), "Sim planning: path found");
                         last_path_sent_at = Some(now);
                         let _ = bus_plan.planner_path.send(path).await;
+                        consecutive_failures = 0;
+                        break 'planning;
                     }
                     None => {
-                        warn!(?choice, "Sim planning: no path to frontier");
+                        warn!(_retry, ?choice, "Sim planning: no path to frontier");
                         let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
                         goal_blacklist.push((goal, exp));
                         last_goal = None;
@@ -1937,7 +1948,10 @@ async fn run_sim_mode(
                             while plan_rx.try_recv().is_ok() {}
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                             while plan_rx.try_recv().is_ok() {}
+                            break 'planning;
                         }
+                        // A* failed but not at escape threshold — continue
+                        // 'planning to try the next frontier immediately.
                     }
                 }
             }
@@ -2161,6 +2175,23 @@ fn nearest_in_fov(scan: &core_types::PseudoLidarScan) -> (f32, f32) {
         .min_by(|a, b| a.range_m.partial_cmp(&b.range_m).unwrap())
         .map(|r| (r.range_m, r.angle_rad))
         .unwrap_or((f32::MAX, 0.0))
+}
+
+/// Compute the open-space bias from a MiDaS depth map.
+///
+/// Returns a value where **positive means the right side is more open**.
+/// Higher pixel values in the depth map indicate closer objects.
+fn depth_open_bias(depth: &core_types::DepthMap) -> f32 {
+    let w = depth.width as usize;
+    let h = depth.mask_start_row.min(depth.height) as usize;
+    if w < 2 || h == 0 { return 0.0; }
+    let mid = w / 2;
+    let (mut left_sum, mut right_sum) = (0.0f32, 0.0f32);
+    for row in 0..h {
+        for col in 0..mid { left_sum  += depth.data[row * w + col]; }
+        for col in mid..w { right_sum += depth.data[row * w + col]; }
+    }
+    (left_sum - right_sum) / (h * mid) as f32
 }
 
 /// Compute the target gimbal pan angle (degrees) for one control frame.
