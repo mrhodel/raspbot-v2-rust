@@ -874,10 +874,10 @@ fn spawn_mapping_task(
 ///
 /// - `obstacle_slow_m`: depth at which forward speed begins to ramp down.
 ///   Real=1.20 m (large slow zone compensates for 4-5 frame camera lag);
-///   Sim=0.80 m (tighter — sim depth is noiseless).
+///   Sim=0.70 m (tighter — sim depth is less noisy after floor-contamination fix).
 /// - `obstacle_stop_m`: depth at which forward motion stops and the path is
 ///   abandoned.  Real=0.60 m (raised from 0.40 to account for camera lag and
-///   MiDaS noise); Sim=0.25 m (matches A* minimum clearance).
+///   MiDaS noise); Sim=0.15 m (above clear-corridor floor since floor-contamination fix).
 /// - `episode_rx`: watch channel that fires on episode reset (sim only).
 ///   For real mode pass a watch receiver whose sender is immediately dropped —
 ///   `Ok(()) = changed()` in the select! arm never matches on a closed watch,
@@ -1100,15 +1100,19 @@ fn spawn_control_task(
                         let obs_side = if obs_deg > 5.0 { "left" } else if obs_deg < -5.0 { "right" } else { "center" };
                         // `toward` is already computed above from unscaled omega.
                         if combined_scale <= 0.0 {
-                            // Hard stop: US at ≤emergency_stop_cm, OR MiDaS obstacle in forward
-                            // arc / turning toward.
-                            // has_forward is intentionally excluded: a side obstacle (>30°) while
-                            // going straight does NOT halt — the robot slows via angle_factor and
-                            // the planner routes around it.  Excluding has_forward prevents MiDaS
-                            // noise at 45° from stopping a forward-moving robot every tick.
+                            // Hard stop: fire obstacle_stopped when ANY of these are true:
+                            //   - US at ≤ emergency_stop_cm
+                            //   - MiDaS obstacle in forward arc (≤ 30°)
+                            //   - navigation turning toward detected obstacle
+                            //   - MiDaS-measured distance ≤ obstacle_stop_m (any angle)
+                            // The last case prevents a crash pattern where nearest drops into
+                            // the stop zone at ~35–45° and `in_forward_arc` is just false:
+                            // the robot sends omega-only, rotates toward the wall, and collides
+                            // before the obstacle crosses the 30° arc threshold.
                             let us_stopped     = us_scale <= 0.0;
                             let in_forward_arc = nearest_angle.abs() <= 30f32.to_radians();
-                            if us_stopped || in_forward_arc || toward {
+                            let midas_stopped  = base_scale <= 0.0; // nearest ≤ obstacle_stop_m
+                            if us_stopped || in_forward_arc || toward || midas_stopped {
                                 if !obstacle_stopped {
                                     warn!(
                                         nearest_m   = nearest,
