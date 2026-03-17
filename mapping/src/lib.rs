@@ -127,6 +127,12 @@ impl Mapper {
             if ray.confidence < MIN_CONFIDENCE {
                 continue;
             }
+            // Skip degenerate near-zero range rays.  A range_m ≈ 0 means the
+            // Bresenham trace ends at the robot's own cell, marking it occupied
+            // every frame and masking real obstacles behind it.
+            if ray.range_m < 0.05 {
+                continue;
+            }
             let world_angle = pose.theta_rad + ray.angle_rad;
             let end_x = pose.x_m + ray.range_m * world_angle.cos();
             let end_y = pose.y_m + ray.range_m * world_angle.sin();

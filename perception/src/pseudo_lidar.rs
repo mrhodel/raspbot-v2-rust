@@ -36,6 +36,12 @@ const HFOV_RAD: f32 = 110.0_f32 * std::f32::consts::PI / 180.0;
 /// a box or wall fills a strip with depth ≈0.15–0.25 above the mean.
 const OBSTACLE_CONTRAST: f32 = 0.10;
 
+/// Any computed range below this value is treated as free space rather than
+/// a close obstacle.  Values near 0 m arise from floor-pixel artifacts (floor
+/// tiles at ~0.43 m anchor MiDaS inverse-depth to 1.0 → formula gives 0 m).
+/// Real obstacles at < 0.10 m are handled by the ultrasonic safety interlock.
+const MIN_OBS_RANGE_M: f32 = 0.10;
+
 pub struct PseudoLidarExtractor {
     num_rays: usize,
     max_range_m: f32,
@@ -51,8 +57,11 @@ impl PseudoLidarExtractor {
         let h = depth.height as usize;
         let mask_row = depth.mask_start_row as usize;
         let usable_rows = mask_row.min(h);
-        // Use the upper 60% of usable rows to avoid the floor.
-        let upper_rows = (usable_rows * 3 / 5).max(1).min(usable_rows);
+        // Use the top half of usable rows (strictly above the horizon) to
+        // exclude floor pixels.  MiDaS normalises inverse-depth per frame;
+        // floor tiles at ~0.43 m would otherwise pin max_depth ≈ 1.0 and
+        // compress all wall pixel depths toward zero.
+        let upper_rows = (usable_rows / 2).max(1);
 
         // ── Scene mean depth (first pass) ────────────────────────────────────
         // Computed over the same upper region used for ray sampling so that
@@ -106,8 +115,12 @@ impl PseudoLidarExtractor {
 
                 // Only report an obstacle when this strip's peak depth is
                 // notably above the scene average.  Otherwise report free space.
+                // Also treat any implausibly-close reading (< MIN_OBS_RANGE_M)
+                // as free space — such values are floor/artifact pixels, not
+                // real obstacles (ultrasonic handles the true near field).
                 let range_m = if max_depth >= obstacle_threshold {
-                    (self.max_range_m * (1.0 - max_depth)).max(0.0)
+                    let r = self.max_range_m * (1.0 - max_depth);
+                    if r < MIN_OBS_RANGE_M { self.max_range_m } else { r }
                 } else {
                     self.max_range_m
                 };
