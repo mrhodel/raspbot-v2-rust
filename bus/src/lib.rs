@@ -22,6 +22,18 @@ use core_types::{
     PseudoLidarScan, SafetyState, TrackSet, UltrasonicReading, VisualDelta,
 };
 
+/// Commands sent from the UI bridge to the executive task.
+///
+/// Delivered via `Bus::bridge_cmd` (watch channel).  The executive polls it
+/// and drives state transitions; backend silently ignores invalid transitions.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum BridgeCommand {
+    #[default]
+    None,
+    Arm,
+    Stop,
+}
+
 // Convenience alias – all Arc-wrapped to keep broadcast clone cheap.
 pub type ArcFrame    = Arc<CameraFrame>;
 pub type ArcGray     = Arc<GrayFrame>;
@@ -85,6 +97,10 @@ pub struct Bus {
     pub health_runtime:       broadcast::Sender<HealthMetrics>,
     pub ui_bridge_status:     broadcast::Sender<BridgeStatus>,
 
+    // ── UI bridge commands (watch) ────────────────────────────────────────
+    /// ARM / STOP commands sent from the HTML control panel via WebSocket.
+    pub bridge_cmd:           watch::Sender<BridgeCommand>,
+
     // ── Decision / planning / control (mpsc senders stored here) ─────────
     pub decision_frontier:    mpsc::Sender<FrontierChoice>,
     pub planner_path:         mpsc::Sender<core_types::Path>,
@@ -133,6 +149,8 @@ impl Bus {
         let (tx_bridge_st,  _) = broadcast::channel(cap);
         let (tx_sim_truth,  _) = broadcast::channel(4);
 
+        let (tx_bridge_cmd, _) = watch::channel(BridgeCommand::None);
+
         let (tx_orientation,   rx_orientation)  = watch::channel(Orientation::default());
         let (tx_pose2d,        rx_pose2d)       = watch::channel(Pose2D::default());
         let (tx_safety,        rx_safety)       = watch::channel(SafetyState::default());
@@ -177,6 +195,7 @@ impl Bus {
             sim_ground_truth:    tx_sim_truth,
             health_runtime:      tx_health,
             ui_bridge_status:    tx_bridge_st,
+            bridge_cmd:          tx_bridge_cmd,
             decision_frontier:   tx_decision,
             planner_path:        tx_path,
             controller_cmd_vel:  tx_cmdvel,

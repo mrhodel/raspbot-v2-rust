@@ -219,8 +219,12 @@ agent:
 sim:
   seed: 42                     # default maze seed (overridden by --seed CLI flag)
   obstacles: 18                # number of random rectangular obstacles (0 = empty room)
-  obstacle_slow_m: 0.80        # MiDaS nearest-obstacle distance that begins speed scaling
-  obstacle_stop_m: 0.25        # MiDaS nearest-obstacle distance → full stop
+  obstacle_slow_m: 0.20        # MiDaS nearest-obstacle distance that begins speed scaling
+  obstacle_stop_m: 0.05        # MiDaS nearest-obstacle distance → full stop
+  # Note: real MiDaS reads 0.10–0.50 m on CLEAR paths (normalized inverse-depth
+  # bias from floor tiles acting as the per-frame depth anchor).  Thresholds must
+  # sit below this noise floor to avoid constant false stops.  0.20/0.05 gives
+  # light speed reduction only when MiDaS says something is within 20 cm.
   # Sensor noise parameters — calibrate against logs/robot.ndjson deceleration curves
   imu_noise_gyro_rad_s: 0.01   # Gaussian sigma on simulated gyro axes (rad/s)
   imu_noise_accel_m_s2: 0.05   # Gaussian sigma on simulated lateral accel axes (m/s²)

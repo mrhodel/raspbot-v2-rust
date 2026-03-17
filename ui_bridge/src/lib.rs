@@ -31,11 +31,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use bus::BridgeCommand;
 use core_types::BridgeStatus;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
@@ -96,6 +97,10 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     <div><span class="label">CRASHES  </span><span id="crashes" class="val">0</span></div>
     <div><span class="label">NEAR MISS </span><span id="estops" class="val">0</span></div>
     <div><span class="label">WS     </span><span id="ws_st" class="warn">connecting</span></div>
+    <div style="margin-top:12px">
+      <button onclick="ws&&ws.send('arm')" style="background:#1a1;color:#fff;padding:6px 14px;border:none;cursor:pointer;font-family:monospace;width:100%;margin-bottom:4px">ARM</button>
+      <button onclick="ws&&ws.send('stop')" style="background:#a11;color:#fff;padding:6px 14px;border:none;cursor:pointer;font-family:monospace;width:100%">STOP</button>
+    </div>
     <div id="legend">
       <h3 style="margin-top:8px">LEGEND</h3>
       <div><span class="ls" style="background:#1a4a1e"></span>free</div>
@@ -326,8 +331,9 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     }
 
     // ── WebSocket ──────────────────────────────────────────────────────────
+    var ws;
     function connect() {
-      const ws = new WebSocket('ws://' + host + ':9000/');
+      ws = new WebSocket('ws://' + host + ':9000/');
       const wsSt = document.getElementById('ws_st');
       wsSt.className = 'warn'; wsSt.textContent = 'connecting';
       ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; };
@@ -458,7 +464,8 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
   <div id="container">
-    <img id="stream" src="" alt="MJPEG stream loading...">
+    <img id="stream" src="" alt="Camera stream">
+    <div id="cam-placeholder" style="display:none;width:640px;height:480px;background:#222;border:1px solid #333;display:none;align-items:center;justify-content:center;color:#555;font-size:14px">No camera stream (simulation mode)</div>
     <div id="overlay">
       <h3>ROBOT TELEMETRY</h3>
       <div><span class="label">MODE </span><span id="mode" class="val">--</span></div>
@@ -477,13 +484,19 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       <div><span class="label">WS   </span><span id="ws_st" class="warn">connecting</span></div>
     </div>
   </div>
+  <div style="margin:8px;display:flex;gap:8px">
+    <button onclick="ws&&ws.send('arm')" style="background:#1a1;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">ARM</button>
+    <button onclick="ws&&ws.send('stop')" style="background:#a11;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">STOP</button>
+  </div>
   <script>
     const host = window.location.hostname;
 
     function startStream() {
       const img = document.getElementById('stream');
+      const ph  = document.getElementById('cam-placeholder');
+      img.onload  = () => { img.style.display = 'block'; ph.style.display = 'none'; };
+      img.onerror = () => { img.style.display = 'none';  ph.style.display = 'flex'; };
       img.src = 'http://' + host + ':8080/';
-      img.onerror = () => { img.src = ''; setTimeout(startStream, 2000); };
     }
     startStream();
 
@@ -507,7 +520,7 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function connect() {
-      const ws = new WebSocket('ws://' + host + ':9000/');
+      var ws = window.ws = new WebSocket('ws://' + host + ':9000/');
       const wsSt = document.getElementById('ws_st');
       wsSt.className = 'warn'; wsSt.textContent = 'connecting';
 
@@ -845,7 +858,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                         if let Some(gt) = gt_cache_listener.lock().ok().and_then(|g| g.clone()) {
                             initial.push(gt);
                         }
-                        tokio::spawn(handle_client(stream, rx, initial));
+                        tokio::spawn(handle_client(stream, rx, initial, bus_listener.bridge_cmd.clone()));
 
                         let status = BridgeStatus {
                             t_ms: 0,
@@ -885,11 +898,13 @@ async fn serve_page(mut stream: TcpStream, html: &'static str) {
     let _ = stream.shutdown().await;
 }
 
-/// Per-client task: receive fan-out messages and forward to WebSocket.
+/// Per-client task: receive fan-out messages and forward to WebSocket;
+/// also read inbound WebSocket messages and forward ARM/STOP commands.
 async fn handle_client(
     stream: TcpStream,
     mut rx: broadcast::Receiver<Arc<String>>,
     initial: Vec<Arc<String>>,
+    cmd_tx: watch::Sender<BridgeCommand>,
 ) {
     let ws = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
@@ -898,7 +913,21 @@ async fn handle_client(
             return;
         }
     };
-    let (mut sink, _source) = futures_util::StreamExt::split(ws);
+    let (mut sink, mut source) = futures_util::StreamExt::split(ws);
+
+    // Spawn reader task: handle ARM/STOP commands from browser.
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = source.next().await {
+            if let Message::Text(txt) = msg {
+                let cmd = match txt.trim() {
+                    "arm"  => BridgeCommand::Arm,
+                    "stop" => BridgeCommand::Stop,
+                    _      => continue,
+                };
+                let _ = cmd_tx.send(cmd);
+            }
+        }
+    });
 
     // Replay initial state: start time, counts, ground truth.
     for msg in initial {
