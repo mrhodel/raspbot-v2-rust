@@ -114,7 +114,9 @@ impl Camera for SimCamera {
         let mut cols = Vec::with_capacity(w);
         for x in 0..w {
             let frac        = x as f32 / (w.saturating_sub(1).max(1)) as f32;
-            let local_angle = pan_rad + (-HFOV_RAD * 0.5 + frac * HFOV_RAD);
+            // Standard camera orientation: x=0 = leftmost = looks LEFT (+angle).
+            // (Reversed from Wolfenstein convention so MiDaS sees unmirrored images.)
+            let local_angle = pan_rad + (HFOV_RAD * 0.5 - frac * HFOV_RAD);
             let world_angle = robot_theta + local_angle;
             let ray_cos     = world_angle.cos();
             let ray_sin     = world_angle.sin();

@@ -1956,7 +1956,6 @@ async fn run_sim_mode(
     spawn_sim_tick_task(
         sim_state,
         Arc::clone(&bus),
-        Arc::clone(&mapper),
         episode_reset_tx,
         arm_tx.clone(),
         timeout_tx.clone(),
@@ -1999,7 +1998,6 @@ async fn run_sim_mode(
 fn spawn_sim_tick_task(
     sim_state:            SimState,
     bus:                  Arc<bus::Bus>,
-    mapper:               Arc<tokio::sync::RwLock<Mapper>>,
     episode_reset_tx:     tokio::sync::watch::Sender<u32>,
     arm_tx:               tokio::sync::mpsc::Sender<()>,
     timeout_tx:           tokio::sync::mpsc::Sender<()>,
@@ -2098,7 +2096,6 @@ fn spawn_sim_tick_task(
                         let mut sim = sim_state.sim.lock().await;
                         sim.reset()
                     };
-                    *mapper.write().await = Mapper::new();
                     let _ = episode_reset_tx.send(episode);
                     let _ = sim_state.step_tx.send(Arc::new(reset_step.clone()));
                     let _ = bus.slam_pose2d.send(reset_step.pose);
@@ -2124,7 +2121,6 @@ fn spawn_sim_tick_task(
                     let mut sim = sim_state.sim.lock().await;
                     sim.reset()
                 };
-                *mapper.write().await = Mapper::new();
                 let _ = episode_reset_tx.send(episode);
                 let _ = sim_state.step_tx.send(Arc::new(reset_step.clone()));
                 let _ = bus.slam_pose2d.send(reset_step.pose);

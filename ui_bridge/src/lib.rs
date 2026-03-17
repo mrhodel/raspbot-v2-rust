@@ -414,21 +414,21 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
             case 'sim/ground_truth': {
               truW = msg.width; truH = msg.height; truRes = msg.res;
               truWalls = new Uint8Array(msg.walls);
-              // Reset occupancy map so the new maze starts fresh.
-              // Don't touch canvas sizing here — applyDelta owns that.
-              // Resetting minCX=null forces applyDelta to rebuild from
-              // ground-truth bounds on next delta, preventing a size mismatch
-              // that would black out the map on reload.
-              grid.clear();
-              minCX = null; maxCX = null; minCY = null; maxCY = null;
-              // Trigger an immediate redraw using ground-truth bounds so
-              // the walls are visible before any occupancy data arrives.
-              minCX = 0; maxCX = truW - 1; minCY = 0; maxCY = truH - 1;
-              const w = (truW + 1) * PX, h = (truH + 1) * PX;
-              bgC.width = fgC.width = w;
-              bgC.height = fgC.height = h;
-              bgX.clearRect(0, 0, w, h);
+              // Size canvas to full arena on first episode only — keep occupancy
+              // cells across episodes so the map accumulates coverage over time.
+              if (minCX === null) {
+                minCX = 0; maxCX = truW - 1; minCY = 0; maxCY = truH - 1;
+                const w = (truW + 1) * PX, h = (truH + 1) * PX;
+                bgC.width = fgC.width = w;
+                bgC.height = fgC.height = h;
+              }
+              // Repaint: new maze walls behind accumulated occupancy overlay.
+              bgX.clearRect(0, 0, bgC.width, bgC.height);
               drawTrueWalls();
+              for (const [key, lo] of grid) {
+                const c = key.split(',');
+                drawCell(+c[0], +c[1], lo);
+              }
               break;
             }
           }

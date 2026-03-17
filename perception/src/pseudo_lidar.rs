@@ -85,8 +85,9 @@ impl PseudoLidarExtractor {
         let rays: Vec<LidarRay> = (0..self.num_rays)
             .map(|i| {
                 // Map ray index to horizontal angle (0 = forward, +left / -right).
+                // Standard camera: col 0 = leftmost = left-looking = +HFOV/2.
                 let frac = i as f32 / (self.num_rays - 1).max(1) as f32;
-                let angle_rad = HFOV_RAD * (frac - 0.5);
+                let angle_rad = HFOV_RAD * (0.5 - frac);
 
                 // Column range for this ray.
                 let col_start = ((frac * w as f32) as usize).min(w.saturating_sub(1));
