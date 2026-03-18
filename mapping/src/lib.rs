@@ -27,8 +27,8 @@ use tracing::debug;
 /// Grid cell side length (metres).
 pub const RESOLUTION_M: f32 = 0.05;
 
-const LOG_ODDS_HIT:  f32 =  0.7;
-const LOG_ODDS_MISS: f32 = -0.35;
+const LOG_ODDS_HIT:  f32 =  1.4;
+const LOG_ODDS_MISS: f32 = -0.70;
 const LOG_ODDS_MIN:  f32 = -3.0;
 const LOG_ODDS_MAX:  f32 =  3.0;
 
@@ -38,7 +38,7 @@ pub const FREE_THRESH: f32 = -0.5;
 pub const OCC_THRESH:  f32 =  0.5;
 
 /// Minimum ray confidence required to update the grid.
-const MIN_CONFIDENCE: f32 = 0.1;
+const MIN_CONFIDENCE: f32 = 0.02;
 
 /// Rays at or beyond this range are "no obstacle detected" sentinels emitted
 /// by the pseudo-lidar when depth contrast is below threshold.  Walking their
