@@ -62,6 +62,15 @@ const SPEED_M_S: f32 = 1.61;
 /// Calibrated 2026-03-18: measured 4.103 rad/s @ 30% → 13.7 rad/s @ 100% (wheels on floor)
 const OMEGA_RAD_S: f32 = 13.7;
 
+// ── Motor model ──────────────────────────────────────────────────────────────
+
+/// Motor acceleration time constant (seconds): how fast motors ramp up.
+/// Measured: real motors reach ~95% speed in ~0.5s, so tau ≈ 0.2s
+const MOTOR_TAU_S: f32 = 0.2;
+
+/// Discrete acceleration filter gain: alpha = dt / (tau + dt)
+const ACCEL_ALPHA: f32 = DT_S / (MOTOR_TAU_S + DT_S);
+
 /// Episode ends after this many steps (in addition to collision).
 /// At 10 Hz this is 200 seconds (~3.3 minutes) per episode.
 const MAX_STEPS: u32 = 2_000;
@@ -158,6 +167,10 @@ pub struct FastSim {
     last_omega: f32,
     /// Room configuration used when (re)generating the maze.
     room_kind: RoomKind,
+    /// Current velocity state (m/s) for acceleration model.
+    current_vx: f32,
+    current_vy: f32,
+    current_omega: f32,
 }
 
 impl FastSim {
@@ -176,6 +189,9 @@ impl FastSim {
             rng: Rng::new(seed),
             last_omega: 0.0,
             room_kind,
+            current_vx: 0.0,
+            current_vy: 0.0,
+            current_omega: 0.0,
         };
         sim.generate_maze();
         sim
@@ -186,6 +202,9 @@ impl FastSim {
         self.step_count = 0;
         self.t_ms = 0;
         self.last_omega = 0.0;
+        self.current_vx = 0.0;
+        self.current_vy = 0.0;
+        self.current_omega = 0.0;
         self.generate_maze();
         self.make_step(false)
     }
@@ -196,6 +215,9 @@ impl FastSim {
     pub fn respawn(&mut self) -> SimStep {
         self.step_count = 0;
         self.last_omega = 0.0;
+        self.current_vx = 0.0;
+        self.current_vy = 0.0;
+        self.current_omega = 0.0;
         let start_x = ARENA_M * 0.5;
         let start_y = ARENA_M * 0.5;
         let (rx, ry) = self.nearest_free(start_x, start_y);
@@ -210,14 +232,20 @@ impl FastSim {
     /// Use `step()` for pan=0 (backward-compatible).
     pub fn step_with_pan(&mut self, action: u8, pan_deg: f32) -> SimStep {
         let act = Action::from_u8(action);
-        let (vx, vy, omega) = action_to_velocity(act);
+        let (target_vx, target_vy, target_omega) = action_to_velocity(act);
 
-        // Compute proposed new pose.
+        // Apply first-order acceleration filter: smooth velocity transitions
+        // current_v = (1 - alpha) * current_v + alpha * target_v
+        self.current_vx = (1.0 - ACCEL_ALPHA) * self.current_vx + ACCEL_ALPHA * target_vx;
+        self.current_vy = (1.0 - ACCEL_ALPHA) * self.current_vy + ACCEL_ALPHA * target_vy;
+        self.current_omega = (1.0 - ACCEL_ALPHA) * self.current_omega + ACCEL_ALPHA * target_omega;
+
+        // Compute proposed new pose using current (accelerated) velocity.
         let cos_t = self.robot_theta.cos();
         let sin_t = self.robot_theta.sin();
-        let try_x = self.robot_x + (vx * cos_t - vy * sin_t) * DT_S;
-        let try_y = self.robot_y + (vx * sin_t + vy * cos_t) * DT_S;
-        let new_theta = wrap_angle(self.robot_theta + omega * DT_S);
+        let try_x = self.robot_x + (self.current_vx * cos_t - self.current_vy * sin_t) * DT_S;
+        let try_y = self.robot_y + (self.current_vx * sin_t + self.current_vy * cos_t) * DT_S;
+        let new_theta = wrap_angle(self.robot_theta + self.current_omega * DT_S);
 
         // Collision check on proposed position.
         let collision = !self.robot_clear(try_x, try_y);
@@ -226,7 +254,7 @@ impl FastSim {
             self.robot_y = try_y;
         }
         self.robot_theta = new_theta;
-        self.last_omega = omega;
+        self.last_omega = self.current_omega;
         self.step_count += 1;
         self.t_ms += (DT_S * 1000.0) as u64;
 
