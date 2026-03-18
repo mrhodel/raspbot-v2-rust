@@ -55,12 +55,12 @@ const MAX_RANGE_M: f32 = 3.0;
 const RAY_STEP_M: f32 = 0.01;
 
 /// Robot forward speed (m/s equivalent).
-/// Calibrated 2026-03-18: measured 0.484 m/s @ 30% → 1.61 m/s @ 100%
+/// Calibrated 2026-03-18: measured 0.484 m/s @ 30% → 1.61 m/s @ 100% (wheels on floor)
 const SPEED_M_S: f32 = 1.61;
 
 /// Robot rotation rate (rad/s).
-/// Calibrated 2026-03-18: measured 4.29 rad/s @ 30% → 14.3 rad/s @ 100%
-const OMEGA_RAD_S: f32 = 14.3;
+/// Calibrated 2026-03-18: measured 4.103 rad/s @ 30% → 13.7 rad/s @ 100% (wheels on floor)
+const OMEGA_RAD_S: f32 = 13.7;
 
 /// Episode ends after this many steps (in addition to collision).
 /// At 10 Hz this is 200 seconds (~3.3 minutes) per episode.

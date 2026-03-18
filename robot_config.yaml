@@ -12,10 +12,10 @@ robot:
 
 # ── Kinematics (calibrated 2026-03-18) ────────────────────────────────
 kinematics:
-  # Measured values at 100% motor duty cycle (wheels off ground, no load)
-  # Phase 14.2.3 calibration test results
+  # Measured values at 100% motor duty cycle
+  # Phase 14.2.3 calibration test results (wheels ON ground)
   forward_speed_m_s: 1.61      # measured 0.484 m/s @ 30% → 1.61 m/s @ 100%
-  rotation_rate_rad_s: 14.3    # measured 4.29 rad/s @ 30% → 14.3 rad/s @ 100%
+  rotation_rate_rad_s: 13.7    # measured 4.103 rad/s @ 30% → 13.7 rad/s @ 100% (wheels on floor)
 
 # ── Hardware Abstraction Layer ────────────────────────────────────
 hal:

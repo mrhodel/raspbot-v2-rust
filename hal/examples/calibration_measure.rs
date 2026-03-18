@@ -3,6 +3,10 @@
 //! Usage:
 //!   calibration_measure forward 6        [run all 4 motors forward for 6 sec, measure distance via accel]
 //!   calibration_measure rotate 6         [run diagonal motors for rotation, measure via gyro]
+//!
+//! ⚠ IMPORTANT for rotate test: Keep WHEELS ON GROUND
+//!   Wheels-off measurement doesn't account for floor friction and load.
+//!   Rotation rate changes significantly when loaded vs unloaded.
 
 use std::time::{Duration, Instant};
 use std::io::Write;
@@ -80,6 +84,11 @@ fn main() -> Result<()> {
 
     println!("Calibration Measurement: {} for {} seconds", mode, duration_sec);
     println!("================================================");
+
+    if mode == "rotate" {
+        println!("⚠️  ROTATE TEST: Keep WHEELS ON GROUND");
+        println!("  (wheels-off measurement doesn't match floor operation)\n");
+    }
 
     let mut motor_i2c = I2c::with_bus(1).context("Open I2C-1 for motors")?;
     motor_i2c.set_slave_address(MOTOR_ADDR).context("Set motor I2C address")?;
