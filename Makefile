@@ -72,7 +72,7 @@ motor-test-run: motor-test-deploy
 ## Run motor_test in --sweep mode on Pi (stall speed characterization).
 ##   Pass SPEED=NN to override default 40%.  SURFACES=hardwood,carpet,tile to batch test.
 motor-test-sweep: motor-test-deploy
-	ssh -t $(PI) "cd $(PI_DIR) && ./motor_test --sweep --speed $(SPEED:-40) --surfaces $(SURFACES:-hardwood)"
+	ssh -t $(PI) "cd $(PI_DIR) && ./motor_test --sweep --speed $(or $(SPEED),40) --surfaces $(or $(SURFACES),hardwood)"
 
 ## Plot motor test CSVs from runs/ locally. Requires matplotlib + numpy.
 motor-test-plot:
