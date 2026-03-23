@@ -90,14 +90,15 @@ mapping:
     expand_amount: 100
     inflate_interval: 10       # run gaussian obstacle inflation every N steps (0=disabled)
     p_prior: 0.50
-    p_occ_hit:  0.75
-    p_occ_miss: 0.40
+    p_occ_hit:  0.75           # Keep original — walls need strong confirmation
+    p_occ_miss: 0.40           # Keep original — misses should be cautious
     p_occ_min:  0.05
     p_occ_max:  0.95
-    obstacle_threshold: 0.65   # cell probability → obstacle
+    obstacle_threshold: 0.65   # Keep original — balanced wall detection
     free_threshold: 0.35
     blur_sigma: 0.8            # Gaussian inflation around obstacles
-    decay_rate: 0.001          # per-step probability decay toward prior
+    decay_rate: 0.002          # 0.001=original (walls stable ~1000s), 0.01=too fast (walls fade in 23s)
+                               # 0.002: mapped walls stable ~460 steps (~46s); false obstacles fade ~460 steps
 
 # ── Navigation ────────────────────────────────────────────────────
 navigation:
@@ -226,17 +227,17 @@ agent:
 sim:
   seed: 42                     # default maze seed (overridden by --seed CLI flag)
   obstacles: 18                # number of random rectangular obstacles (0 = empty room)
-  obstacle_slow_m: 0.70        # MiDaS nearest-obstacle distance that begins speed scaling
-  obstacle_stop_m: 0.05        # MiDaS nearest-obstacle distance → hard stop (above floor noise)
-  # After PseudoLidar floor-contamination fix, clear-corridor readings are ~0.90 m+.
-  # 0.70/0.05: robot starts slowing at 70 cm; at crash-typical distances (10-50 cm)
-  # speed_scale drops to 5-40%, giving rotation time to swing obstacles out of forward arc.
-  # stop_m=0.05 (not 0.15) avoids livelock from floor noise that persists at ~0.10 m.
+  obstacle_slow_m: 0.70        # Nearest-obstacle distance (m) that begins forward speed scaling
+  obstacle_stop_m: 0.15        # Nearest-obstacle distance (m) → forward hard stop
+  # A* clearance=5 guarantees path cells are ≥5 grid cells (0.25 m) from walls,
+  # but with sub-cell robot positioning the actual nearest_m can be as low as ~0.20 m.
+  # obstacle_stop_m must be below that (~0.15 m) or A*-planned corridors immediately
+  # trigger a hard stop and livelock.  0.15 m = robot radius — genuine collision risk.
   # Sensor noise parameters — calibrate against logs/robot.ndjson deceleration curves
   imu_noise_gyro_rad_s: 0.01   # Gaussian sigma on simulated gyro axes (rad/s)
   imu_noise_accel_m_s2: 0.05   # Gaussian sigma on simulated lateral accel axes (m/s²)
   range_dropout: 0.08          # fraction of pseudo-lidar rays dropped per scan
-  range_noise_m: 0.07          # Gaussian sigma on pseudo-lidar range (metres)
+  range_noise_m: 0.02          # Gaussian sigma on pseudo-lidar range (metres)
 
 # ── IMU Bias Calibration ──────────────────────────────────────────
 # Run "robot calibrate" with robot flat and stationary to regenerate.

@@ -358,12 +358,14 @@ impl Default for SimConfig {
 
 fn default_sim_seed()               -> u64   { 42 }
 fn default_sim_obstacles()          -> usize  { 18 }
-fn default_sim_obstacle_slow_m()    -> f32    { 0.80 }
+// Sim uses ground-truth geometric lidar (not MiDaS), so thresholds are metric.
+// Match real-robot intent: slow at 70 cm, stop at 25 cm.
+fn default_sim_obstacle_slow_m()    -> f32    { 0.70 }
 fn default_sim_obstacle_stop_m()    -> f32    { 0.25 }
 fn default_sim_imu_noise_gyro()     -> f32    { 0.01 }
 fn default_sim_imu_noise_accel()    -> f32    { 0.05 }
 fn default_sim_range_dropout()      -> f32    { 0.08 }
-fn default_sim_range_noise_m()      -> f32    { 0.07 }
+fn default_sim_range_noise_m()      -> f32    { 0.02 }
 
 // ── Perception ────────────────────────────────────────────────────────────────
 

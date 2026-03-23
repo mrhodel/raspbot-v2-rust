@@ -73,11 +73,12 @@ impl Executive {
     ///
     /// Allowed transitions:
     /// ```text
-    ///   Idle            → Calibrating | Exploring | Fault
+    ///   Idle            → Calibrating | Exploring | ManualDrive | Fault
     ///   Calibrating     → Idle | Exploring | Fault
     ///   Exploring       → Recovering | SafetyStopped | Idle | Fault
     ///   Recovering      → Exploring | SafetyStopped | Idle | Fault
     ///   SafetyStopped   → Idle | Fault
+    ///   ManualDrive     → Idle
     ///   Fault           → Idle  (manual reset only)
     /// ```
     fn is_allowed(&self, next: &ExecutiveState) -> bool {
@@ -86,6 +87,7 @@ impl Executive {
             (&self.state, next),
             (Idle,          Calibrating   )
             | (Idle,        Exploring     )
+            | (Idle,        ManualDrive   )
             | (Idle,        Fault { .. }  )
             | (Calibrating, Idle          )
             | (Calibrating, Exploring     )
@@ -100,6 +102,7 @@ impl Executive {
             | (Recovering,  Fault { .. }  )
             | (SafetyStopped, Idle        )
             | (SafetyStopped, Fault { .. })
+            | (ManualDrive, Idle          )
             | (Fault { .. }, Idle         )
         )
     }

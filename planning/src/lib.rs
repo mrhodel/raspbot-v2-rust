@@ -22,12 +22,16 @@ use tracing::{debug, warn};
 /// Used when calling `plan()`; use `plan_with_clearance()` to override.
 const CLEARANCE_CELLS: i32 = 7;
 
-/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 4 cells = 20 cm).
-/// Denser waypoints keep pure-pursuit on the planned line and reduce corner-cutting.
-const WAYPOINT_STEP: usize = 4;
+/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 10 cells = 50 cm).
+/// Pure-pursuit lookahead handles sub-waypoint tracking; sparser waypoints mean longer
+/// path segments per replan cycle and fewer artificial pauses.
+const WAYPOINT_STEP: usize = 10;
 
 /// Maximum A* nodes to expand before giving up.
-const MAX_NODES: usize = 50_000;
+/// The robot's reachable connected component is typically 10 000–20 000 cells
+/// (the rest is walls + clearance zones).  20 k is sufficient to find any
+/// reachable goal and fails ~2.5× faster than 50 k on disconnected goals.
+const MAX_NODES: usize = 20_000;
 
 // ── AStarPlanner ─────────────────────────────────────────────────────────────
 
@@ -131,39 +135,13 @@ impl AStarPlanner {
 
     /// True if `(cx,cy)` and all cells within `clearance` are free of obstacles.
     fn passable(&self, mapper: &Mapper, cx: i32, cy: i32, clearance: i32) -> bool {
-        for dx in -clearance..=clearance {
-            for dy in -clearance..=clearance {
-                if mapper.grid.get(cx + dx, cy + dy) >= OCC_THRESH {
-                    return false;
-                }
-            }
-        }
-        true
+        is_passable_with_clearance(mapper, cx, cy, clearance)
     }
 
     /// BFS from `(cx,cy)` outward to find the nearest passable cell.
     /// Searches up to 20 cells radius; returns `None` if none found.
     fn nearest_passable(&self, mapper: &Mapper, cx: i32, cy: i32, clearance: i32) -> Option<(i32, i32)> {
-        use std::collections::VecDeque;
-        let mut visited = std::collections::HashSet::new();
-        let mut queue = VecDeque::new();
-        queue.push_back((cx, cy));
-        visited.insert((cx, cy));
-        const MAX_RADIUS: i32 = 20;
-        while let Some((x, y)) = queue.pop_front() {
-            if (x - cx).abs().max((y - cy).abs()) > MAX_RADIUS {
-                break;
-            }
-            if self.passable(mapper, x, y, clearance) {
-                return Some((x, y));
-            }
-            for (nx, ny) in neighbors8(x, y) {
-                if visited.insert((nx, ny)) {
-                    queue.push_back((nx, ny));
-                }
-            }
-        }
-        None
+        nearest_passable_cell(mapper, cx, cy, clearance, 20)
     }
 
     fn reconstruct(
@@ -203,6 +181,93 @@ impl Default for AStarPlanner {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// True if `(cx,cy)` and all cells within `clearance` are free of confirmed obstacles.
+fn is_passable_with_clearance(mapper: &Mapper, cx: i32, cy: i32, clearance: i32) -> bool {
+    for dx in -clearance..=clearance {
+        for dy in -clearance..=clearance {
+            if mapper.grid.get(cx + dx, cy + dy) >= OCC_THRESH {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// BFS from `(cx,cy)` outward to find the nearest passable cell within `max_radius`.
+/// Returns `None` if no passable cell is found.
+fn nearest_passable_cell(
+    mapper: &Mapper,
+    cx: i32,
+    cy: i32,
+    clearance: i32,
+    max_radius: i32,
+) -> Option<(i32, i32)> {
+    use std::collections::VecDeque;
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((cx, cy));
+    visited.insert((cx, cy));
+    while let Some((x, y)) = queue.pop_front() {
+        if (x - cx).abs().max((y - cy).abs()) > max_radius {
+            break;
+        }
+        if is_passable_with_clearance(mapper, x, y, clearance) {
+            return Some((x, y));
+        }
+        for (nx, ny) in neighbors8(x, y) {
+            if visited.insert((nx, ny)) {
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+    None
+}
+
+/// BFS flood-fill from `start` using passability at `clearance`.
+/// Returns all reachable cells up to `max_cells` (prevents runaway on open maps).
+///
+/// If `start` is itself in a clearance zone (within `clearance` cells of an obstacle),
+/// the BFS seeds from the nearest passable cell within 20 cells — mirroring what A*
+/// does via `nearest_passable`.  Without this, a robot navigating into a corner would
+/// return an empty reachable set and all frontiers would be filtered out.
+pub fn reachable_set(
+    mapper: &Mapper,
+    start: (i32, i32),
+    clearance: i32,
+    max_cells: usize,
+) -> std::collections::HashSet<(i32, i32)> {
+    use std::collections::{HashSet, VecDeque};
+
+    let seed = if is_passable_with_clearance(mapper, start.0, start.1, clearance) {
+        start
+    } else {
+        match nearest_passable_cell(mapper, start.0, start.1, clearance, 20) {
+            Some(cell) => cell,
+            None => return HashSet::new(),
+        }
+    };
+
+    let mut visited: HashSet<(i32, i32)> = HashSet::new();
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    visited.insert(seed);
+    queue.push_back(seed);
+    while let Some((cx, cy)) = queue.pop_front() {
+        if visited.len() >= max_cells {
+            break;
+        }
+        for (nx, ny) in neighbors8(cx, cy) {
+            if visited.contains(&(nx, ny)) {
+                continue;
+            }
+            if is_passable_with_clearance(mapper, nx, ny, clearance) {
+                visited.insert((nx, ny));
+                queue.push_back((nx, ny));
+            }
+        }
+    }
+    visited
+}
 
 /// Octile distance heuristic (consistent, admissible for 8-connected grids).
 fn heuristic(x0: i32, y0: i32, x1: i32, y1: i32) -> f32 {

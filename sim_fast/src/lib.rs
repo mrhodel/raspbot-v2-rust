@@ -68,8 +68,16 @@ const OMEGA_RAD_S: f32 = 13.7;
 /// Measured: real motors reach ~95% speed in ~0.5s, so tau ≈ 0.2s
 const MOTOR_TAU_S: f32 = 0.2;
 
+/// Motor braking time constant (seconds): how fast motors stop when duty → 0.
+/// Yahboom H-bridge actively brakes at duty=0 (low-side short), so spin-down
+/// is much faster than spin-up.  tau_brake ≈ 0.02s ≈ 1 tick to near-zero.
+const BRAKE_TAU_S: f32 = 0.02;
+
 /// Discrete acceleration filter gain: alpha = dt / (tau + dt)
 const ACCEL_ALPHA: f32 = DT_S / (MOTOR_TAU_S + DT_S);
+
+/// Discrete braking filter gain (fast): used when |target| < |current|.
+const BRAKE_ALPHA: f32 = DT_S / (BRAKE_TAU_S + DT_S);
 
 /// Episode ends after this many steps (in addition to collision).
 /// At 10 Hz this is 200 seconds (~3.3 minutes) per episode.
@@ -87,12 +95,15 @@ pub enum RoomKind {
     Empty,
     /// Random rectangular obstacles. `0` is equivalent to `Empty`.
     Random(usize),
+    /// Single centered square obstacle, `side_m` × `side_m`.
+    /// Robot spawns at (5m, 2m) — lower third, away from the obstacle.
+    SingleBox { side_m: f32 },
 }
 
 impl RoomKind {
     fn obstacle_count(&self) -> usize {
         match self {
-            Self::Empty => 0,
+            Self::Empty | Self::SingleBox { .. } => 0,
             Self::Random(n) => *n,
         }
     }
@@ -234,11 +245,15 @@ impl FastSim {
         let act = Action::from_u8(action);
         let (target_vx, target_vy, target_omega) = action_to_velocity(act);
 
-        // Apply first-order acceleration filter: smooth velocity transitions
-        // current_v = (1 - alpha) * current_v + alpha * target_v
-        self.current_vx = (1.0 - ACCEL_ALPHA) * self.current_vx + ACCEL_ALPHA * target_vx;
-        self.current_vy = (1.0 - ACCEL_ALPHA) * self.current_vy + ACCEL_ALPHA * target_vy;
-        self.current_omega = (1.0 - ACCEL_ALPHA) * self.current_omega + ACCEL_ALPHA * target_omega;
+        // Apply first-order acceleration filter with separate spin-up / brake alphas.
+        // When |target| < |current| the H-bridge is actively braking — use BRAKE_ALPHA
+        // (fast) so the coast matches real hardware.  Spin-up uses ACCEL_ALPHA (slow).
+        let ax = if target_vx.abs()    >= self.current_vx.abs()    { ACCEL_ALPHA } else { BRAKE_ALPHA };
+        let ay = if target_vy.abs()    >= self.current_vy.abs()    { ACCEL_ALPHA } else { BRAKE_ALPHA };
+        let aw = if target_omega.abs() >= self.current_omega.abs() { ACCEL_ALPHA } else { BRAKE_ALPHA };
+        self.current_vx    = (1.0 - ax) * self.current_vx    + ax * target_vx;
+        self.current_vy    = (1.0 - ay) * self.current_vy    + ay * target_vy;
+        self.current_omega = (1.0 - aw) * self.current_omega + aw * target_omega;
 
         // Compute proposed new pose using current (accelerated) velocity.
         let cos_t = self.robot_theta.cos();
@@ -266,6 +281,42 @@ impl FastSim {
     /// Advance the simulation by one time step with the camera pointing forward.
     pub fn step(&mut self, action: u8) -> SimStep {
         self.step_with_pan(action, 0.0)
+    }
+
+    /// Advance the simulation using continuous proportional velocity targets
+    /// (m/s for translation, rad/s for rotation, in sim velocity units).
+    ///
+    /// Unlike `step_with_pan` this does not snap to a discrete action, so
+    /// blended forward+rotation commands (e.g. from the pure-pursuit controller)
+    /// are executed faithfully rather than losing the rotation component due to
+    /// sign truncation in the MotorCommand integer encoding.
+    pub fn step_continuous(&mut self, target_vx: f32, target_vy: f32, target_omega: f32, pan_deg: f32) -> SimStep {
+        let ax = if target_vx.abs()    >= self.current_vx.abs()    { ACCEL_ALPHA } else { BRAKE_ALPHA };
+        let ay = if target_vy.abs()    >= self.current_vy.abs()    { ACCEL_ALPHA } else { BRAKE_ALPHA };
+        let aw = if target_omega.abs() >= self.current_omega.abs() { ACCEL_ALPHA } else { BRAKE_ALPHA };
+        self.current_vx    = (1.0 - ax) * self.current_vx    + ax * target_vx;
+        self.current_vy    = (1.0 - ay) * self.current_vy    + ay * target_vy;
+        self.current_omega = (1.0 - aw) * self.current_omega + aw * target_omega;
+
+        let cos_t = self.robot_theta.cos();
+        let sin_t = self.robot_theta.sin();
+        let try_x = self.robot_x + (self.current_vx * cos_t - self.current_vy * sin_t) * DT_S;
+        let try_y = self.robot_y + (self.current_vx * sin_t + self.current_vy * cos_t) * DT_S;
+        let new_theta = wrap_angle(self.robot_theta + self.current_omega * DT_S);
+
+        let collision = !self.robot_clear(try_x, try_y);
+        if !collision {
+            self.robot_x = try_x;
+            self.robot_y = try_y;
+        }
+        self.robot_theta = new_theta;
+        self.last_omega = self.current_omega;
+        self.step_count += 1;
+        self.t_ms += (DT_S * 1000.0) as u64;
+
+        let done = collision || self.step_count >= MAX_STEPS;
+        self.make_step_pan(collision, pan_deg)
+            .with_done(done)
     }
 
     /// Return the centered (pan=0) scan at the current robot position without
@@ -344,6 +395,29 @@ impl FastSim {
     }
 
 
+    /// Cast a VL53L5CX ToF sensor scan: 8 column-averaged rays across ±19.69°,
+    /// panned to `pan_deg`.  Same pan convention as `cast_lidar_pan`.
+    ///
+    /// Column centres (robot frame): `(col − 3.5) × 5.625°` for col in 0..8.
+    /// Angles: −19.69°, −14.06°, −8.44°, −2.81°, +2.81°, +8.44°, +14.06°, +19.69°.
+    pub fn cast_tof(&self, pan_deg: f32) -> PseudoLidarScan {
+        const TOF_COLS: usize = 8;
+        const COL_STEP_RAD: f32 = 5.625 * std::f32::consts::PI / 180.0;
+        let pan_rad = -pan_deg * std::f32::consts::PI / 180.0;
+        let mut rays = Vec::with_capacity(TOF_COLS);
+        for col in 0..TOF_COLS {
+            let local_angle = pan_rad + (col as f32 - 3.5) * COL_STEP_RAD;
+            let world_angle = self.robot_theta + local_angle;
+            let range = self.cast_ray(self.robot_x, self.robot_y, world_angle);
+            rays.push(LidarRay {
+                angle_rad:  local_angle,
+                range_m:    range,
+                confidence: 1.0,
+            });
+        }
+        PseudoLidarScan { t_ms: self.t_ms, rays }
+    }
+
     fn cast_ray(&self, ox: f32, oy: f32, angle: f32) -> f32 {
         let dx = angle.cos() * RAY_STEP_M;
         let dy = angle.sin() * RAY_STEP_M;
@@ -359,8 +433,15 @@ impl FastSim {
             if cx < 0 || cy < 0
                 || cx >= GRID_CELLS as i32
                 || cy >= GRID_CELLS as i32
-                || self.wall(cx as usize, cy as usize)
             {
+                // Step landed outside the grid.  Back up one step so the
+                // endpoint stays within the valid boundary — prevents the
+                // mapper from creating cells at negative or out-of-range
+                // indices, which form spurious frontier clusters outside
+                // the arena walls.
+                return (dist - RAY_STEP_M).max(0.0);
+            }
+            if self.wall(cx as usize, cy as usize) {
                 return dist;
             }
         }
@@ -417,33 +498,55 @@ impl FastSim {
             }
         }
 
-        // Random rectangular obstacles.
-        let n_obstacles = self.room_kind.obstacle_count();
-        let min_cells = 4usize;  // 20 cm minimum obstacle dimension
-        let max_cells = 30usize; // 150 cm maximum
-        for _ in 0..n_obstacles {
-            let w = min_cells + self.rng.next_usize(max_cells - min_cells + 1);
-            let h = min_cells + self.rng.next_usize(max_cells - min_cells + 1);
-            // Keep away from borders.
-            let x0 = 4 + self.rng.next_usize(g - w - 8);
-            let y0 = 4 + self.rng.next_usize(g - h - 8);
-            for ry in y0..(y0 + h).min(g) {
-                for rx in x0..(x0 + w).min(g) {
-                    self.set_wall(rx, ry, true);
+        // Interior obstacles.
+        match &self.room_kind.clone() {
+            RoomKind::SingleBox { side_m } => {
+                // One square obstacle centered at (5m, 5m).
+                let half_cells = ((side_m / 2.0) / RESOLUTION_M) as usize;
+                let center = GRID_CELLS / 2; // 100
+                let x0 = center.saturating_sub(half_cells);
+                let x1 = (center + half_cells).min(g - 1);
+                let y0 = center.saturating_sub(half_cells);
+                let y1 = (center + half_cells).min(g - 1);
+                for ry in y0..=y1 {
+                    for rx in x0..=x1 {
+                        self.set_wall(rx, ry, true);
+                    }
+                }
+            }
+            _ => {
+                // Random rectangular obstacles.
+                let n_obstacles = self.room_kind.obstacle_count();
+                let min_cells = 4usize;  // 20 cm minimum obstacle dimension
+                let max_cells = 30usize; // 150 cm maximum
+                for _ in 0..n_obstacles {
+                    let w = min_cells + self.rng.next_usize(max_cells - min_cells + 1);
+                    let h = min_cells + self.rng.next_usize(max_cells - min_cells + 1);
+                    // Keep away from borders.
+                    let x0 = 4 + self.rng.next_usize(g - w - 8);
+                    let y0 = 4 + self.rng.next_usize(g - h - 8);
+                    for ry in y0..(y0 + h).min(g) {
+                        for rx in x0..(x0 + w).min(g) {
+                            self.set_wall(rx, ry, true);
+                        }
+                    }
                 }
             }
         }
 
-        // Place robot in a free cell near the centre, scanning outward.
-        let start_x = ARENA_M * 0.5;
-        let start_y = ARENA_M * 0.5;
+        // Place robot: SingleBox starts in the lower third, others near centre.
+        let (start_x, start_y) = if matches!(self.room_kind, RoomKind::SingleBox { .. }) {
+            (ARENA_M * 0.5, ARENA_M * 0.2)  // (5m, 2m) — lower third
+        } else {
+            (ARENA_M * 0.5, ARENA_M * 0.5)
+        };
         let (rx, ry) = self.nearest_free(start_x, start_y);
         self.robot_x = rx;
         self.robot_y = ry;
         self.robot_theta = self.rng.next_f32() * 2.0 * std::f32::consts::PI;
 
         debug!(
-            obstacles = n_obstacles,
+            obstacles = self.room_kind.obstacle_count(),
             robot_x   = self.robot_x,
             robot_y   = self.robot_y,
             "Maze generated"
@@ -488,6 +591,33 @@ impl SimStep {
 // ── Free functions ────────────────────────────────────────────────────────────
 
 /// Map a discrete action to `(vx, vy, omega)` in robot frame.
+/// Decode a `MotorCommand` back to continuous target velocities in sim space
+/// using the inverse of the standard mecanum kinematics applied in `cmdvel_to_motor`.
+///
+/// `cmdvel_to_motor` maps:  fl = vx_n + vy_n − ω_n,  fr = vx_n − vy_n + ω_n,
+///                          rl = vx_n − vy_n − ω_n,  rr = vx_n + vy_n + ω_n
+/// Inverse:  vx_n = (fl+fr+rl+rr)/4,  vy_n = (fl+rr−fr−rl)/4,  ω_n = (fr+rr−fl−rl)/4
+/// Velocities are then scaled to sim space by SPEED_M_S / OMEGA_RAD_S.
+///
+/// Used by the sim tick task so that blended forward+rotation CmdVels produced
+/// by the pure-pursuit controller execute proportionally rather than snapping to
+/// one of the six discrete actions (which caused the rotation component to be
+/// lost when the integer FR duty cycle truncated to zero).
+pub fn motor_cmd_to_vel(fl: i8, fr: i8, rl: i8, rr: i8, max_duty: i8) -> (f32, f32, f32) {
+    let d = max_duty as f32;
+    let fl = fl as f32 / d;
+    let fr = fr as f32 / d;
+    let rl = rl as f32 / d;
+    let rr = rr as f32 / d;
+    let vx_n    = (fl + fr + rl + rr) * 0.25;
+    let vy_n    = (fl + rr - fr - rl) * 0.25;
+    let omega_n = (fr + rr - fl - rl) * 0.25;
+    // SPEED_M_S / OMEGA_RAD_S are at 100% duty; scale by actual duty fraction
+    // so sim velocities reflect the real motor cap (max_duty=35 → 35% of peak).
+    let duty_scale = d / 100.0;
+    (vx_n * SPEED_M_S * duty_scale, vy_n * SPEED_M_S * duty_scale, omega_n * OMEGA_RAD_S * duty_scale)
+}
+
 fn action_to_velocity(action: Action) -> (f32, f32, f32) {
     match action {
         Action::Forward     => (SPEED_M_S,  0.0,       0.0),

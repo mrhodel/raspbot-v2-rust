@@ -22,6 +22,8 @@ use core_types::{
     PseudoLidarScan, SafetyState, TrackSet, UltrasonicReading, VisualDelta,
 };
 
+const DEFAULT_CMDVEL: CmdVel = CmdVel { t_ms: 0, vx: 0.0, vy: 0.0, omega: 0.0 };
+
 /// Commands sent from the UI bridge to the executive task.
 ///
 /// Delivered via `Bus::bridge_cmd` (watch channel).  The executive polls it
@@ -32,6 +34,10 @@ pub enum BridgeCommand {
     None,
     Arm,
     Stop,
+    /// Enter manual WASD drive mode (bypasses autonomous planning/control).
+    Manual,
+    /// Return from manual drive to Idle (autonomous mode can then be re-armed).
+    Auto,
 }
 
 // Convenience alias – all Arc-wrapped to keep broadcast clone cheap.
@@ -88,6 +94,10 @@ pub struct Bus {
     /// Cumulative US EmergencyStop count — near-misses that the safety
     /// system caught before a physical contact occurred.
     pub estop_count:          watch::Sender<u32>,
+    /// Total rooms explored so far (incremented each time a new room starts).
+    pub episode_count:        watch::Sender<u32>,
+    /// Rooms that ended by timeout rather than full exploration.
+    pub episode_timeout_count: watch::Sender<u32>,
 
     // ── Sim ground truth (broadcast, one message per episode reset) ──────
     /// Flat wall grid: `walls[y * 200 + x] == 1` means wall. 200×200 cells, 0.05 m/cell.
@@ -98,8 +108,10 @@ pub struct Bus {
     pub ui_bridge_status:     broadcast::Sender<BridgeStatus>,
 
     // ── UI bridge commands (watch) ────────────────────────────────────────
-    /// ARM / STOP commands sent from the HTML control panel via WebSocket.
+    /// ARM / STOP / MANUAL / AUTO commands sent from the HTML control panel via WebSocket.
     pub bridge_cmd:           watch::Sender<BridgeCommand>,
+    /// Manual WASD velocity from the browser (only applied in ManualDrive state).
+    pub manual_cmd_vel:       watch::Sender<CmdVel>,
 
     // ── Decision / planning / control (mpsc senders stored here) ─────────
     pub decision_frontier:    mpsc::Sender<FrontierChoice>,
@@ -149,7 +161,8 @@ impl Bus {
         let (tx_bridge_st,  _) = broadcast::channel(cap);
         let (tx_sim_truth,  _) = broadcast::channel(4);
 
-        let (tx_bridge_cmd, _) = watch::channel(BridgeCommand::None);
+        let (tx_bridge_cmd, _)  = watch::channel(BridgeCommand::None);
+        let (tx_manual_vel, _)  = watch::channel(DEFAULT_CMDVEL);
 
         let (tx_orientation,   rx_orientation)  = watch::channel(Orientation::default());
         let (tx_pose2d,        rx_pose2d)       = watch::channel(Pose2D::default());
@@ -161,6 +174,8 @@ impl Bus {
         let (tx_nearest_angle, _)               = watch::channel(0.0_f32);
         let (tx_collisions,    _)               = watch::channel(0_u32);
         let (tx_estops,        _)               = watch::channel(0_u32);
+        let (tx_episodes,      _)               = watch::channel(0_u32);
+        let (tx_ep_timeouts,   _)               = watch::channel(0_u32);
 
         let (tx_decision,  rx_decision)  = mpsc::channel(cap);
         let (tx_path,      rx_path)      = mpsc::channel(cap);
@@ -192,10 +207,13 @@ impl Bus {
             executive_state:     tx_exec_state,
             collision_count:     tx_collisions,
             estop_count:         tx_estops,
+            episode_count:       tx_episodes,
+            episode_timeout_count: tx_ep_timeouts,
             sim_ground_truth:    tx_sim_truth,
             health_runtime:      tx_health,
             ui_bridge_status:    tx_bridge_st,
             bridge_cmd:          tx_bridge_cmd,
+            manual_cmd_vel:      tx_manual_vel,
             decision_frontier:   tx_decision,
             planner_path:        tx_path,
             controller_cmd_vel:  tx_cmdvel,

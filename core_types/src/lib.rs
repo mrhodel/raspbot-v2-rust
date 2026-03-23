@@ -257,6 +257,8 @@ pub enum ExecutiveState {
     Exploring,
     Recovering,
     SafetyStopped,
+    /// Browser is sending manual WASD velocity commands.
+    ManualDrive,
     Fault { reason: String },
 }
 

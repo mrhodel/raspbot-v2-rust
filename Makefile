@@ -4,7 +4,7 @@ PI_DIR    := ~/robot_ws
 BINARY    := target/$(TARGET)/release/robot
 PI_CONFIG := robot_config.yaml
 
-.PHONY: cross deploy check stop sim stop-pi run-pi logs-pi arm arm-local \
+.PHONY: cross deploy check stop sim sim-armed sim-box sim-box-armed sim-tof sim-tof-armed sim-box-tof sim-box-tof-armed stop-pi run-pi logs-pi arm arm-local \
          motor-test-cross motor-test-deploy motor-test-run motor-test-sweep motor-test-plot
 
 ## Fast local check (no default features — skips V4L2/MPU6050).
@@ -26,6 +26,50 @@ ORT_LIB := $(CURDIR)/.ort/libonnxruntime.so
 SIM_LOG := /tmp/robot_sim.log
 sim: stop
 	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore $(ARGS) 2>&1 | tee $(SIM_LOG)
+
+## Run sim and auto-arm after startup (background; logs → SIM_LOG).
+sim-armed: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore $(ARGS) 2>&1 | tee $(SIM_LOG) &
+	@echo "Sim starting — waiting 5 s for init…"
+	sleep 5
+	pkill -USR1 -x robot
+	@echo "Sim armed. Logs: tail -f $(SIM_LOG)"
+
+## Run sim with a single centered 1m×1m obstacle (clean crash isolation).
+sim-box: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore single-box $(ARGS) 2>&1 | tee $(SIM_LOG)
+
+## Run sim-box and auto-arm after startup (background; logs → SIM_LOG).
+sim-box-armed: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore single-box $(ARGS) 2>&1 | tee $(SIM_LOG) &
+	@echo "Sim (single-box) starting — waiting 5 s for init…"
+	sleep 5
+	pkill -USR1 -x robot
+	@echo "Sim armed. Logs: tail -f $(SIM_LOG)"
+
+## Run sim with VL53L5CX ToF sensor model (8 rays, ±19.69°, no dropout).
+sim-tof: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore tof $(ARGS) 2>&1 | tee $(SIM_LOG)
+
+## Run sim-tof and auto-arm after startup (background; logs → SIM_LOG).
+sim-tof-armed: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore tof $(ARGS) 2>&1 | tee $(SIM_LOG) &
+	@echo "Sim (ToF) starting — waiting 5 s for init…"
+	sleep 5
+	pkill -USR1 -x robot
+	@echo "Sim (ToF) armed. Logs: tail -f $(SIM_LOG)"
+
+## Run sim with single-box + ToF sensor model.
+sim-box-tof: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore single-box tof $(ARGS) 2>&1 | tee $(SIM_LOG)
+
+## Run sim-box-tof and auto-arm after startup (background; logs → SIM_LOG).
+sim-box-tof-armed: stop
+	ORT_DYLIB_PATH=$(ORT_LIB) cargo run --no-default-features --features onnx -- sim explore single-box tof $(ARGS) 2>&1 | tee $(SIM_LOG) &
+	@echo "Sim (single-box ToF) starting — waiting 5 s for init…"
+	sleep 5
+	pkill -USR1 -x robot
+	@echo "Sim (single-box ToF) armed. Logs: tail -f $(SIM_LOG)"
 
 ## Stop robot on Pi.
 stop-pi:

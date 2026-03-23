@@ -5,7 +5,11 @@ Cargo.lock
 
 # Models (large binary files — download separately)
 models/*.onnx
+models/*.data
 models/checkpoints/
+
+# ONNX Runtime shared libraries (platform-specific, download separately)
+.ort/
 
 # Logs and runtime output
 logs/

@@ -1,0 +1,7 @@
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[env]
+# Tells v4l2-sys-mit's bindgen where to find aarch64 kernel headers.
+# The sysroot is installed by gcc-aarch64-linux-gnu + libv4l-dev:arm64.
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu = "--sysroot=/home/mike/pi-sysroot --target=aarch64-linux-gnu"

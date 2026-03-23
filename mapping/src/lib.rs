@@ -103,6 +103,15 @@ pub struct Mapper {
     resolution: f32,
     /// Frontier list from the most recent `update()` call.
     pub last_frontiers: Vec<Frontier>,
+    /// Cells pre-seeded with ground-truth walls (sim-only).
+    /// Re-stamped to LOG_ODDS_MAX after every update so MISS sweeps can never
+    /// erode them — prevents frontiers forming outside the arena walls.
+    seeded_walls: HashSet<(i32, i32)>,
+    /// Arena size in grid cells, set by `seed_walls()`.
+    /// When present, `detect_frontiers()` discards any frontier cell outside
+    /// `[0, arena_cells)` × `[0, arena_cells)` — the direct guard against
+    /// stray Bresenham endpoints outside the seeded margin creating fake clusters.
+    arena_cells: Option<i32>,
 }
 
 impl Mapper {
@@ -111,7 +120,77 @@ impl Mapper {
             grid: OccupancyGrid::new(),
             resolution: RESOLUTION_M,
             last_frontiers: Vec::new(),
+            seeded_walls: HashSet::new(),
+            arena_cells: None,
         }
+    }
+
+    /// Pre-seed the grid with ground-truth walls (sim-only, called once at startup).
+    /// Sets each wall cell to LOG_ODDS_MAX so A* treats them as obstacles immediately
+    /// and frontiers never form at room boundaries.
+    pub fn seed_walls(&mut self, wall_grid: &[bool], grid_cells: usize) {
+        // Remove any previously seeded cells so a second call (e.g. after a
+        // sim reset that regenerates the maze) fully replaces the old layout
+        // rather than accumulating two different mazes.
+        for cell in self.seeded_walls.drain() {
+            self.grid.cells.remove(&cell);
+        }
+        self.arena_cells = Some(grid_cells as i32);
+        // Seed actual wall cells.
+        for y in 0..grid_cells {
+            for x in 0..grid_cells {
+                if wall_grid[y * grid_cells + x] {
+                    let cell = (x as i32, y as i32);
+                    self.grid.cells.insert(cell, LOG_ODDS_MAX);
+                    self.seeded_walls.insert(cell);
+                }
+            }
+        }
+        // Extend seeding 3 cells beyond each grid edge.
+        //
+        // The endpoint formula `pose + range * sin(angle)` uses f32 arithmetic.
+        // When a ray hits the arena boundary, rounding errors can place the
+        // computed endpoint 1–3 cells outside the grid (e.g. cell y = -1).
+        // Without seeding those cells, they accumulate uncontrolled HIT/MISS
+        // updates and appear as false obstacle walls and frontier clusters
+        // outside the physical arena boundary.
+        const MARGIN: i32 = 3;
+        let g = grid_cells as i32;
+        for t in 1..=MARGIN {
+            for i in -MARGIN..=(g - 1 + MARGIN) {
+                for &cell in &[
+                    (i, -t),           // below bottom wall
+                    (i, g - 1 + t),    // above top wall
+                    (-t, i),           // left of left wall
+                    (g - 1 + t, i),    // right of right wall
+                ] {
+                    self.grid.cells.insert(cell, LOG_ODDS_MAX);
+                    self.seeded_walls.insert(cell);
+                }
+            }
+        }
+    }
+
+    /// Return a GridDelta containing every seeded wall cell at LOG_ODDS_MAX.
+    ///
+    /// Call this once after `seed_walls()` and publish the result to the UI bus
+    /// so obstacle positions appear immediately without waiting for lidar scans
+    /// to touch each cell via a MISS-then-restore cycle.
+    ///
+    /// Only the interior arena cells (not the 3-cell boundary margin) are
+    /// included, since the margin falls outside the 200×200 UI canvas and the
+    /// arena_cells bound-check in detect_frontiers already discards them.
+    pub fn initial_delta(&self) -> GridDelta {
+        let cells: Vec<(i32, i32, f32)> = self.seeded_walls
+            .iter()
+            .filter(|&&(cx, cy)| {
+                // Exclude out-of-bounds margin cells — the UI canvas is 0..arena_cells.
+                let g = self.arena_cells.unwrap_or(i32::MAX);
+                cx >= 0 && cy >= 0 && cx < g && cy < g
+            })
+            .map(|&(cx, cy)| (cx, cy, LOG_ODDS_MAX))
+            .collect();
+        GridDelta { t_ms: 0, cells }
     }
 
     /// Ingest one pseudo-lidar scan at the given pose.
@@ -165,8 +244,17 @@ impl Mapper {
 
             for (cx, cy) in bresenham(rx, ry, hx, hy) {
                 if cx == hx && cy == hy {
-                    self.grid.apply(cx, cy, LOG_ODDS_HIT);
-                    touched.insert((cx, cy), ());
+                    // In sim mode (seeded_walls non-empty) only stamp HIT on known
+                    // obstacle cells.  Float arithmetic places computed endpoints
+                    // 1-4 cells from the true wall, creating phantom obstacle
+                    // markers in free space that block A* navigation.  All real
+                    // obstacles are pre-seeded; anything else is free space.
+                    let apply_hit = self.seeded_walls.is_empty()
+                        || self.seeded_walls.contains(&(cx, cy));
+                    if apply_hit {
+                        self.grid.apply(cx, cy, LOG_ODDS_HIT);
+                        touched.insert((cx, cy), ());
+                    }
                 } else if !hit_endpoints.contains(&(cx, cy)) {
                     // Only apply MISS to cells that are not a HIT endpoint for
                     // another ray — prevents adjacent Bresenham traces from
@@ -174,6 +262,17 @@ impl Mapper {
                     self.grid.apply(cx, cy, LOG_ODDS_MISS);
                     touched.insert((cx, cy), ());
                 }
+            }
+        }
+
+        // Restore seeded wall cells that were eroded by MISS sweeps this tick.
+        // Only cells actually changed (eroded below LOG_ODDS_MAX) are added to
+        // the delta so the UI copy stays consistent.
+        for &cell in &self.seeded_walls {
+            let v = self.grid.cells.entry(cell).or_insert(LOG_ODDS_MAX);
+            if *v < LOG_ODDS_MAX {
+                *v = LOG_ODDS_MAX;
+                touched.insert(cell, ());
             }
         }
 
@@ -212,14 +311,28 @@ impl Mapper {
         let mut free_count: u32 = 0;
 
         for (&(cx, cy), &lo) in &self.grid.cells {
+            // Discard cells outside the known arena bounds (sim-only guard).
+            // Stray Bresenham endpoints from oblique rays can land past the
+            // seeded margin, creating free cells outside the physical arena.
+            if let Some(g) = self.arena_cells {
+                if cx < 0 || cy < 0 || cx >= g || cy >= g {
+                    continue;
+                }
+            }
             if lo < FREE_THRESH {
                 free_count += 1;
-                // Frontier if any 4-neighbor is unknown.
-                for (nx, ny) in neighbors4(cx, cy) {
-                    if self.grid.is_unknown(nx, ny) {
-                        frontier_cells.insert((cx, cy));
-                        break;
-                    }
+                // Frontier if any 4-neighbor is unknown AND the cell has at least one
+                // free 4-neighbor.  The second condition rejects isolated free islands
+                // caused by stray lidar rays clipping past walls (floating-point endpoints
+                // map to the cell just outside the arena).  Real frontier cells are always
+                // adjacent to the explored free area behind them.
+                let has_unknown_nb = neighbors4(cx, cy).iter()
+                    .any(|&(nx, ny)| self.grid.is_unknown(nx, ny));
+                if !has_unknown_nb { continue; }
+                let has_free_nb = neighbors4(cx, cy).iter()
+                    .any(|&(nx, ny)| self.grid.is_free(nx, ny));
+                if has_free_nb {
+                    frontier_cells.insert((cx, cy));
                 }
             }
         }
