@@ -1792,50 +1792,57 @@ async fn run_sim_mode(
                     .collect();
                 let hard_bl: Vec<[f32; 2]> = hard_blacklist.iter().map(|(g, _)| *g).collect();
 
-                let annotated: Vec<core_types::Frontier> = {
+                // Clone frontier list quickly then release the lock — holding it
+                // across the full annotation loop starves the mapping task's write lock.
+                let raw_frontiers: Vec<core_types::Frontier> = {
                     let m = mapper_plan.read().await;
-                    m.last_frontiers.iter().map(|f| {
-                        let dx = f.centroid_x_m - pose_pre.x_m;
-                        let dy = f.centroid_y_m - pose_pre.y_m;
-                        let dist = (dx * dx + dy * dy).sqrt();
-
-                        let is_goal = last_goal.map_or(false, |g| {
-                            (f.centroid_x_m - g[0]).abs() < 0.15
-                                && (f.centroid_y_m - g[1]).abs() < 0.15
-                        });
-
-                        let bl_dist = |pos: &Vec<[f32; 2]>| -> f32 {
-                            pos.iter().map(|b| {
-                                let dx = f.centroid_x_m - b[0];
-                                let dy = f.centroid_y_m - b[1];
-                                (dx * dx + dy * dy).sqrt()
-                            }).fold(f32::INFINITY, f32::min)
-                        };
-
-                        let (fcx, fcy) = m.world_to_cell(f.centroid_x_m, f.centroid_y_m);
-                        let reachable = (-8_i32..=8).any(|ddx| {
-                            (-8_i32..=8).any(|ddy| reach.contains(&(fcx + ddx, fcy + ddy)))
-                        });
-
-                        let status = if is_goal {
-                            fs::CURRENT_GOAL
-                        } else if f.size_cells < MIN_FRONTIER_SIZE {
-                            fs::TOO_SMALL
-                        } else if !reachable {
-                            fs::UNREACHABLE
-                        } else if bl_dist(&hard_bl) < BLACKLIST_RADIUS {
-                            fs::HARD_BLACKLISTED
-                        } else if bl_dist(&bl) < BLACKLIST_RADIUS {
-                            fs::SOFT_BLACKLISTED
-                        } else if dist < MIN_GOAL_DIST {
-                            fs::TOO_CLOSE
-                        } else {
-                            fs::NORMAL
-                        };
-
-                        core_types::Frontier { status, ..*f }
-                    }).collect()
+                    m.last_frontiers.clone()
                 };
+                let annotated: Vec<core_types::Frontier> = raw_frontiers.iter().map(|f| {
+                    let dx = f.centroid_x_m - pose_pre.x_m;
+                    let dy = f.centroid_y_m - pose_pre.y_m;
+                    let dist = (dx * dx + dy * dy).sqrt();
+
+                    let is_goal = last_goal.map_or(false, |g| {
+                        (f.centroid_x_m - g[0]).abs() < 0.15
+                            && (f.centroid_y_m - g[1]).abs() < 0.15
+                    });
+
+                    let bl_dist = |pos: &[[f32; 2]]| -> f32 {
+                        pos.iter().map(|b| {
+                            let dx = f.centroid_x_m - b[0];
+                            let dy = f.centroid_y_m - b[1];
+                            (dx * dx + dy * dy).sqrt()
+                        }).fold(f32::INFINITY, f32::min)
+                    };
+
+                    // reach was computed outside the lock (from the same mapper snapshot).
+                    // We need world_to_cell — use the formula directly: cell = (world / RES) as i32.
+                    const RES: f32 = 0.05;
+                    let fcx = (f.centroid_x_m / RES).floor() as i32;
+                    let fcy = (f.centroid_y_m / RES).floor() as i32;
+                    let reachable = (-8_i32..=8).any(|ddx| {
+                        (-8_i32..=8).any(|ddy| reach.contains(&(fcx + ddx, fcy + ddy)))
+                    });
+
+                    let status = if is_goal {
+                        fs::CURRENT_GOAL
+                    } else if f.size_cells < MIN_FRONTIER_SIZE {
+                        fs::TOO_SMALL
+                    } else if !reachable {
+                        fs::UNREACHABLE
+                    } else if bl_dist(&hard_bl) < BLACKLIST_RADIUS {
+                        fs::HARD_BLACKLISTED
+                    } else if bl_dist(&bl) < BLACKLIST_RADIUS {
+                        fs::SOFT_BLACKLISTED
+                    } else if dist < MIN_GOAL_DIST {
+                        fs::TOO_CLOSE
+                    } else {
+                        fs::NORMAL
+                    };
+
+                    core_types::Frontier { status, ..*f }
+                }).collect();
                 let _ = bus_plan.map_frontier_annotations.send(annotated);
             }
 
