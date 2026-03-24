@@ -128,7 +128,13 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       <div><span class="ls" style="background:#1a4a1e"></span>free</div>
       <div><span class="ls" style="background:#555"></span>unknown</div>
       <div><span class="ls" style="background:#c0c0c0"></span>obstacle</div>
-      <div><span class="ls" style="background:#00cccc"></span>frontier</div>
+      <div><span class="ls" style="background:#00cccc"></span>frontier (candidate)</div>
+      <div><span class="ls" style="background:#ffe040"></span>frontier (goal)</div>
+      <div><span class="ls" style="background:#ff8800"></span>frontier (soft-blacklisted)</div>
+      <div><span class="ls" style="background:#ff3300"></span>frontier (hard-blacklisted)</div>
+      <div><span class="ls" style="background:#606060"></span>frontier (unreachable)</div>
+      <div><span class="ls" style="background:#4488bb"></span>frontier (too close)</div>
+      <div><span class="ls" style="background:#2a6060"></span>frontier (too small)</div>
       <div><span class="ls" style="background:#00ff44"></span>robot</div>
     </div>
   </div>
@@ -167,6 +173,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // ── Overlay state ──────────────────────────────────────────────────────
     let pose = null;
     let frontiers = [];
+    let frontiersAnnotated = false; // true once planner annotations arrive
     let lidarRays = null;
     let lastPan = 0;       // gimbal pan in degrees; 0 = forward
     let flashFrames = 0;
@@ -310,12 +317,17 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
         }
       }
 
-      // Frontiers (cyan circles, sized by frontier area).
+      // Frontiers — circles sized by frontier area, colored by planner status.
+      // Status: 0=normal(cyan) 1=too-small(dark-teal) 2=too-close(steel-blue)
+      //         3=unreachable(gray) 4=soft-blacklisted(orange) 5=hard-blacklisted(red)
+      //         6=current-goal(yellow, thick ring)
+      const FRONTIER_COLORS = ['#00cccc','#2a6060','#4488bb','#606060','#ff8800','#ff3300','#ffe040'];
       for (const f of frontiers) {
         const [fx, fy] = worldPx(f.centroid_x_m, f.centroid_y_m);
         const r = Math.max(3, Math.sqrt(f.size_cells) * PX * 0.3);
-        fgX.strokeStyle = '#00cccc';
-        fgX.lineWidth = 2;
+        const st = f.status || 0;
+        fgX.strokeStyle = FRONTIER_COLORS[st] || '#00cccc';
+        fgX.lineWidth = st === 6 ? 3 : 2;
         fgX.beginPath();
         fgX.arc(fx, fy, r, 0, Math.PI * 2);
         fgX.stroke();
@@ -457,7 +469,13 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               if (msg.data && msg.data.cells) applyDelta(msg.data.cells);
               break;
             case 'map/frontiers':
+              // Raw frontiers from mapper (no status). Only apply if no annotated
+              // version has arrived yet, so planner annotations take precedence.
+              if (!frontiersAnnotated) frontiers = msg.data || [];
+              break;
+            case 'map/frontier_annotations':
               frontiers = msg.data || [];
+              frontiersAnnotated = true;
               break;
             case 'vision/pseudo_lidar':
               lidarRays = msg.data && msg.data.rays;
@@ -507,7 +525,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               // Initial session start — clear everything including counts.
               grid.clear();
               crashMarkers = []; crashCount = 0;
-              frontiers = []; lidarRays = null; pose = null;
+              frontiers = []; frontiersAnnotated = false; lidarRays = null; pose = null;
               truWalls = null; truW = 0; truH = 0;
               minCX = maxCX = minCY = maxCY = null;
               bgC.width = bgC.height = fgC.width = fgC.height = 4;
@@ -521,7 +539,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               const epNum = msg.data || 0;
               grid.clear();
               crashMarkers = [];
-              frontiers = []; lidarRays = null; pose = null;
+              frontiers = []; frontiersAnnotated = false; lidarRays = null; pose = null;
               truWalls = null; truW = 0; truH = 0;
               minCX = maxCX = minCY = maxCY = null;
               bgC.width = bgC.height = fgC.width = fgC.height = 4;
@@ -1120,6 +1138,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     tokio::spawn(async move {
         let mut rx_grid       = bus_agg.map_grid_delta.subscribe();
         let mut rx_frontier   = bus_agg.map_frontiers.subscribe();
+        let mut rx_frontier_ann = bus_agg.map_frontier_annotations.subscribe();
         let mut rx_exec       = bus_agg.executive_state.subscribe();
         let mut rx_health     = bus_agg.health_runtime.subscribe();
         let mut rx_us         = bus_agg.ultrasonic.subscribe();
@@ -1155,6 +1174,14 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                     if let Ok(msg) = serde_json::to_string(&serde_json::json!({
                         "topic": "map/frontiers",
                         "data":  frontiers,
+                    })) {
+                        let _ = fanout_agg.send(Arc::new(msg));
+                    }
+                }
+                Ok(ann) = rx_frontier_ann.recv() => {
+                    if let Ok(msg) = serde_json::to_string(&serde_json::json!({
+                        "topic": "map/frontier_annotations",
+                        "data":  ann,
                     })) {
                         let _ = fanout_agg.send(Arc::new(msg));
                     }

@@ -83,6 +83,9 @@ pub struct Bus {
     pub map_grid_delta:       broadcast::Sender<GridDelta>,
     pub map_explored_stats:   broadcast::Sender<ExploredStats>,
     pub map_frontiers:        broadcast::Sender<Vec<Frontier>>,
+    /// Planner-annotated frontier list (status field set). Published by the
+    /// planning task each cycle. The UI bridge prefers this over `map_frontiers`.
+    pub map_frontier_annotations: broadcast::Sender<Vec<Frontier>>,
 
     // ── Executive (watch) ─────────────────────────────────────────────────
     pub executive_state:      watch::Sender<ExecutiveState>,
@@ -157,6 +160,7 @@ impl Bus {
         let (tx_grid,       _) = broadcast::channel(cap);
         let (tx_explored,   _) = broadcast::channel(cap);
         let (tx_frontiers,  _) = broadcast::channel(cap);
+        let (tx_frontier_ann, _) = broadcast::channel(cap);
         let (tx_health,     _) = broadcast::channel(cap);
         let (tx_bridge_st,  _) = broadcast::channel(cap);
         let (tx_sim_truth,  _) = broadcast::channel(4);
@@ -204,6 +208,7 @@ impl Bus {
             map_grid_delta:      tx_grid,
             map_explored_stats:  tx_explored,
             map_frontiers:       tx_frontiers,
+            map_frontier_annotations: tx_frontier_ann,
             executive_state:     tx_exec_state,
             collision_count:     tx_collisions,
             estop_count:         tx_estops,

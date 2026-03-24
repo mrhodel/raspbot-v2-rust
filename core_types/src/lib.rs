@@ -168,6 +168,21 @@ pub struct Frontier {
     pub centroid_x_m: f32,
     pub centroid_y_m: f32,
     pub size_cells: u32,
+    /// Planner-assigned display status (see `frontier_status` constants).
+    /// Default 0 = normal; set by the planning task after each cycle.
+    #[serde(default)]
+    pub status: u8,
+}
+
+/// Display status codes for [`Frontier::status`].
+pub mod frontier_status {
+    pub const NORMAL:           u8 = 0; // reachable candidate
+    pub const TOO_SMALL:        u8 = 1; // below MIN_FRONTIER_SIZE
+    pub const TOO_CLOSE:        u8 = 2; // within MIN_GOAL_DIST of robot
+    pub const UNREACHABLE:      u8 = 3; // BFS-disconnected from robot
+    pub const SOFT_BLACKLISTED: u8 = 4; // in goal_blacklist (short timeout)
+    pub const HARD_BLACKLISTED: u8 = 5; // in hard_blacklist (crash area)
+    pub const CURRENT_GOAL:     u8 = 6; // actively being pursued
 }
 
 /// Exploration statistics published after each map update.

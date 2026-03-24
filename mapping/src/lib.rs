@@ -412,6 +412,7 @@ fn cluster_frontiers(cells: &HashSet<(i32, i32)>, res: f32) -> Vec<Frontier> {
             centroid_x_m: cx * res + res * 0.5,
             centroid_y_m: cy * res + res * 0.5,
             size_cells: cluster.len() as u32,
+            status: 0,
         });
     }
     frontiers

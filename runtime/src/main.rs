@@ -1778,6 +1778,67 @@ async fn run_sim_mode(
                 reachable_set(&m, start_cell, 5, 50_000)
             };
 
+            // Annotate frontiers with planner state for display.
+            // Each frontier gets a status byte encoding why it is/isn't a candidate.
+            {
+                use core_types::frontier_status as fs;
+                const MIN_FRONTIER_SIZE: u32 = 5;
+                const MIN_GOAL_DIST: f32     = 0.75;
+                const BLACKLIST_RADIUS: f32  = 0.60;
+
+                let bl: Vec<[f32; 2]> = goal_blacklist.iter()
+                    .chain(hard_blacklist.iter())
+                    .map(|(g, _)| *g)
+                    .collect();
+                let hard_bl: Vec<[f32; 2]> = hard_blacklist.iter().map(|(g, _)| *g).collect();
+
+                let annotated: Vec<core_types::Frontier> = {
+                    let m = mapper_plan.read().await;
+                    m.last_frontiers.iter().map(|f| {
+                        let dx = f.centroid_x_m - pose_pre.x_m;
+                        let dy = f.centroid_y_m - pose_pre.y_m;
+                        let dist = (dx * dx + dy * dy).sqrt();
+
+                        let is_goal = last_goal.map_or(false, |g| {
+                            (f.centroid_x_m - g[0]).abs() < 0.15
+                                && (f.centroid_y_m - g[1]).abs() < 0.15
+                        });
+
+                        let bl_dist = |pos: &Vec<[f32; 2]>| -> f32 {
+                            pos.iter().map(|b| {
+                                let dx = f.centroid_x_m - b[0];
+                                let dy = f.centroid_y_m - b[1];
+                                (dx * dx + dy * dy).sqrt()
+                            }).fold(f32::INFINITY, f32::min)
+                        };
+
+                        let (fcx, fcy) = m.world_to_cell(f.centroid_x_m, f.centroid_y_m);
+                        let reachable = (-8_i32..=8).any(|ddx| {
+                            (-8_i32..=8).any(|ddy| reach.contains(&(fcx + ddx, fcy + ddy)))
+                        });
+
+                        let status = if is_goal {
+                            fs::CURRENT_GOAL
+                        } else if f.size_cells < MIN_FRONTIER_SIZE {
+                            fs::TOO_SMALL
+                        } else if !reachable {
+                            fs::UNREACHABLE
+                        } else if bl_dist(&hard_bl) < BLACKLIST_RADIUS {
+                            fs::HARD_BLACKLISTED
+                        } else if bl_dist(&bl) < BLACKLIST_RADIUS {
+                            fs::SOFT_BLACKLISTED
+                        } else if dist < MIN_GOAL_DIST {
+                            fs::TOO_CLOSE
+                        } else {
+                            fs::NORMAL
+                        };
+
+                        core_types::Frontier { status, ..*f }
+                    }).collect()
+                };
+                let _ = bus_plan.map_frontier_annotations.send(annotated);
+            }
+
             // Goal-reached blacklist: if the robot has closed within MIN_GOAL_DIST of
             // last_goal, the control task already cleared its path on arrival.  Blacklist
             // the goal so the planner picks a fresh frontier instead of issuing a
