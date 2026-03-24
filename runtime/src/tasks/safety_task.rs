@@ -30,7 +30,7 @@ pub fn spawn_safety_task(
         // Escape: after EmergencyStop the robot reverses briefly to clear the obstacle.
         // The escape window suppresses re-stop commands so the reverse isn't interrupted.
         const ESCAPE_DELAY:    tokio::time::Duration = tokio::time::Duration::from_millis(200);
-        const ESCAPE_DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(600);  // ~35 cm reverse (1.61×0.35×0.6s)
+        const ESCAPE_DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(300);  // ~18 cm reverse — reduced from 600ms to avoid reversing into rear walls (crash 8)
         const ESCAPE_ROTATION: tokio::time::Duration = tokio::time::Duration::from_millis(400);  // 110° at 35% duty (35/100 × 13.7 × 0.4s) — break heading deadlock
         let mut emstop_until:  Option<tokio::time::Instant> = None;
         let mut escape_until:  Option<tokio::time::Instant> = None;

@@ -1070,7 +1070,7 @@ fn select_frontier_goal(
         .filter(|f| large_enough(f) && dist(f) >= MIN_GOAL_DIST && !blacklisted(f) && reachable_centroid(f) && reachable_frontier(f))
         .collect();
     let fallback1: Vec<_> = frontiers.iter()
-        .filter(|f| large_enough(f) && dist(f) >= MIN_GOAL_DIST && reachable_centroid(f) && reachable_frontier(f))
+        .filter(|f| large_enough(f) && dist(f) >= MIN_GOAL_DIST && !blacklisted(f) && reachable_centroid(f) && reachable_frontier(f))
         .collect();
 
     let pool: &[&core_types::Frontier] = if !candidates.is_empty() {
@@ -1634,6 +1634,11 @@ async fn run_sim_mode(
         info!("Sim planning task started (A*, 4-cell clearance)");
         let planner = AStarPlanner::new();
         let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
+        // Hard blacklist: no-progress and collision-based entries.
+        // NOT cleared on A*-saturation so the robot doesn't immediately retry
+        // corners it physically cannot navigate through (crash 9 pattern: same
+        // frontier re-selected 12+ times after each saturation clear).
+        let mut hard_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
         let mut last_goal: Option<[f32; 2]> = None;
         let mut last_path_sent_at: Option<Instant> = None;
         // Time we FIRST sent a path to the current goal (not reset on re-sends).
@@ -1669,6 +1674,7 @@ async fn run_sim_mode(
                     let ep = *episode_rx_plan.borrow_and_update();
                     info!(ep, "Sim planning: episode reset — clearing state");
                     goal_blacklist.clear();
+                    hard_blacklist.clear();
                     consecutive_failures = 0;
                     escape_failures = 0;
                     escape_cycles = 0;
@@ -1694,6 +1700,7 @@ async fn run_sim_mode(
 
             let now = Instant::now();
             goal_blacklist.retain(|(_, exp)| *exp > now);
+            hard_blacklist.retain(|(_, exp)| *exp > now);
 
             // Collision-based blacklist: if a crash occurred since the last planning cycle,
             // blacklist the goal we were pursuing so the new path routes around the crash area.
@@ -1703,13 +1710,21 @@ async fn run_sim_mode(
                     last_crash_plan = crash_n;
                     if let Some(goal) = last_goal {
                         let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 3);
-                        warn!(gx = goal[0], gy = goal[1], "Sim planning: crash — blacklisting goal");
-                        goal_blacklist.push((goal, exp));
+                        warn!(gx = goal[0], gy = goal[1], "Sim planning: crash — hard-blacklisting goal");
+                        hard_blacklist.push((goal, exp));
                         last_goal = None;
                         last_path_sent_at = None;
                         goal_first_sent_at = None;
                         no_progress_pos = None;
                     }
+                    // Also blacklist the robot's current position so the planner avoids
+                    // routing back into the same physical crash area via a nearby frontier.
+                    // BLACKLIST_RADIUS (0.60 m) provides a safe exclusion bubble.
+                    let p = *rx_pose_p.borrow();
+                    let crash_pos = [p.x_m, p.y_m];
+                    let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 6);
+                    warn!(rx = crash_pos[0], ry = crash_pos[1], "Sim planning: crash — hard-blacklisting robot position");
+                    hard_blacklist.push((crash_pos, exp));
                 }
             }
 
@@ -1751,7 +1766,7 @@ async fn run_sim_mode(
             // waiting ~1 s for the next plan_rx.recv() cycle.
             const MAX_INLINE_RETRIES: usize = 5;
             'planning: for _retry in 0..=MAX_INLINE_RETRIES {
-                let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
+                let bl: Vec<[f32; 2]> = goal_blacklist.iter().chain(hard_blacklist.iter()).map(|(g, _)| *g).collect();
                 let pose = *rx_pose_p.borrow_and_update();
                 let maybe_goal = {
                     let m = mapper_plan.read().await;
@@ -1784,6 +1799,7 @@ async fn run_sim_mode(
                             let _ = episode_rx_plan.borrow_and_update();
                             // Reset all planning state for the new room.
                             goal_blacklist.clear();
+                            hard_blacklist.clear();
                             consecutive_failures = 0;
                             escape_failures = 0;
                             escape_cycles = 0;
@@ -1799,6 +1815,7 @@ async fn run_sim_mode(
                         warn!(no_frontier_streak, cells,
                             "Planning: frontier streak reset (cells < {MIN_CELLS_FOR_DONE}, likely pre-arm)");
                         goal_blacklist.clear();
+                        hard_blacklist.clear();
                         no_frontier_streak = 0;
                     }
                     break 'planning;
@@ -1877,9 +1894,9 @@ async fn run_sim_mode(
                         "timeout"
                     };
                     warn!(x = goal[0], y = goal[1], age_s = age, reason,
-                          "Sim planning: goal unreached — blacklisting");
+                          "Sim planning: goal unreached — hard-blacklisting");
                     let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 4);
-                    goal_blacklist.push((goal, exp));
+                    hard_blacklist.push((goal, exp));
                     last_goal = None;
                     last_path_sent_at = None;
                     goal_first_sent_at = None;
@@ -1973,6 +1990,7 @@ async fn run_sim_mode(
                                 let _ = episode_rx_plan.changed().await;
                                 let _ = episode_rx_plan.borrow_and_update();
                                 goal_blacklist.clear();
+                                hard_blacklist.clear();
                                 consecutive_failures = 0;
                                 no_frontier_streak = 0;
                                 last_goal = None;
@@ -1997,6 +2015,7 @@ async fn run_sim_mode(
                                 let _ = episode_rx_plan.changed().await;
                                 let _ = episode_rx_plan.borrow_and_update();
                                 goal_blacklist.clear();
+                                hard_blacklist.clear();
                                 consecutive_failures = 0;
                                 escape_cycles = 0;
                                 no_frontier_streak = 0;

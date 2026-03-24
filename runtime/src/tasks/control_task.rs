@@ -61,9 +61,13 @@ pub fn spawn_control_task(
         let mut is_safety_estop = false;  // mirrors safety task state to avoid backup conflict
         let mut was_safety_estop = false; // tracks previous safety state for edge-detection
         let mut backup_until: Option<std::time::Instant> = None;
-        // Rotation during backup: set when backup starts, based on nearest obstacle angle.
+        // Rotation and speed during backup: set when backup starts.
         // Obstacle on left (angle > 0) → rotate right (omega < 0) to escape.
+        // In proximity zone (!safe_to_spin, nearest < stop_m + 0.15 m) use half speed
+        // to limit blind reverse distance — crashes 10/11 were caused by backing 0.24 m
+        // into a rear wall that the forward-only US couldn't detect.
         let mut backup_escape_omega: f32 = 0.0;
+        let mut backup_escape_vx: f32 = -0.30;
         // Camera-obstacle deadlock detection: timer that fires after the robot has
         // been in obstacle_stopped state for 3 s continuously without recovering.
         // When hysteresis never clears (nearest < 2×stop_m because robot can't move),
@@ -218,7 +222,7 @@ pub fn spawn_control_task(
                     if let Some(until) = backup_until {
                         if std::time::Instant::now() < until {
                             let _ = bus_ctrl.controller_cmd_vel.try_send(
-                                CmdVel { t_ms: 0, vx: -0.30, vy: 0.0, omega: backup_escape_omega }
+                                CmdVel { t_ms: 0, vx: backup_escape_vx, vy: 0.0, omega: backup_escape_omega }
                             );
                             continue;
                         } else {
@@ -255,9 +259,34 @@ pub fn spawn_control_task(
                             if stuck_since.elapsed() >= Duration::from_secs(3) {
                                 // Rotate away from the nearest obstacle during backup.
                                 // Obstacle on left (angle > 0) → spin right (omega < 0).
-                                backup_escape_omega = if nearest_angle > 0.05 { -1.0 }
-                                    else if nearest_angle < -0.05 { 1.0 }
-                                    else { 1.0 }; // dead-ahead: spin either way (pick left)
+                                // Only spin when obstacle is clearly to one side (> 20°).
+                                // Near-center obstacles (±20°): back up straight — spinning
+                                // sweeps the robot body into the same wall (crashes 6, 7).
+                                //
+                                // Proximity guard: only spin when there is enough clearance
+                                // for the body to rotate without clipping the obstacle.
+                                // At nearest < stop_m + 0.15 m (e.g. < 0.30 m in sim) the
+                                // shoulder has < 15 cm to spare — spinning sweeps the robot
+                                // body into the wall even when rotating away from it (crash 9).
+                                const SPIN_THRESHOLD_RAD: f32 = 0.35; // ~20°
+                                const SAFE_SPIN_CLEARANCE_M: f32 = 0.15;
+                                let safe_to_spin = nearest >= obstacle_stop_m + SAFE_SPIN_CLEARANCE_M;
+                                backup_escape_omega = if !safe_to_spin {
+                                    0.0 // too close — straight backup only
+                                } else if nearest_angle > SPIN_THRESHOLD_RAD {
+                                    -1.0 // obstacle left → spin right
+                                } else if nearest_angle < -SPIN_THRESHOLD_RAD {
+                                    1.0  // obstacle right → spin left
+                                } else {
+                                    0.0  // obstacle ≤ 20° off-center: straight backup
+                                };
+                                // Proximity zone: use half speed to limit blind reverse
+                                // distance.  !safe_to_spin means nearest < stop_m+0.15 m —
+                                // the robot body has < 15 cm shoulder clearance and the
+                                // forward-only US can't see rear obstacles.  At -0.30 m/s
+                                // the robot travels 0.36 m in 1.2 s; at -0.15 m/s it
+                                // travels only 0.18 m, staying clear of corner rear walls.
+                                backup_escape_vx = if safe_to_spin { -0.30 } else { -0.15 };
                                 warn!(
                                     nearest_m = nearest,
                                     nearest_angle_deg = nearest_angle.to_degrees(),
@@ -462,41 +491,45 @@ pub fn spawn_control_task(
                                           else                           { "turning-right" };
                         let obs_side = if obs_deg > 5.0 { "left" } else if obs_deg < -5.0 { "right" } else { "center" };
                         // `toward` is already computed above from unscaled omega.
-                        if combined_scale <= 0.0 {
-                            // Hard stop: US at ≤ emergency_stop_cm, OR MiDaS obstacle in forward
-                            // arc (≤ 30°), OR navigation is turning toward the detected obstacle.
+                        // Deep near-zone hard stop: when in_near_zone and already within
+                        // 8 cm of the stop threshold (nearest ≤ stop_m + 0.08 m ≈ 0.23 m),
+                        // stop immediately rather than creeping forward at 5–17% speed.
+                        // Fixes corner-clip crashes where the robot crept at ~7% into a 55°
+                        // side wall — combined_scale was > 0 so the block below was skipped.
+                        const DEEP_STOP_MARGIN_M: f32 = 0.08;
+                        let deep_near_stop = in_near_zone && nearest < obstacle_stop_m + DEEP_STOP_MARGIN_M;
+
+                        if combined_scale <= 0.0 || deep_near_stop {
+                            // Hard stop: fire whenever the robot is at or near the stop
+                            // threshold, regardless of obstacle angle.
+                            //
+                            // Previously the "send omega only" path was taken for side
+                            // obstacles (obs_deg ±55°) at stop distance, leaving the robot
+                            // frozen with obstacle_stopped=false and the deadlock timer
+                            // unarmed — causing timeouts.  Always STOP now.
                             let us_stopped     = us_scale <= 0.0;
                             let in_forward_arc = nearest_angle.abs() <= 30f32.to_radians();
-                            if us_stopped || in_forward_arc || toward {
-                                if !obstacle_stopped {
-                                    warn!(
-                                        nearest_m   = nearest,
-                                        us_m        = latest_us_m,
-                                        us_stopped,
-                                        obs_deg,
-                                        obs_side,
-                                        heading_deg,
-                                        omega       = cmd_vel.omega,
-                                        turn_dir,
-                                        turning_toward_obstacle = toward,
-                                        "Control: obstacle STOP — replan"
-                                    );
-                                    obstacle_stopped = true;
-                                    obstacle_stopped_by_us = us_stopped && !in_forward_arc && !toward;
-                                    clear_since = None;
-                                    current_path = None;
-                                    // Immediately zero velocity — without this the motor task
-                                    // keeps executing the last CmdVel and the robot coasts into
-                                    // the obstacle while we wait for the next tick.
-                                    let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: 0.0, vy: 0.0, omega: 0.0 });
-
-                                    // Deadlock detection is handled by the time-based
-                                    // cam_obstacle_stopped_since timer in the obstacle_stopped
-                                    // block above — fires after 3 s regardless of hysteresis state.
-                                }
-                                continue;
+                            if !obstacle_stopped {
+                                warn!(
+                                    nearest_m   = nearest,
+                                    us_m        = latest_us_m,
+                                    us_stopped,
+                                    deep_near_stop,
+                                    obs_deg,
+                                    obs_side,
+                                    heading_deg,
+                                    omega       = cmd_vel.omega,
+                                    turn_dir,
+                                    turning_toward_obstacle = toward,
+                                    "Control: obstacle STOP — replan"
+                                );
+                                obstacle_stopped = true;
+                                obstacle_stopped_by_us = !deep_near_stop && us_stopped && !in_forward_arc && !toward;
+                                clear_since = None;
+                                current_path = None;
+                                let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: 0.0, vy: 0.0, omega: 0.0 });
                             }
-                            // Side obstacle during rotation, US clear — send omega only.
+                            continue;
                         }
                         info!(
                             nearest_m   = nearest,

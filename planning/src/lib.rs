@@ -31,7 +31,13 @@ const WAYPOINT_STEP: usize = 10;
 /// The robot's reachable connected component is typically 10 000–20 000 cells
 /// (the rest is walls + clearance zones).  20 k is sufficient to find any
 /// reachable goal and fails ~2.5× faster than 50 k on disconnected goals.
-const MAX_NODES: usize = 20_000;
+// 50k covers a full 10×10 m arena at 5 cm/cell (200×200 = 40k cells) with room
+// to spare.  Previous 20k limit caused clearance=7 to exhaust its budget and
+// fall back to clearance=5, which routed the robot closer to walls and into
+// corners that the ±55° sensor FOV couldn't detect in time (crashes 4, 5).
+// With BFS reachability pre-screen filtering disconnected goals, exhaustion
+// of this limit is rare so the performance cost is negligible.
+const MAX_NODES: usize = 50_000;
 
 // ── AStarPlanner ─────────────────────────────────────────────────────────────
 
