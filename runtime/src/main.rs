@@ -1142,6 +1142,114 @@ fn select_frontier_goal(
 // until SIGUSR1 re-arms it (mirrors real-robot behaviour so the same care
 // must be taken in sim as on the real floor).
 
+// ── Sim run statistics ────────────────────────────────────────────────────────
+
+struct RoomRecord {
+    reason:     &'static str,   // "complete" | "timeout" | "cascade" | "isolated" | "reset"
+    duration_s: f64,
+    cells:      u32,            // explored_cells at room end
+    crashes:    u32,            // collisions during this room
+}
+
+struct SimRunStats {
+    run_start:       std::time::Instant,
+    rooms:           Vec<RoomRecord>,
+    astar_ok:        u32,
+    astar_fail:      u32,
+    cascades:        u32,
+    hard_bl_pushes:  u32,
+    /// Set by planning task before sending explore_done so the sim tick task
+    /// can record the correct room exit reason.
+    next_room_reason: Option<&'static str>,
+}
+
+fn print_sim_summary(stats: &SimRunStats, bus: &bus::Bus) {
+    let elapsed = stats.run_start.elapsed();
+    let h = elapsed.as_secs() / 3600;
+    let m = (elapsed.as_secs() % 3600) / 60;
+    let s = elapsed.as_secs() % 60;
+
+    let total_crashes    = *bus.collision_count.borrow();
+    let total_near_miss  = *bus.estop_count.borrow();
+    let total_episodes   = *bus.episode_count.borrow();
+    let hours            = elapsed.as_secs_f64() / 3600.0;
+
+    let rooms            = &stats.rooms;
+    let n_complete  = rooms.iter().filter(|r| r.reason == "complete").count();
+    let n_timeout   = rooms.iter().filter(|r| r.reason == "timeout").count();
+    let n_cascade   = rooms.iter().filter(|r| r.reason == "cascade").count();
+    let n_isolated  = rooms.iter().filter(|r| r.reason == "isolated").count();
+    let n_reset     = rooms.iter().filter(|r| r.reason == "reset").count();
+
+    let complete_times: Vec<f64> = rooms.iter()
+        .filter(|r| r.reason == "complete")
+        .map(|r| r.duration_s)
+        .collect();
+    let avg_clear = if complete_times.is_empty() { 0.0 }
+        else { complete_times.iter().sum::<f64>() / complete_times.len() as f64 };
+    let min_clear = complete_times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_clear = complete_times.iter().cloned().fold(0.0_f64, f64::max);
+
+    let total_cells: u32 = rooms.iter().map(|r| r.cells).sum();
+    let avg_cells = if rooms.is_empty() { 0 }
+        else { total_cells / rooms.len() as u32 };
+    let max_cells = rooms.iter().map(|r| r.cells).max().unwrap_or(0);
+
+    let clean_rooms = rooms.iter().filter(|r| r.crashes == 0).count();
+    let worst_crashes = rooms.iter().map(|r| r.crashes).max().unwrap_or(0);
+    let avg_crashes = if rooms.is_empty() { 0.0 }
+        else { total_crashes as f64 / rooms.len() as f64 };
+
+    let astar_total = stats.astar_ok + stats.astar_fail;
+    let astar_pct = if astar_total == 0 { 100.0 }
+        else { 100.0 * stats.astar_ok as f64 / astar_total as f64 };
+
+    let sep = "═".repeat(54);
+    eprintln!("\n╔{sep}╗");
+    eprintln!("║{:^54}║", "  SIM RUN SUMMARY  ");
+    eprintln!("╠{sep}╣");
+    eprintln!("║  Run time          : {:>3}h {:02}m {:02}s{:>19}║", h, m, s, "");
+    eprintln!("║  Rooms entered     : {:>6}{:>25}║", total_episodes, "");
+    eprintln!("╠{sep}╣");
+    eprintln!("║  ROOM OUTCOMES{:>40}║", "");
+    eprintln!("║    Explored (complete) : {:>6}{:>19}║", n_complete, "");
+    eprintln!("║    Timed out           : {:>6}{:>19}║", n_timeout, "");
+    eprintln!("║    Cascade crash exit  : {:>6}{:>19}║", n_cascade, "");
+    eprintln!("║    Isolated (A* stuck) : {:>6}{:>19}║", n_isolated, "");
+    eprintln!("║    Episode reset       : {:>6}{:>19}║", n_reset, "");
+    eprintln!("╠{sep}╣");
+    eprintln!("║  EXPLORATION TIMING (complete rooms){:>18}║", "");
+    if !complete_times.is_empty() {
+        eprintln!("║    Avg clear time      : {:>7.1}s{:>17}║", avg_clear, "");
+        eprintln!("║    Fastest             : {:>7.1}s{:>17}║", min_clear, "");
+        eprintln!("║    Slowest             : {:>7.1}s{:>17}║", max_clear, "");
+    } else {
+        eprintln!("║    (no rooms fully explored){:>26}║", "");
+    }
+    eprintln!("╠{sep}╣");
+    eprintln!("║  MAPPING{:>45}║", "");
+    eprintln!("║    Total cells explored: {:>9}{:>15}║", total_cells, "");
+    eprintln!("║    Avg cells / room    : {:>9}{:>15}║", avg_cells, "");
+    eprintln!("║    Best room (cells)   : {:>9}{:>15}║", max_cells, "");
+    eprintln!("╠{sep}╣");
+    eprintln!("║  SAFETY{:>46}║", "");
+    eprintln!("║    Collisions (crashes): {:>6}  ({:.1}/hr){:>10}║",
+        total_crashes, if hours > 0.0 { total_crashes as f64 / hours } else { 0.0 }, "");
+    eprintln!("║    Near-misses (US)    : {:>6}  ({:.1}/hr){:>10}║",
+        total_near_miss, if hours > 0.0 { total_near_miss as f64 / hours } else { 0.0 }, "");
+    eprintln!("║    Avg crashes / room  : {:>9.1}{:>15}║", avg_crashes, "");
+    eprintln!("║    Worst room crashes  : {:>6}{:>18}║", worst_crashes, "");
+    eprintln!("║    Clean rooms (0 crash): {:>5}{:>18}║", clean_rooms, "");
+    eprintln!("╠{sep}╣");
+    eprintln!("║  PLANNING{:>44}║", "");
+    eprintln!("║    A* paths found      : {:>6}  ({:.1}%){:>12}║",
+        stats.astar_ok, astar_pct, "");
+    eprintln!("║    A* failures         : {:>6}{:>18}║", stats.astar_fail, "");
+    eprintln!("║    Cascade escapes     : {:>6}{:>18}║", stats.cascades, "");
+    eprintln!("║    Hard-blacklist hits : {:>6}{:>18}║", stats.hard_bl_pushes, "");
+    eprintln!("╚{sep}╝\n");
+}
+
 async fn run_sim_mode(
     bus:              Arc<bus::Bus>,
     cfg:              config::RobotConfig,
@@ -1151,6 +1259,16 @@ async fn run_sim_mode(
     cmdvel_rx:        tokio::sync::mpsc::Receiver<core_types::CmdVel>,
 ) -> anyhow::Result<()> {
     use sim_fast::RoomKind;
+
+    let sim_stats = std::sync::Arc::new(std::sync::Mutex::new(SimRunStats {
+        run_start:        std::time::Instant::now(),
+        rooms:            Vec::new(),
+        astar_ok:         0,
+        astar_fail:       0,
+        cascades:         0,
+        hard_bl_pushes:   0,
+        next_room_reason: None,
+    }));
 
     // Usage: `robot sim [explore] [single-box] [seed]`
     // `explore` keeps the map and maze across collisions (single infinite episode).
@@ -1624,6 +1742,7 @@ async fn run_sim_mode(
     let timeout_tx_plan = timeout_tx.clone();
     let _force_respawn_tx_plan = force_respawn_tx.clone();
     let explore_done_tx_plan = explore_done_tx.clone();
+    let stats_plan = std::sync::Arc::clone(&sim_stats);
     tokio::spawn(async move {
         use tokio::time::Instant;
         const GOAL_BLACKLIST_SECS: u64 = 30;
@@ -1716,6 +1835,7 @@ async fn run_sim_mode(
                         let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 3);
                         warn!(gx = goal[0], gy = goal[1], "Sim planning: crash — hard-blacklisting goal");
                         hard_blacklist.push((goal, exp));
+                        { let mut s = stats_plan.lock().unwrap(); s.hard_bl_pushes += 1; }
                         last_goal = None;
                         last_path_sent_at = None;
                         goal_first_sent_at = None;
@@ -1729,6 +1849,7 @@ async fn run_sim_mode(
                     let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 6);
                     warn!(rx = crash_pos[0], ry = crash_pos[1], "Sim planning: crash — hard-blacklisting robot position");
                     hard_blacklist.push((crash_pos, exp));
+                    { let mut s = stats_plan.lock().unwrap(); s.hard_bl_pushes += 1; }
 
                     // Cascade detection: if a recent hard_blacklist entry is within
                     // CASCADE_RADIUS of this crash position, the robot is physically
@@ -1744,6 +1865,7 @@ async fn run_sim_mode(
                         });
                     if is_cascade {
                         warn!(rx = crash_pos[0], ry = crash_pos[1], "Sim planning: crash cascade detected — forcing new room");
+                        { let mut s = stats_plan.lock().unwrap(); s.cascades += 1; s.next_room_reason = Some("cascade"); }
                         let _ = explore_done_tx_plan.send(()).await;
                         while plan_rx.try_recv().is_ok() {}
                         let _ = episode_rx_plan.borrow_and_update();
@@ -2036,6 +2158,7 @@ async fn run_sim_mode(
                 match planned {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Sim planning: path found");
+                        { let mut s = stats_plan.lock().unwrap(); s.astar_ok += 1; }
                         last_path_sent_at = Some(now);
                         let _ = bus_plan.planner_path.send(path).await;
                         consecutive_failures = 0;
@@ -2043,6 +2166,7 @@ async fn run_sim_mode(
                         break 'planning;
                     }
                     None => {
+                        { let mut s = stats_plan.lock().unwrap(); s.astar_fail += 1; }
                         warn!(_retry, ?choice, total_failure, "Sim planning: no path to frontier");
                         // Goals that fail at ALL clearance levels are structurally unreachable
                         // (e.g. frontier centroid beyond arena wall).  Use a 10× longer
@@ -2088,6 +2212,7 @@ async fn run_sim_mode(
                             last_goal = None;
                             if explore_mode && escape_cycles >= MAX_ESCAPE_CYCLES {
                                 warn!(escape_cycles, "Sim planning: A*-unreachable frontiers after {} escape cycles — starting new room", escape_cycles);
+                                { let mut s = stats_plan.lock().unwrap(); s.next_room_reason = Some("isolated"); }
                                 escape_cycles = 0;
                                 escape_failures = 0;
                                 let _ = explore_done_tx_plan.send(()).await;
@@ -2114,6 +2239,7 @@ async fn run_sim_mode(
                             } else if escape_failures >= MAX_ESCAPE_FAILURES {
                                 // In explore mode, robot is truly stuck — start a new room.
                                 warn!(escape_failures, "Sim planning: robot isolated (explore mode) — starting new room");
+                                { let mut s = stats_plan.lock().unwrap(); s.next_room_reason = Some("isolated"); }
                                 escape_failures = 0;
                                 let _ = explore_done_tx_plan.send(()).await;
                                 while plan_rx.try_recv().is_ok() {}
@@ -2170,6 +2296,7 @@ async fn run_sim_mode(
         cfg.sim.range_noise_m,
         seed,
         max_motor_duty,
+        std::sync::Arc::clone(&sim_stats),
     );
 
     // ── UI Bridge — same port 9000 WebSocket telemetry as real robot ─────────
@@ -2198,6 +2325,10 @@ async fn run_sim_mode(
     // worker thread yields.  `process::exit` terminates immediately after
     // motors are zeroed, which is all the cleanup we need.
     info!("Sim mode: shutting down");
+    {
+        let stats = sim_stats.lock().unwrap();
+        print_sim_summary(&stats, &bus);
+    }
     std::process::exit(0);
 }
 
@@ -2224,6 +2355,7 @@ fn spawn_sim_tick_task(
     range_noise_m:          f32,
     seed:                   u64,
     max_motor_duty:         i8,
+    sim_stats:              std::sync::Arc<std::sync::Mutex<SimRunStats>>,
 ) -> tokio::task::JoinHandle<()> {
     use std::time::Duration;
     use std::time::Instant;
@@ -2263,8 +2395,14 @@ fn spawn_sim_tick_task(
         // Separate from MAX_STEPS (used for RL training episode length).
         const EXPLORE_ROOM_TIMEOUT_S: u64 = 900; // 15 minutes
         let mut room_start_time = Instant::now();
+        let mut rx_explored_st = bus.map_explored_stats.subscribe();
+        let mut latest_cells: u32 = 0;
+        let mut crashes_at_room_start: u32 = *bus.collision_count.borrow();
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Drain explored_stats to keep latest_cells current (non-blocking).
+            while let Ok(es) = rx_explored_st.try_recv() { latest_cells = es.explored_cells; }
 
             // Read latest actuator state.
             let latest_motor = sim_state.latest_motor.lock().unwrap().take();
@@ -2425,6 +2563,19 @@ fn spawn_sim_tick_task(
             if explore_complete || explore_timeout || training_timeout {
                 episode += 1;
                 let is_timeout = explore_timeout || training_timeout;
+                // Record room stats before resetting state.
+                {
+                    let mut s = sim_stats.lock().unwrap();
+                    let reason = s.next_room_reason.take().unwrap_or_else(||
+                        if is_timeout { "timeout" } else { "complete" }
+                    );
+                    s.rooms.push(RoomRecord {
+                        reason,
+                        duration_s: room_start_time.elapsed().as_secs_f64(),
+                        cells:      latest_cells,
+                        crashes:    bus.collision_count.borrow().saturating_sub(crashes_at_room_start),
+                    });
+                }
                 if is_timeout {
                     episode_timeout_count += 1;
                     let _ = bus.episode_timeout_count.send(episode_timeout_count);
@@ -2457,6 +2608,8 @@ fn spawn_sim_tick_task(
                 let _ = bus.slam_pose2d.send(reset_step.pose);
                 let _ = bus.safety_state.send(SafetyState::Ok);
                 room_start_time = Instant::now();
+                latest_cells = 0;
+                crashes_at_room_start = *bus.collision_count.borrow();
                 let _ = arm_tx.send(()).await;
                 continue;
             }
