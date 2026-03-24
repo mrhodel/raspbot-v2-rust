@@ -1169,12 +1169,12 @@ fn print_sim_summary(stats: &SimRunStats, bus: &bus::Bus) {
     let m = (elapsed.as_secs() % 3600) / 60;
     let s = elapsed.as_secs() % 60;
 
-    let total_crashes    = *bus.collision_count.borrow();
-    let total_near_miss  = *bus.estop_count.borrow();
-    let total_episodes   = *bus.episode_count.borrow();
-    let hours            = elapsed.as_secs_f64() / 3600.0;
+    let total_crashes   = *bus.collision_count.borrow();
+    let total_near_miss = *bus.estop_count.borrow();
+    let total_episodes  = *bus.episode_count.borrow();
+    let hours           = elapsed.as_secs_f64() / 3600.0;
 
-    let rooms            = &stats.rooms;
+    let rooms       = &stats.rooms;
     let n_complete  = rooms.iter().filter(|r| r.reason == "complete").count();
     let n_timeout   = rooms.iter().filter(|r| r.reason == "timeout").count();
     let n_cascade   = rooms.iter().filter(|r| r.reason == "cascade").count();
@@ -1182,71 +1182,77 @@ fn print_sim_summary(stats: &SimRunStats, bus: &bus::Bus) {
     let n_reset     = rooms.iter().filter(|r| r.reason == "reset").count();
 
     let complete_times: Vec<f64> = rooms.iter()
-        .filter(|r| r.reason == "complete")
-        .map(|r| r.duration_s)
-        .collect();
-    let avg_clear = if complete_times.is_empty() { 0.0 }
+        .filter(|r| r.reason == "complete").map(|r| r.duration_s).collect();
+    let avg_clear    = if complete_times.is_empty() { 0.0 }
         else { complete_times.iter().sum::<f64>() / complete_times.len() as f64 };
-    let min_clear = complete_times.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_clear = complete_times.iter().cloned().fold(0.0_f64, f64::max);
+    let min_clear    = complete_times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_clear    = complete_times.iter().cloned().fold(0.0_f64, f64::max);
 
-    let total_cells: u32 = rooms.iter().map(|r| r.cells).sum();
-    let avg_cells = if rooms.is_empty() { 0 }
-        else { total_cells / rooms.len() as u32 };
-    let max_cells = rooms.iter().map(|r| r.cells).max().unwrap_or(0);
+    let total_cells  = rooms.iter().map(|r| r.cells).sum::<u32>();
+    let avg_cells    = if rooms.is_empty() { 0 } else { total_cells / rooms.len() as u32 };
+    let max_cells    = rooms.iter().map(|r| r.cells).max().unwrap_or(0);
 
-    let clean_rooms = rooms.iter().filter(|r| r.crashes == 0).count();
-    let worst_crashes = rooms.iter().map(|r| r.crashes).max().unwrap_or(0);
-    let avg_crashes = if rooms.is_empty() { 0.0 }
+    let clean_rooms  = rooms.iter().filter(|r| r.crashes == 0).count();
+    let worst_crash  = rooms.iter().map(|r| r.crashes).max().unwrap_or(0);
+    let avg_crashes  = if rooms.is_empty() { 0.0 }
         else { total_crashes as f64 / rooms.len() as f64 };
 
-    let astar_total = stats.astar_ok + stats.astar_fail;
-    let astar_pct = if astar_total == 0 { 100.0 }
+    let astar_total  = stats.astar_ok + stats.astar_fail;
+    let astar_pct    = if astar_total == 0 { 100.0 }
         else { 100.0 * stats.astar_ok as f64 / astar_total as f64 };
 
-    let sep = "═".repeat(54);
+    // Box is W=52 chars wide between the two border chars (total line = 54).
+    // `line(s)` pads `s` to exactly W chars so borders always align.
+    const W: usize = 52;
+    let sep  = "═".repeat(W);
+    let line = |s: String| { eprintln!("║{:<W$}║", s, W = W); };
+    let sect = |s: &str|   { eprintln!("╠{sep}╣"); line(format!("  {s}")); };
+    let kv   = |label: &str, val: String| {
+        line(format!("    {:<26}{:>20}", format!("{label} :"), val));
+    };
+
     eprintln!("\n╔{sep}╗");
-    eprintln!("║{:^54}║", "  SIM RUN SUMMARY  ");
+    line(format!("{:^W$}", "SIM RUN SUMMARY", W = W));
     eprintln!("╠{sep}╣");
-    eprintln!("║  Run time          : {:>3}h {:02}m {:02}s{:>19}║", h, m, s, "");
-    eprintln!("║  Rooms entered     : {:>6}{:>25}║", total_episodes, "");
-    eprintln!("╠{sep}╣");
-    eprintln!("║  ROOM OUTCOMES{:>40}║", "");
-    eprintln!("║    Explored (complete) : {:>6}{:>19}║", n_complete, "");
-    eprintln!("║    Timed out           : {:>6}{:>19}║", n_timeout, "");
-    eprintln!("║    Cascade crash exit  : {:>6}{:>19}║", n_cascade, "");
-    eprintln!("║    Isolated (A* stuck) : {:>6}{:>19}║", n_isolated, "");
-    eprintln!("║    Episode reset       : {:>6}{:>19}║", n_reset, "");
-    eprintln!("╠{sep}╣");
-    eprintln!("║  EXPLORATION TIMING (complete rooms){:>18}║", "");
+    line(format!("  {:<26}{:>20}", "Run time :", format!("{}h {:02}m {:02}s", h, m, s)));
+    line(format!("  {:<26}{:>20}", "Rooms entered :", total_episodes));
+
+    sect("ROOM OUTCOMES");
+    kv("Explored (complete)", format!("{}", n_complete));
+    kv("Timed out",           format!("{}", n_timeout));
+    kv("Cascade crash exit",  format!("{}", n_cascade));
+    kv("Isolated (A* stuck)", format!("{}", n_isolated));
+    kv("Episode reset",       format!("{}", n_reset));
+
+    sect("EXPLORATION TIMING  (complete rooms only)");
     if !complete_times.is_empty() {
-        eprintln!("║    Avg clear time      : {:>7.1}s{:>17}║", avg_clear, "");
-        eprintln!("║    Fastest             : {:>7.1}s{:>17}║", min_clear, "");
-        eprintln!("║    Slowest             : {:>7.1}s{:>17}║", max_clear, "");
+        kv("Avg clear time", format!("{:.1}s", avg_clear));
+        kv("Fastest",        format!("{:.1}s", min_clear));
+        kv("Slowest",        format!("{:.1}s", max_clear));
     } else {
-        eprintln!("║    (no rooms fully explored){:>26}║", "");
+        line("    (no rooms fully explored)".to_string());
     }
-    eprintln!("╠{sep}╣");
-    eprintln!("║  MAPPING{:>45}║", "");
-    eprintln!("║    Total cells explored: {:>9}{:>15}║", total_cells, "");
-    eprintln!("║    Avg cells / room    : {:>9}{:>15}║", avg_cells, "");
-    eprintln!("║    Best room (cells)   : {:>9}{:>15}║", max_cells, "");
-    eprintln!("╠{sep}╣");
-    eprintln!("║  SAFETY{:>46}║", "");
-    eprintln!("║    Collisions (crashes): {:>6}  ({:.1}/hr){:>10}║",
-        total_crashes, if hours > 0.0 { total_crashes as f64 / hours } else { 0.0 }, "");
-    eprintln!("║    Near-misses (US)    : {:>6}  ({:.1}/hr){:>10}║",
-        total_near_miss, if hours > 0.0 { total_near_miss as f64 / hours } else { 0.0 }, "");
-    eprintln!("║    Avg crashes / room  : {:>9.1}{:>15}║", avg_crashes, "");
-    eprintln!("║    Worst room crashes  : {:>6}{:>18}║", worst_crashes, "");
-    eprintln!("║    Clean rooms (0 crash): {:>5}{:>18}║", clean_rooms, "");
-    eprintln!("╠{sep}╣");
-    eprintln!("║  PLANNING{:>44}║", "");
-    eprintln!("║    A* paths found      : {:>6}  ({:.1}%){:>12}║",
-        stats.astar_ok, astar_pct, "");
-    eprintln!("║    A* failures         : {:>6}{:>18}║", stats.astar_fail, "");
-    eprintln!("║    Cascade escapes     : {:>6}{:>18}║", stats.cascades, "");
-    eprintln!("║    Hard-blacklist hits : {:>6}{:>18}║", stats.hard_bl_pushes, "");
+
+    sect("MAPPING");
+    kv("Total cells explored", format!("{}", total_cells));
+    kv("Avg cells / room",     format!("{}", avg_cells));
+    kv("Best room (cells)",    format!("{}", max_cells));
+
+    sect("SAFETY");
+    kv("Collisions (crashes)", format!("{}  ({:.1}/hr)", total_crashes,
+        if hours > 0.0 { total_crashes as f64 / hours } else { 0.0 }));
+    kv("Near-misses (US)",     format!("{}  ({:.1}/hr)", total_near_miss,
+        if hours > 0.0 { total_near_miss as f64 / hours } else { 0.0 }));
+    kv("Avg crashes / room",   format!("{:.1}", avg_crashes));
+    kv("Worst room (crashes)", format!("{}", worst_crash));
+    kv("Clean rooms (0 crash)",format!("{}", clean_rooms));
+
+    sect("PLANNING");
+    kv("A* paths found",      format!("{}  ({:.1}%)", stats.astar_ok, astar_pct));
+    kv("A* failures",         format!("{}", stats.astar_fail));
+    kv("Cascade escapes",     format!("{}", stats.cascades));
+    kv("Hard-blacklist hits", format!("{}", stats.hard_bl_pushes));
+
     eprintln!("╚{sep}╝\n");
 }
 
