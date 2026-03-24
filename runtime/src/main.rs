@@ -1682,7 +1682,11 @@ async fn run_sim_mode(
                     last_goal = None;
                     last_path_sent_at = None;
                     goal_first_sent_at = None;
-                    last_crash_plan = 0;
+                    // Sync to current collision_count so the crash detector doesn't
+                    // fire spuriously on the first planning tick of the new episode
+                    // (collision_count persists across rooms; resetting to 0 would
+                    // trigger a false "crash detected" the first time the loop runs).
+                    last_crash_plan = *bus_plan.collision_count.borrow();
                     no_progress_pos = None;
                     while plan_rx.try_recv().is_ok() {}
                     continue;
@@ -1725,6 +1729,40 @@ async fn run_sim_mode(
                     let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 6);
                     warn!(rx = crash_pos[0], ry = crash_pos[1], "Sim planning: crash — hard-blacklisting robot position");
                     hard_blacklist.push((crash_pos, exp));
+
+                    // Cascade detection: if a recent hard_blacklist entry is within
+                    // CASCADE_RADIUS of this crash position, the robot is physically
+                    // trapped and will crash indefinitely (deadlock backup can't escape).
+                    // Force a new room immediately rather than burning 100s of crash cycles.
+                    const CASCADE_RADIUS: f32 = 0.30;
+                    let is_cascade = explore_mode && hard_blacklist.iter()
+                        .filter(|(b, _)| *b != crash_pos)
+                        .any(|(b, _)| {
+                            let dx = crash_pos[0] - b[0];
+                            let dy = crash_pos[1] - b[1];
+                            (dx * dx + dy * dy).sqrt() < CASCADE_RADIUS
+                        });
+                    if is_cascade {
+                        warn!(rx = crash_pos[0], ry = crash_pos[1], "Sim planning: crash cascade detected — forcing new room");
+                        let _ = explore_done_tx_plan.send(()).await;
+                        while plan_rx.try_recv().is_ok() {}
+                        let _ = episode_rx_plan.borrow_and_update();
+                        let _ = episode_rx_plan.changed().await;
+                        let _ = episode_rx_plan.borrow_and_update();
+                        goal_blacklist.clear();
+                        hard_blacklist.clear();
+                        consecutive_failures = 0;
+                        escape_cycles = 0;
+                        escape_failures = 0;
+                        no_frontier_streak = 0;
+                        last_goal = None;
+                        last_path_sent_at = None;
+                        goal_first_sent_at = None;
+                        no_progress_pos = None;
+                        last_crash_plan = *bus_plan.collision_count.borrow();
+                        while plan_rx.try_recv().is_ok() {}
+                        continue;
+                    }
                 }
             }
 
@@ -1808,7 +1846,7 @@ async fn run_sim_mode(
                             last_path_sent_at = None;
                             goal_first_sent_at = None;
                             no_progress_pos = None;
-                            last_crash_plan = 0;
+                            last_crash_plan = *bus_plan.collision_count.borrow();
                             while plan_rx.try_recv().is_ok() {}
                             continue; // back to the outer select! loop
                         }
@@ -1997,7 +2035,7 @@ async fn run_sim_mode(
                                 last_path_sent_at = None;
                                 goal_first_sent_at = None;
                                 no_progress_pos = None;
-                                last_crash_plan = 0;
+                                last_crash_plan = *bus_plan.collision_count.borrow();
                                 while plan_rx.try_recv().is_ok() {}
                                 continue;
                             }
@@ -2023,7 +2061,7 @@ async fn run_sim_mode(
                                 last_path_sent_at = None;
                                 goal_first_sent_at = None;
                                 no_progress_pos = None;
-                                last_crash_plan = 0;
+                                last_crash_plan = *bus_plan.collision_count.borrow();
                                 while plan_rx.try_recv().is_ok() {}
                                 continue;
                             }

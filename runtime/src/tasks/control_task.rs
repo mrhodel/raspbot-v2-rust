@@ -269,7 +269,11 @@ pub fn spawn_control_task(
                                 // shoulder has < 15 cm to spare — spinning sweeps the robot
                                 // body into the wall even when rotating away from it (crash 9).
                                 const SPIN_THRESHOLD_RAD: f32 = 0.35; // ~20°
-                                const SAFE_SPIN_CLEARANCE_M: f32 = 0.15;
+                                // Raised from 0.15 to 0.20 m: crash 12 had nearest=0.31 m
+                                // (0.01 m above old threshold) → full-speed backup → 0.354 m
+                                // into rear wall at 1.18 s.  0.35 m threshold catches these
+                                // borderline cases; slow/short backup (0.09 m max) stays safe.
+                                const SAFE_SPIN_CLEARANCE_M: f32 = 0.20;
                                 let safe_to_spin = nearest >= obstacle_stop_m + SAFE_SPIN_CLEARANCE_M;
                                 backup_escape_omega = if !safe_to_spin {
                                     0.0 // too close — straight backup only
@@ -286,16 +290,25 @@ pub fn spawn_control_task(
                                 // forward-only US can't see rear obstacles.  At -0.30 m/s
                                 // the robot travels 0.36 m in 1.2 s; at -0.15 m/s it
                                 // travels only 0.18 m, staying clear of corner rear walls.
+                                // Proximity zone: half speed AND shorter duration.
+                                // At -0.15 m/s for 1200 ms = 0.18 m max travel;
+                                // crash 12 had rear gap ≈ 0.125 m → crash at 0.836 s.
+                                // 600 ms → 0.09 m < 0.125 m (35 mm margin).
+                                // 0.09 m + nearest(0.28) = 0.37 m > clear_hysteresis(0.30)
+                                // so obstacle_stopped clears via hysteresis after backup.
                                 backup_escape_vx = if safe_to_spin { -0.30 } else { -0.15 };
+                                let backup_ms = if safe_to_spin { 1200 } else { 600 };
                                 warn!(
                                     nearest_m = nearest,
                                     nearest_angle_deg = nearest_angle.to_degrees(),
                                     backup_escape_omega,
+                                    backup_escape_vx,
+                                    backup_ms,
                                     us_m = latest_us_m,
-                                    "Control: obstacle stuck for 3 s — backing up with rotation"
+                                    "Control: obstacle stuck for 3 s — backing up"
                                 );
                                 backup_until = Some(std::time::Instant::now()
-                                    + Duration::from_millis(1200));
+                                    + Duration::from_millis(backup_ms));
                                 cam_obstacle_stopped_since = None;
                                 clear_since = None;
                             }
