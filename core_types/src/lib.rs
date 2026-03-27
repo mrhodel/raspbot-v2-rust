@@ -203,7 +203,7 @@ pub struct Path {
 }
 
 /// Velocity command output by the pure-pursuit controller.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct CmdVel {
     pub t_ms: Ms,
     pub vx: f32,    // forward m/s equivalent (scaled to duty cycle later)

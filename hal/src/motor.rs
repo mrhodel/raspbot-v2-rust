@@ -135,20 +135,34 @@ impl MotorController for YahboomMotorController {
         let rr = cmd.rr.clamp(-self.max_duty, self.max_duty);
         debug!(fl, fr, rl, rr, "YahboomMotor: send_command");
 
-        // Board order: FL(0), RL(1), FR(2), RR(3)
+        // Board order: FL(0), RL(1), FR(2), RR(3).
+        // Use best-effort writes: log errors but always attempt all four motors.
+        // Early-exit via `?` would leave later motors at their previous speed
+        // (e.g. one wheel spinning after a rotation command when the zero-stop
+        // I2C write fails on the last motor).
+        let mut last_err: Option<anyhow::Error> = None;
         for (motor_id, duty) in [(M_FL, fl), (M_RL, rl), (M_FR, fr), (M_RR, rr)] {
-            self.write_motor(motor_id, duty)?;
+            if let Err(e) = self.write_motor(motor_id, duty) {
+                warn!("Motor write id={motor_id} duty={duty} failed: {e}");
+                last_err = Some(e);
+            }
             tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
         }
+        if let Some(e) = last_err { return Err(e); }
         Ok(())
     }
 
     async fn emergency_stop(&mut self) -> Result<()> {
         warn!("YahboomMotor: EMERGENCY STOP");
+        let mut last_err: Option<anyhow::Error> = None;
         for motor_id in [M_FL, M_RL, M_FR, M_RR] {
-            self.write_motor(motor_id, 0)?;
+            if let Err(e) = self.write_motor(motor_id, 0) {
+                warn!("Emergency stop write id={motor_id} failed: {e}");
+                last_err = Some(e);
+            }
             tokio::time::sleep(Duration::from_millis(INTER_WRITE_MS)).await;
         }
+        if let Some(e) = last_err { return Err(e); }
         Ok(())
     }
 }

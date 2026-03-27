@@ -16,15 +16,18 @@
 //! See requirements_v3.md §6 for interface contracts (VisualDelta, Pose2D,
 //! KeyframeEvent, confidence metric).
 
-use core_types::{ImuSample, Pose2D};
+use core_types::{CmdVel, ImuSample, Pose2D};
 use std::f32::consts::TAU;
 
 /// Integrates IMU gyro_z at a fixed rate to estimate heading.
+/// Also integrates motor feedforward velocity (set via `set_velocity`) into x,y.
 pub struct ImuDeadReckon {
     pose: Pose2D,
     t0: std::time::Instant,
     last_t_ms: Option<u64>,
     gz_bias: f32,
+    vel_fwd_m_s: f32,
+    vel_lat_m_s: f32,
 }
 
 impl ImuDeadReckon {
@@ -38,7 +41,20 @@ impl ImuDeadReckon {
             t0: std::time::Instant::now(),
             last_t_ms: None,
             gz_bias,
+            vel_fwd_m_s: 0.0,
+            vel_lat_m_s: 0.0,
         }
+    }
+
+    /// Set the current motor feedforward velocity for x,y integration.
+    ///
+    /// `scale_m_s` = `(max_motor_duty / 100) × kinematics.forward_speed_m_s`.
+    /// Called by the runtime each IMU tick with the velocity last applied to
+    /// the motors, so x,y is integrated consistently with actual wheel motion.
+    pub fn set_velocity(&mut self, cmd: &CmdVel, scale_m_s: f32) {
+        const MAX_VX: f32 = 0.3; // matches cmdvel_to_motor / PurePursuitController
+        self.vel_fwd_m_s = (cmd.vx / MAX_VX).clamp(-1.0, 1.0) * scale_m_s;
+        self.vel_lat_m_s = (cmd.vy / MAX_VX).clamp(-1.0, 1.0) * scale_m_s;
     }
 
     /// Update pose from one IMU sample. Returns the new Pose2D.
@@ -50,6 +66,10 @@ impl ImuDeadReckon {
             self.pose.theta_rad += (sample.gyro_z - self.gz_bias) * dt_s;
             // Normalise to (-π, π].
             self.pose.theta_rad = wrap_angle(self.pose.theta_rad);
+            // Integrate motor feedforward velocity into x,y (robot frame → world frame).
+            let (sin_h, cos_h) = self.pose.theta_rad.sin_cos();
+            self.pose.x_m += (self.vel_fwd_m_s * cos_h - self.vel_lat_m_s * sin_h) * dt_s;
+            self.pose.y_m += (self.vel_fwd_m_s * sin_h + self.vel_lat_m_s * cos_h) * dt_s;
         }
 
         self.last_t_ms = Some(sample.t_ms);

@@ -32,6 +32,7 @@ pub fn spawn_control_task(
     obstacle_slow_m: f32,
     obstacle_stop_m: f32,
     mut episode_rx: tokio::sync::watch::Receiver<u32>,
+    min_vx_m_s: f32,
 ) -> tokio::task::JoinHandle<()> {
     const CONTROL_HZ: f64 = 10.0;
     const GOAL_TOLERANCE_M: f32 = 0.25;
@@ -52,8 +53,8 @@ pub fn spawn_control_task(
         const US_SLOW_M: f32 = 0.70;
         const US_STOP_M: f32 = 0.30;
         let mut latest_us_m: f32 = f32::MAX;
-        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.3 m)");
-        let controller = PurePursuitController::with_lookahead(0.3);
+        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.20 m, min_vx {min_vx_m_s:.3} m/s)");
+        let controller = PurePursuitController::with_lookahead(0.20);
         let mut current_path: Option<Path> = None;
         let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / CONTROL_HZ));
         let mut obstacle_stopped = false;
@@ -256,7 +257,7 @@ pub fn spawn_control_task(
                         if backup_until.is_none() && !is_safety_estop {
                             let stuck_since = cam_obstacle_stopped_since
                                 .get_or_insert_with(std::time::Instant::now);
-                            if stuck_since.elapsed() >= Duration::from_secs(3) {
+                            if stuck_since.elapsed() >= Duration::from_millis(1500) {
                                 // Rotate away from the nearest obstacle during backup.
                                 // Obstacle on left (angle > 0) → spin right (omega < 0).
                                 // Only spin when obstacle is clearly to one side (> 20°).
@@ -490,6 +491,12 @@ pub fn spawn_control_task(
                     // to escape forward obstacles. If planning commanded reverse, restore it.
                     if original_vx < 0.0 && cmd_vel.vx < original_vx {
                         cmd_vel.vx = original_vx;
+                    }
+                    // Motor deadband floor: any forward vx below min_vx_m_s maps to less than
+                    // min_motor_duty and gets rounded up by cmdvel_to_motor anyway.  Snap to
+                    // min_vx_m_s so the intended slow speed is explicit, not a silent round-up.
+                    if cmd_vel.vx > 0.0 && cmd_vel.vx < min_vx_m_s {
+                        cmd_vel.vx = min_vx_m_s;
                     }
                     // Also scale omega by us_scale — prevents sweeping the US sensor into an
                     // obstacle while rotating (e.g. omega=0.4 sweeps forward-facing US across

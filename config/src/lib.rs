@@ -23,6 +23,8 @@ pub struct RobotConfig {
     pub perception: PerceptionConfig,
     #[serde(default)]
     pub sim: SimConfig,
+    #[serde(default)]
+    pub kinematics: KinematicsConfig,
 }
 
 impl RobotConfig {
@@ -52,6 +54,8 @@ pub struct HalConfig {
     pub ultrasonic: UltrasonicConfig,
     pub gimbal: GimbalConfig,
     pub camera: CameraConfig,
+    #[serde(default)]
+    pub tof: TofConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +114,36 @@ pub struct CameraConfig {
 
 fn default_true() -> bool { true }
 fn default_stream_port() -> u16 { 8080 }
+
+// ── ToF ───────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TofConfig {
+    #[serde(default = "default_tof_i2c_bus")]
+    pub i2c_bus: u8,
+    #[serde(default = "default_tof_i2c_address")]
+    pub i2c_address: u8,    // 7-bit: 0x29
+    #[serde(default = "default_tof_ranging_mode")]
+    pub ranging_mode: u8,   // 1=short (≤135 cm, fastest), 2=long (≤400 cm)
+    #[serde(default = "default_tof_integration_time_ms")]
+    pub integration_time_ms: u32,
+}
+
+impl Default for TofConfig {
+    fn default() -> Self {
+        Self {
+            i2c_bus:             default_tof_i2c_bus(),
+            i2c_address:         default_tof_i2c_address(),
+            ranging_mode:        default_tof_ranging_mode(),
+            integration_time_ms: default_tof_integration_time_ms(),
+        }
+    }
+}
+
+fn default_tof_i2c_bus()             -> u8  { 2 }
+fn default_tof_i2c_address()         -> u8  { 0x29 }
+fn default_tof_ranging_mode()        -> u8  { 1 }
+fn default_tof_integration_time_ms() -> u32 { 5 }
 
 // ── IMU ───────────────────────────────────────────────────────────────────────
 
@@ -405,3 +439,29 @@ fn default_midas_model_path() -> String { "models/midas_small.onnx".to_string() 
 fn default_depth_out_width()  -> u32    { 32 }
 fn default_depth_out_height() -> u32    { 32 }
 fn default_num_threads()      -> usize  { 4 }
+
+// ── Kinematics ────────────────────────────────────────────────────────────────
+
+/// Measured physical speed constants.  Used by SLAM to integrate motor
+/// feedforward velocity into the x,y position estimate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KinematicsConfig {
+    /// Maximum forward speed at 100% motor duty (m/s). Measured on real hardware.
+    #[serde(default = "default_forward_speed_m_s")]
+    pub forward_speed_m_s: f32,
+    /// Maximum rotation rate at 100% motor duty (rad/s). Measured on real hardware.
+    #[serde(default = "default_rotation_rate_rad_s")]
+    pub rotation_rate_rad_s: f32,
+}
+
+impl Default for KinematicsConfig {
+    fn default() -> Self {
+        Self {
+            forward_speed_m_s:   default_forward_speed_m_s(),
+            rotation_rate_rad_s: default_rotation_rate_rad_s(),
+        }
+    }
+}
+
+fn default_forward_speed_m_s()   -> f32 { 1.61 }
+fn default_rotation_rate_rad_s() -> f32 { 13.7 }

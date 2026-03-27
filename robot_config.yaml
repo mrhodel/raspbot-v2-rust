@@ -73,6 +73,15 @@ hal:
     # Perception computes mask_start_row = height - body_mask_bottom_rows.
     body_mask_bottom_rows: 0
 
+  tof:
+    # VL53L8CX on bit-banged I2C bus 4 (GPIO 12=SDA, GPIO 13=SCL).
+    # Enable in /boot/firmware/config.txt:
+    #   dtoverlay=i2c-gpio,bus=4,i2c_gpio_sda=12,i2c_gpio_scl=13,i2c_gpio_delay_us=2
+    i2c_bus: 4
+    i2c_address: 0x29      # 7-bit (= 0x52 write / 0x53 read in 8-bit notation)
+    ranging_mode: 1        # 1=short ≤135 cm (fastest, 5 ms budget), 2=long ≤400 cm
+    integration_time_ms: 5 # measurement time budget (5 ms → up to 60 Hz)
+
 # ── Perception ────────────────────────────────────────────────────
 perception:
   midas_model_path: models/midas_small.onnx

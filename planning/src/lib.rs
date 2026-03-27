@@ -22,10 +22,13 @@ use tracing::{debug, warn};
 /// Used when calling `plan()`; use `plan_with_clearance()` to override.
 const CLEARANCE_CELLS: i32 = 7;
 
-/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 10 cells = 50 cm).
+/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 15 cells = 75 cm).
 /// Pure-pursuit lookahead handles sub-waypoint tracking; sparser waypoints mean longer
 /// path segments per replan cycle and fewer artificial pauses.
-const WAYPOINT_STEP: usize = 10;
+/// 15 cells (75 cm) vs the old 10 cells (50 cm): at 0.20 m lookahead the robot snaps to
+/// each waypoint individually (decelerate-turn-accelerate), so wider spacing reduces the
+/// frequency of visible direction changes ("drunk" navigation) from once/1.7 s to once/2.5 s.
+const WAYPOINT_STEP: usize = 15;
 
 /// Maximum A* nodes to expand before giving up.
 /// The robot's reachable connected component is typically 10 000–20 000 cells

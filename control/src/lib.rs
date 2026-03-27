@@ -18,7 +18,7 @@ use core_types::{CmdVel, Path, Pose2D};
 /// Default lookahead distance (metres).
 const DEFAULT_LOOKAHEAD_M: f32 = 0.3;
 /// Maximum forward speed equivalent (will be scaled to duty-cycle by HAL).
-const MAX_VX: f32 = 0.3;
+pub const MAX_VX: f32 = 0.3;
 /// Maximum angular rate (rad/s equivalent).
 const MAX_OMEGA: f32 = 1.5;
 

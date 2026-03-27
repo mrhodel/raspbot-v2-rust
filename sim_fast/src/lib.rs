@@ -395,7 +395,7 @@ impl FastSim {
     }
 
 
-    /// Cast a VL53L5CX ToF sensor scan: 8 column-averaged rays across ±19.69°,
+    /// Cast a VL53L8CX ToF sensor scan: 8 column-averaged rays across ±19.69°,
     /// panned to `pan_deg`.  Same pan convention as `cast_lidar_pan`.
     ///
     /// Column centres (robot frame): `(col − 3.5) × 5.625°` for col in 0..8.
