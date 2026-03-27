@@ -12,6 +12,7 @@ pub mod gimbal;
 pub mod imu;
 pub mod mjpeg;
 pub mod motor;
+pub mod tof;
 pub mod ultrasonic;
 
 // Re-export trait and stub types at crate root for convenience.
@@ -23,4 +24,7 @@ pub use imu::{Imu, StubImu};
 #[cfg(feature = "mpu6050")]
 pub use imu::Mpu6050Imu;
 pub use motor::{MotorController, StubMotorController, YahboomMotorController};
+pub use tof::{Tof, StubTof};
+#[cfg(feature = "vl53l8cx")]
+pub use tof::Vl53l8cxTof;
 pub use ultrasonic::{Ultrasonic, StubUltrasonic, YahboomUltrasonic};

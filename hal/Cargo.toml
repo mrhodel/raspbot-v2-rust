@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-# usb-camera: real V4L2 driver (requires libclang on build host, Linux V4L2 headers)
-# mpu6050:    real MPU-6050 driver via rppal I2C (Pi only)
+# usb-camera:  real V4L2 driver (requires libclang on build host)
+# mpu6050:     real MPU-6050 driver via rppal I2C (Pi only)
+# vl53l8cx:    real VL53L8CX ToF via C ULD wrapper (cross-compiled with cc crate)
 # Dev-machine: cargo check --no-default-features
-default    = ["usb-camera", "mpu6050"]
+default    = ["usb-camera", "mpu6050", "vl53l8cx"]
 usb-camera = ["dep:v4l"]
 mpu6050    = []
+vl53l8cx   = []
 
 [dependencies]
 core_types  = { workspace = true }
@@ -21,6 +23,9 @@ tracing     = { workspace = true }
 image       = { workspace = true }
 rppal       = "0.19"
 v4l         = { version = "0.14", optional = true }
+
+[build-dependencies]
+cc = "1"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

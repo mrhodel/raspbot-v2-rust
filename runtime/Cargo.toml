@@ -10,10 +10,11 @@ path = "src/main.rs"
 # Feature flags mirror hal's hardware features.
 # Dev machines without libclang/ORT: cargo check/run --no-default-features
 [features]
-default     = ["usb-camera", "mpu6050", "onnx"]
-usb-camera  = ["hal/usb-camera"]        # real V4L2 camera (requires libclang on build host)
-mpu6050     = ["hal/mpu6050"]           # real MPU-6050 IMU
-onnx        = ["perception/onnx"]       # real MiDaS inference (requires ORT .so at runtime)
+default     = ["usb-camera", "mpu6050", "vl53l8cx", "onnx"]
+usb-camera  = ["hal/usb-camera"]  # real V4L2 camera (requires libclang on build host)
+mpu6050     = ["hal/mpu6050"]     # real MPU-6050 IMU
+vl53l8cx    = ["hal/vl53l8cx"]   # real VL53L8CX ToF (C ULD, cross-compiled via cc crate)
+onnx        = ["perception/onnx"] # real MiDaS inference (requires ORT .so at runtime)
 
 [dependencies]
 core_types         = { workspace = true }

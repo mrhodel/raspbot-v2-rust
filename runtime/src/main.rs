@@ -27,14 +27,16 @@ use config::RobotConfig;
 use core_types::{CmdVel, ExecutiveState, FrontierChoice, MotorCommand, SafetyState};
 use executive::Executive;
 use hal::{
-    Camera, Gimbal, Imu, MotorController, Ultrasonic,
-    StubCamera, StubGimbal, StubImu, StubMotorController, StubUltrasonic,
+    Camera, Gimbal, Imu, MotorController, Tof, Ultrasonic,
+    StubCamera, StubGimbal, StubImu, StubMotorController, StubTof, StubUltrasonic,
     YahboomGimbal, YahboomMotorController, YahboomUltrasonic,
 };
 #[cfg(feature = "usb-camera")]
 use hal::V4L2Camera;
 #[cfg(feature = "mpu6050")]
 use hal::Mpu6050Imu;
+#[cfg(feature = "vl53l8cx")]
+use hal::Vl53l8cxTof;
 use mapping::Mapper;
 use micro_slam::ImuDeadReckon;
 use perception::{DepthInference, EventGate, PseudoLidarExtractor};
@@ -181,7 +183,24 @@ async fn main() -> anyhow::Result<()> {
         Box::new(StubGimbal::new(cfg.hal.gimbal.tilt_neutral))
     };
 
+    let tof: Box<dyn Tof> = {
+        #[cfg(feature = "vl53l8cx")]
+        {
+            let tc = &cfg.hal.tof;
+            match Vl53l8cxTof::new(tc.i2c_bus, tc.i2c_address, tc.ranging_mode, tc.integration_time_ms) {
+                Ok(t)  => { info!("ToF: VL53L8CX on /dev/i2c-{}", tc.i2c_bus); Box::new(t) as Box<dyn Tof> }
+                Err(e) => { warn!("ToF: VL53L8CX unavailable ({e:#}), using stub"); Box::new(StubTof::new()) }
+            }
+        }
+        #[cfg(not(feature = "vl53l8cx"))]
+        {
+            info!("ToF: stub (vl53l8cx feature disabled)");
+            Box::new(StubTof::new())
+        }
+    };
+
     let max_motor_duty = cfg.hal.motor.max_speed as i8;
+    let min_motor_duty = cfg.robot.min_speed as i8;
     info!("HAL initialised");
 
     // Early exit for modes that don't need the full autonomy stack.
@@ -210,8 +229,12 @@ async fn main() -> anyhow::Result<()> {
     info!("Perception pipeline initialised");
 
     // ── Micro-SLAM ────────────────────────────────────────────────────────────
+    // Scale factor converts normalised CmdVel (range ±1.0) to physical m/s.
+    // max_motor_duty caps the normalised wheel speed; kinematics.forward_speed_m_s
+    // is the measured top speed at 100% duty.
+    let vel_scale = (max_motor_duty as f32 / 100.0) * cfg.kinematics.forward_speed_m_s;
     let mut slam = ImuDeadReckon::with_gz_bias(cfg.imu.gz_bias);
-    info!(gz_bias = cfg.imu.gz_bias, "Micro-SLAM initialised (IMU dead-reckoning)");
+    info!(gz_bias = cfg.imu.gz_bias, vel_scale, "Micro-SLAM initialised (IMU dead-reckoning + motor feedforward)");
 
     // ── Mapper (shared: mapping task writes, planning task reads) ─────────────
     let mapper = Arc::new(RwLock::new(Mapper::new()));
@@ -399,17 +422,62 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // ── ToF task ──────────────────────────────────────────────────────────────
+    // Reads VL53L8CX 8×8 scans at up to 60 Hz and publishes:
+    //   • nearest_obstacle_m / nearest_obstacle_angle_rad — used by the control
+    //     task for reactive speed scaling (replaces noisy MiDaS on real hardware).
+    //   • vision_pseudo_lidar — same PseudoLidarScan format as MiDaS, so the
+    //     mapping task automatically ingests ToF data alongside MiDaS scans.
+    let bus_tof = Arc::clone(&bus);
+    let mut tof = tof;
+    let tof_handle = tokio::spawn(async move {
+        info!("ToF task started (VL53L8CX ±19.69° forward arc)");
+        loop {
+            match tof.read_scan().await {
+                Ok(scan) => {
+                    // Nearest obstacle across all rays.
+                    let (nearest_m, nearest_angle_rad) = scan.rays.iter()
+                        .fold((f32::MAX, 0.0_f32), |(min_r, min_a), r| {
+                            if r.range_m < min_r { (r.range_m, r.angle_rad) } else { (min_r, min_a) }
+                        });
+                    let nearest_m = if nearest_m == f32::MAX { 3.0 } else { nearest_m };
+                    // Only override nearest_obstacle_m if ToF sees something CLOSER than
+                    // the current MiDaS reading.  MiDaS (wide FOV) is the baseline owner;
+                    // ToF (narrow ±20°, precise) overrides only when it detects an imminent
+                    // forward obstacle.  This prevents the 20 Hz ToF open-space value (3.0m)
+                    // from washing out MiDaS detections at wider angles.
+                    let current_nearest = *bus_tof.nearest_obstacle_m.borrow();
+                    if nearest_m < current_nearest {
+                        let _ = bus_tof.nearest_obstacle_m.send(nearest_m);
+                        let _ = bus_tof.nearest_obstacle_angle_rad.send(nearest_angle_rad);
+                    }
+                }
+                Err(e) => tracing::error!("ToF error: {e}"),
+            }
+        }
+    });
+
+    // Depth MJPEG server (port+1 = 8081, mirrors sim setup).
+    if cfg.hal.camera.stream_enabled {
+        let depth_tx = bus.vision_depth.clone();
+        let depth_port = cfg.hal.camera.stream_port + 1;
+        tokio::spawn(hal::mjpeg::run_depth_server(depth_port, depth_tx));
+        info!("Depth MJPEG stream → http://0.0.0.0:{depth_port}/");
+    }
+
     // ── SLAM task (IMU-only, runs independently of depth inference) ──────────
     // Kept separate so that the 147ms depth inference does not starve IMU
     // integration: heading would freeze during every inference frame if both
     // were in the same select! loop.
-    let bus_slam   = Arc::clone(&bus);
-    let mut rx_imu = bus.imu_raw.subscribe();
+    let bus_slam        = Arc::clone(&bus);
+    let mut rx_imu      = bus.imu_raw.subscribe();
+    let rx_eff_vel      = bus.effective_cmd_vel.subscribe();
     let slam_handle = tokio::spawn(async move {
-        info!("SLAM task started (IMU dead-reckoning)");
+        info!("SLAM task started (IMU dead-reckoning + motor feedforward)");
         loop {
             match rx_imu.recv().await {
                 Ok(sample) => {
+                    slam.set_velocity(&rx_eff_vel.borrow(), vel_scale);
                     let pose = slam.update(&sample);
                     let _ = bus_slam.slam_pose2d.send(pose);
                 }
@@ -474,8 +542,15 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
+                                // Publish MiDaS nearest obstacle too: ToF covers ±20° forward
+                                // only, MiDaS provides wider FOV coverage for the safety channels.
+                                // Rolling-min (near_m_min) prevents single noisy far readings
+                                // from causing false clears.
                                 let _ = bus_perc.nearest_obstacle_m.send(near_m_min);
-                                let _ = bus_perc.nearest_obstacle_angle_rad.send(near_angle_rad);
+                                // Reset angle to 0 when clear so the orange dot doesn't
+                                // float at a stale angle when nearest_m returns to 3.0m.
+                                let publish_angle = if near_m_min >= 3.0 { 0.0 } else { near_angle_rad };
+                                let _ = bus_perc.nearest_obstacle_angle_rad.send(publish_angle);
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }
@@ -523,6 +598,12 @@ async fn main() -> anyhow::Result<()> {
         const MAX_CONSECUTIVE_FAILURES: u32 = 15;
         let mut consecutive_failures: u32 = 0;
         let mut no_frontier_streak: u32 = 0;
+        // Counts how many times the "pre-arm guard" (cells < 10 000) has cleared the
+        // blacklist.  If this fires repeatedly without the robot making progress, the
+        // robot is physically isolated from all remaining frontiers (tight passages,
+        // US livelock).  After MAX_STUCK_RESETS, give up and stop navigation.
+        const MAX_STUCK_RESETS: u32 = 3;
+        let mut stuck_resets: u32 = 0;
         loop {
             let Some(choice) = plan_rx.recv().await else { break };
             let now = Instant::now();
@@ -530,9 +611,20 @@ async fn main() -> anyhow::Result<()> {
             let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
 
             let pose = *rx_pose_p.borrow_and_update();
+            let reach = {
+                let m = mapper_plan.read().await;
+                let start_cell = m.world_to_cell(pose.x_m, pose.y_m);
+                reachable_set(&m, start_cell, 5, 50_000)
+            };
+            let raw_frontiers: Vec<core_types::Frontier> = {
+                let m = mapper_plan.read().await;
+                m.last_frontiers.clone()
+            };
+            let annotated = annotate_frontiers(&raw_frontiers, &reach, &bl, &[], last_goal, &pose);
+            let _ = bus_plan.map_frontier_annotations.send(annotated);
             let maybe_goal = {
                 let m = mapper_plan.read().await;
-                select_frontier_goal(&m, &choice, &pose, &bl, None, last_goal)
+                select_frontier_goal(&m, &choice, &pose, &bl, Some(&reach), last_goal)
             };
             if let Some(goal) = maybe_goal {
                 no_frontier_streak = 0;
@@ -563,9 +655,12 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
                 // Don't interrupt an active path with a different goal.
-                // 3 s is enough to protect a path in flight; goals are reached in
+                // 2 s is enough to protect a path in flight; goals are reached in
                 // 2-7 s so the window expires shortly after arrival.
-                const PATH_COMMIT_S: u64 = 3;
+                // Reduced from 3 s: the 3-second "frontier update delay" observed in the UI
+                // was this window — the goal annotation doesn't change until PATH_COMMIT_S
+                // expires after the previous goal was reached.
+                const PATH_COMMIT_S: u64 = 2;
                 let goal_matches_last = last_goal.map_or(false, |lg| {
                     let dx = lg[0] - goal[0]; let dy = lg[1] - goal[1];
                     (dx*dx + dy*dy).sqrt() < 0.25
@@ -615,7 +710,13 @@ async fn main() -> anyhow::Result<()> {
                         info!(no_frontier_streak, cells, "Exploration complete — no reachable frontiers remaining");
                         break; // motor watchdog stops the robot
                     }
-                    warn!(no_frontier_streak, cells,
+                    stuck_resets += 1;
+                    if stuck_resets >= MAX_STUCK_RESETS {
+                        warn!(stuck_resets, cells,
+                            "Planning: robot isolated from all frontiers — stopping navigation");
+                        break; // motor watchdog stops the robot
+                    }
+                    warn!(no_frontier_streak, cells, stuck_resets,
                         "Planning: frontier streak reset (cells < {MIN_CELLS_FOR_DONE}, likely pre-arm)");
                     no_frontier_streak = 0;
                     goal_blacklist.clear();
@@ -632,14 +733,12 @@ async fn main() -> anyhow::Result<()> {
     // Real mode has no episode reset; pass a dummy watch whose sender is dropped
     // so the episode arm in spawn_control_task never fires.
     let (_episode_dummy_tx, episode_dummy_rx) = tokio::sync::watch::channel(0u32);
-    // MiDaS obstacle avoidance disabled for real mode (f32::MAX thresholds = never triggered).
-    // On real hardware MiDaS readings are too noisy for reactive stopping — the rolling min
-    // consistently reads 0.1–0.5m on clear paths, causing constant false stops.
-    // US (70 cm slow, 30 cm stop) is the sole reactive obstacle sensor in real mode.
-    // MiDaS still feeds the occupancy map / frontier selector via PseudoLidar.
-    // obstacle_slow_m=0.0: `nearest >= 0.0` is always true → base_scale=1.0 → MiDaS never stops.
-    // US (70 cm slow, 30 cm stop) is the sole reactive obstacle sensor in real mode.
-    let ctrl_handle = spawn_control_task(Arc::clone(&bus), control_path_rx, 0.0, 0.0, episode_dummy_rx);
+    // ToF reactive avoidance: 0.70 m slow zone, 0.25 m hard stop.
+    // The ToF task publishes to nearest_obstacle_m at up to 60 Hz (much faster than
+    // MiDaS at ~3 Hz), giving the control task clean metric readings for speed scaling.
+    // US (70 cm slow, 30 cm stop) provides an independent forward-facing interlock.
+    let min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * control::MAX_VX;
+    let ctrl_handle = spawn_control_task(Arc::clone(&bus), control_path_rx, 0.70, 0.25, episode_dummy_rx, min_vx);
 
     // ── Motor execution task ──────────────────────────────────────────────────
     // Drains both the safety motor_command channel and the controller cmdvel
@@ -655,6 +754,7 @@ async fn main() -> anyhow::Result<()> {
     let rx_exec_m         = bus.executive_state.subscribe();
     let rx_safety_m       = bus.safety_state.subscribe();
     let mut manual_rx_m   = bus.manual_cmd_vel.subscribe();
+    let bus_motor         = Arc::clone(&bus);
     let (motor_shutdown_tx, mut motor_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let motor_handle = tokio::spawn(async move {
         info!("Motor execution task started (disarmed — send SIGUSR1 to arm)");
@@ -676,6 +776,7 @@ async fn main() -> anyhow::Result<()> {
                 // CmdVel-suppressed WARN on every subsequent 10 Hz CmdVel.
                 cmd = motor_cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break };
+                    let _ = bus_motor.effective_cmd_vel.send(CmdVel::default());
                     if let Err(e) = motor.send_command(cmd).await {
                         error!("Motor error (safety): {e}");
                     }
@@ -697,7 +798,8 @@ async fn main() -> anyhow::Result<()> {
                     );
                     if armed && safe {
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty);
+                        let _ = bus_motor.effective_cmd_vel.send(cmd_vel);
+                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor error (ctrl): {e}");
                         }
@@ -710,6 +812,7 @@ async fn main() -> anyhow::Result<()> {
                             warn!(armed, safe, "Motor task: CmdVel suppressed — zeroing motors");
                             watchdog_logged = true;
                         }
+                        let _ = bus_motor.effective_cmd_vel.send(CmdVel::default());
                         if let Err(e) = motor.send_command(MotorCommand::stop(0)).await {
                             error!("Motor suppressed-stop failed: {e}");
                         }
@@ -720,7 +823,8 @@ async fn main() -> anyhow::Result<()> {
                     if matches!(*rx_exec_m.borrow(), ExecutiveState::ManualDrive) {
                         let vel = *manual_rx_m.borrow_and_update();
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty);
+                        let _ = bus_motor.effective_cmd_vel.send(vel);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor error (manual): {e}");
                         }
@@ -735,7 +839,8 @@ async fn main() -> anyhow::Result<()> {
                     if matches!(state, ExecutiveState::ManualDrive) {
                         // Re-send held velocity so keys feel responsive.
                         let vel = *manual_rx_m.borrow();
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty);
+                        let _ = bus_motor.effective_cmd_vel.send(vel);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor watchdog manual error: {e}");
                         }
@@ -752,6 +857,7 @@ async fn main() -> anyhow::Result<()> {
                             }
                             watchdog_logged = true;
                         }
+                        let _ = bus_motor.effective_cmd_vel.send(CmdVel::default());
                         if let Err(e) = motor.send_command(MotorCommand::stop(0)).await {
                             error!("Motor watchdog stop failed: {e}");
                         }
@@ -782,8 +888,7 @@ async fn main() -> anyhow::Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Threshold below which we track the obstacle instead of sweeping open.
-        // Matches clear_hysteresis_m (2× obstacle_stop_m) used by control task.
-        let danger_m = cfg.sim.obstacle_stop_m * 4.0; // 0.60 m
+        const GIMBAL_DANGER_M: f32 = 0.60; // m — track obstacles within this distance
         loop {
             interval.tick().await;
             let mut closed = false;
@@ -796,16 +901,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if closed { break; }
-            // When a nearby obstacle is within danger_m, point ToF toward it so
-            // it gets an accurate metric reading instead of looking at the open side.
+            // When a nearby obstacle is within GIMBAL_DANGER_M, point camera toward
+            // it for an accurate reading instead of sweeping the open side.
             let nearest_m   = *rx_nearest_g.borrow();
             let near_ang_deg = rx_near_angle_g.borrow().to_degrees();
-            // When a nearby obstacle is within danger_m, point ToF toward it so it
+            // When a nearby obstacle is within GIMBAL_DANGER_M, point ToF toward it so it
             // gets an accurate metric reading.  Exception: if the obstacle is primarily
             // to the side (> 30°), look forward instead — the forward wall is invisible
             // to ToF when the pan tracks a side obstacle, and pseudo-lidar covers ±55°
             // anyway.  This prevents crashes when obstacles are on both sides at corners.
-            let danger_angle = if nearest_m < danger_m {
+            let danger_angle = if nearest_m < GIMBAL_DANGER_M {
                 if near_ang_deg.abs() > 30.0 { Some(0.0_f32) } else { Some(near_ang_deg) }
             } else {
                 None
@@ -820,6 +925,10 @@ async fn main() -> anyhow::Result<()> {
             };
             if let Err(e) = gimbal.set_pan(new_pan).await {
                 warn!("Gimbal pan error: {e}");
+            }
+            // Re-send tilt every tick — servo can drift under gravity if not refreshed.
+            if let Err(e) = gimbal.set_tilt(tilt_home).await {
+                warn!("Gimbal tilt error: {e}");
             }
             let (cur_pan_out, cur_tilt_out) = gimbal.angles();
             let _ = bus_gimbal.gimbal_pan_deg.send(cur_pan_out);
@@ -867,6 +976,7 @@ async fn main() -> anyhow::Result<()> {
     drop(cam_handle);
     drop(imu_handle);
     drop(us_handle);
+    drop(tof_handle);
     drop(slam_handle);
     drop(perc_handle);
     drop(map_handle);
@@ -896,7 +1006,12 @@ async fn main() -> anyhow::Result<()> {
 /// Normalises vx/vy by `MAX_VX` and omega by `MAX_OMEGA` (matching the
 /// constants in `control/src/lib.rs`), then applies standard mecanum kinematics.
 /// Preserves wheel ratios when the combined command saturates `max_duty`.
-fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8) -> MotorCommand {
+///
+/// Dead-band: wheels commanded to a non-zero duty below `min_duty` are snapped
+/// up to `min_duty` (preserving sign).  Below this threshold the physical motors
+/// stall; snapping ensures the robot either moves at minimum speed or stops —
+/// matching real hardware behaviour in both real and sim modes.
+fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8, min_duty: i8) -> MotorCommand {
     const MAX_VX:    f32 = 0.3;  // m/s — matches PurePursuitController::MAX_VX
     const MAX_OMEGA: f32 = 1.5;  // rad/s — matches PurePursuitController::MAX_OMEGA
 
@@ -918,12 +1033,18 @@ fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8) -> MotorCommand {
         .fold(1.0_f32, f32::max);
     let scale = max_duty as f32 / max_mag;
 
+    // Apply dead-band: snap non-zero sub-threshold duties to ±min_duty.
+    let db = |d: f32| -> i8 {
+        let v = (d * scale) as i8;
+        if v == 0 { 0 } else if v.abs() < min_duty { min_duty * v.signum() } else { v }
+    };
+
     MotorCommand {
         t_ms: cmd.t_ms,
-        fl: (fl * scale) as i8,
-        fr: (fr * scale) as i8,
-        rl: (rl * scale) as i8,
-        rr: (rr * scale) as i8,
+        fl: db(fl),
+        fr: db(fr),
+        rl: db(rl),
+        rr: db(rr),
     }
 }
 
@@ -1117,6 +1238,65 @@ fn select_frontier_goal(
 }
 
 
+/// Annotate a frontier list with planner-state status codes for the UI display.
+///
+/// Called by both the real-robot and sim planning tasks.  Accepts separate soft
+/// and hard blacklist slices so callers can pass `&[]` for absent lists.
+fn annotate_frontiers(
+    raw_frontiers: &[core_types::Frontier],
+    reach: &std::collections::HashSet<(i32, i32)>,
+    soft_bl: &[[f32; 2]],
+    hard_bl: &[[f32; 2]],
+    last_goal: Option<[f32; 2]>,
+    pose: &core_types::Pose2D,
+) -> Vec<core_types::Frontier> {
+    use core_types::frontier_status as fs;
+    const MIN_FRONTIER_SIZE: u32 = 5;
+    const MIN_GOAL_DIST:     f32 = 0.75;
+    const BLACKLIST_RADIUS:  f32 = 0.60;
+    const RES:               f32 = 0.05;
+
+    raw_frontiers.iter().map(|f| {
+        let dist = {
+            let dx = f.centroid_x_m - pose.x_m;
+            let dy = f.centroid_y_m - pose.y_m;
+            (dx * dx + dy * dy).sqrt()
+        };
+        let is_goal = last_goal.map_or(false, |g| {
+            (f.centroid_x_m - g[0]).abs() < 0.15
+                && (f.centroid_y_m - g[1]).abs() < 0.15
+        });
+        let bl_min = |bl: &[[f32; 2]]| -> f32 {
+            bl.iter().map(|b| {
+                let bx = f.centroid_x_m - b[0];
+                let by = f.centroid_y_m - b[1];
+                (bx * bx + by * by).sqrt()
+            }).fold(f32::INFINITY, f32::min)
+        };
+        let fcx = (f.centroid_x_m / RES).floor() as i32;
+        let fcy = (f.centroid_y_m / RES).floor() as i32;
+        let reachable = (-8_i32..=8).any(|ddx| {
+            (-8_i32..=8).any(|ddy| reach.contains(&(fcx + ddx, fcy + ddy)))
+        });
+        let status = if is_goal {
+            fs::CURRENT_GOAL
+        } else if f.size_cells < MIN_FRONTIER_SIZE {
+            fs::TOO_SMALL
+        } else if !reachable {
+            fs::UNREACHABLE
+        } else if bl_min(hard_bl) < BLACKLIST_RADIUS {
+            fs::HARD_BLACKLISTED
+        } else if bl_min(soft_bl) < BLACKLIST_RADIUS {
+            fs::SOFT_BLACKLISTED
+        } else if dist < MIN_GOAL_DIST {
+            fs::TOO_CLOSE
+        } else {
+            fs::NORMAL
+        };
+        core_types::Frontier { status, ..*f }
+    }).collect()
+}
+
 //
 // Reads from `bus.ultrasonic`, evaluates each reading against `emergency_stop_cm`,
 // latches EmergencyStop for 5 s on a trip, and spawns an escape reverse maneuver.
@@ -1179,6 +1359,7 @@ fn print_sim_summary(stats: &SimRunStats, bus: &bus::Bus) {
     let n_timeout   = rooms.iter().filter(|r| r.reason == "timeout").count();
     let n_cascade   = rooms.iter().filter(|r| r.reason == "cascade").count();
     let n_isolated  = rooms.iter().filter(|r| r.reason == "isolated").count();
+    let n_bl_stuck  = rooms.iter().filter(|r| r.reason == "hard_bl_isolated").count();
     let n_reset     = rooms.iter().filter(|r| r.reason == "reset").count();
 
     let complete_times: Vec<f64> = rooms.iter()
@@ -1220,6 +1401,7 @@ fn print_sim_summary(stats: &SimRunStats, bus: &bus::Bus) {
     sect("ROOM OUTCOMES");
     kv("Explored (complete)", format!("{}", n_complete));
     kv("Timed out",           format!("{}", n_timeout));
+    kv("Phys. blocked exit",  format!("{}", n_bl_stuck));
     kv("Cascade crash exit",  format!("{}", n_cascade));
     kv("Isolated (A* stuck)", format!("{}", n_isolated));
     kv("Episode reset",       format!("{}", n_reset));
@@ -1313,6 +1495,7 @@ async fn run_sim_mode(
     let mut motor: Box<dyn MotorController>  = Box::new(sim_state.motor_controller());
     let mut gimbal: Box<dyn Gimbal>          = Box::new(sim_state.gimbal(&cfg.hal.gimbal));
     let max_motor_duty = cfg.hal.motor.max_speed as i8;
+    let min_motor_duty = cfg.robot.min_speed as i8;
     info!(seed, "Sim HAL initialised");
 
     // ── Perception pipeline ───────────────────────────────────────────────────
@@ -1634,6 +1817,10 @@ async fn run_sim_mode(
             if let Err(e) = gimbal.set_pan(new_pan).await {
                 warn!("Sim gimbal pan error: {e}");
             }
+            // Re-send tilt every tick — keeps it at home if servo drifts.
+            if let Err(e) = gimbal.set_tilt(tilt_home).await {
+                warn!("Sim gimbal tilt error: {e}");
+            }
             let (cur_pan_out, cur_tilt_out) = gimbal.angles();
             let _ = bus_gimbal.gimbal_pan_deg.send(cur_pan_out);
             let _ = bus_gimbal.gimbal_tilt_deg.send(cur_tilt_out);
@@ -1679,7 +1866,7 @@ async fn run_sim_mode(
                     );
                     if armed && safe {
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty);
+                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (ctrl): {e}");
                         }
@@ -1701,7 +1888,7 @@ async fn run_sim_mode(
                     if matches!(*rx_exec_m.borrow(), ExecutiveState::ManualDrive) {
                         let vel = *manual_rx.borrow_and_update();
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (manual): {e}");
                         }
@@ -1712,7 +1899,7 @@ async fn run_sim_mode(
                     if matches!(state, ExecutiveState::ManualDrive) {
                         // In manual drive: re-send held velocity so keys feel responsive.
                         let vel = *manual_rx.borrow();
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor watchdog manual error: {e}");
                         }
@@ -1907,70 +2094,15 @@ async fn run_sim_mode(
             };
 
             // Annotate frontiers with planner state for display.
-            // Each frontier gets a status byte encoding why it is/isn't a candidate.
+            // Clone frontier list quickly then release the lock, then annotate lock-free.
             {
-                use core_types::frontier_status as fs;
-                const MIN_FRONTIER_SIZE: u32 = 5;
-                const MIN_GOAL_DIST: f32     = 0.75;
-                const BLACKLIST_RADIUS: f32  = 0.60;
-
-                let bl: Vec<[f32; 2]> = goal_blacklist.iter()
-                    .chain(hard_blacklist.iter())
-                    .map(|(g, _)| *g)
-                    .collect();
+                let soft_bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
                 let hard_bl: Vec<[f32; 2]> = hard_blacklist.iter().map(|(g, _)| *g).collect();
-
-                // Clone frontier list quickly then release the lock — holding it
-                // across the full annotation loop starves the mapping task's write lock.
                 let raw_frontiers: Vec<core_types::Frontier> = {
                     let m = mapper_plan.read().await;
                     m.last_frontiers.clone()
                 };
-                let annotated: Vec<core_types::Frontier> = raw_frontiers.iter().map(|f| {
-                    let dx = f.centroid_x_m - pose_pre.x_m;
-                    let dy = f.centroid_y_m - pose_pre.y_m;
-                    let dist = (dx * dx + dy * dy).sqrt();
-
-                    let is_goal = last_goal.map_or(false, |g| {
-                        (f.centroid_x_m - g[0]).abs() < 0.15
-                            && (f.centroid_y_m - g[1]).abs() < 0.15
-                    });
-
-                    let bl_dist = |pos: &[[f32; 2]]| -> f32 {
-                        pos.iter().map(|b| {
-                            let dx = f.centroid_x_m - b[0];
-                            let dy = f.centroid_y_m - b[1];
-                            (dx * dx + dy * dy).sqrt()
-                        }).fold(f32::INFINITY, f32::min)
-                    };
-
-                    // reach was computed outside the lock (from the same mapper snapshot).
-                    // We need world_to_cell — use the formula directly: cell = (world / RES) as i32.
-                    const RES: f32 = 0.05;
-                    let fcx = (f.centroid_x_m / RES).floor() as i32;
-                    let fcy = (f.centroid_y_m / RES).floor() as i32;
-                    let reachable = (-8_i32..=8).any(|ddx| {
-                        (-8_i32..=8).any(|ddy| reach.contains(&(fcx + ddx, fcy + ddy)))
-                    });
-
-                    let status = if is_goal {
-                        fs::CURRENT_GOAL
-                    } else if f.size_cells < MIN_FRONTIER_SIZE {
-                        fs::TOO_SMALL
-                    } else if !reachable {
-                        fs::UNREACHABLE
-                    } else if bl_dist(&hard_bl) < BLACKLIST_RADIUS {
-                        fs::HARD_BLACKLISTED
-                    } else if bl_dist(&bl) < BLACKLIST_RADIUS {
-                        fs::SOFT_BLACKLISTED
-                    } else if dist < MIN_GOAL_DIST {
-                        fs::TOO_CLOSE
-                    } else {
-                        fs::NORMAL
-                    };
-
-                    core_types::Frontier { status, ..*f }
-                }).collect();
+                let annotated = annotate_frontiers(&raw_frontiers, &reach, &soft_bl, &hard_bl, last_goal, &pose_pre);
                 let _ = bus_plan.map_frontier_annotations.send(annotated);
             }
 
@@ -2046,11 +2178,44 @@ async fn run_sim_mode(
                             while plan_rx.try_recv().is_ok() {}
                             continue; // back to the outer select! loop
                         }
-                        warn!(no_frontier_streak, cells,
-                            "Planning: frontier streak reset (cells < {MIN_CELLS_FOR_DONE}, likely pre-arm)");
+                        // Two cases:
+                        // A) Pre-arm: robot hasn't moved, soft-blacklisted the spawn
+                        //    scan frontiers.  Clear soft blacklist only.
+                        // B) Physically stuck: A* reaches the frontiers but the robot
+                        //    can't traverse them (US livelock, tight corridor).  Hard
+                        //    entries must NOT be cleared — that causes the endless
+                        //    re-blacklist loop seen when both reachable frontiers are
+                        //    in tight spots.  Instead, if hard_blacklist is non-empty
+                        //    after clearing soft, declare the robot stuck and force a
+                        //    new room after one more streak cycle (streak will hit 5
+                        //    again immediately since all remaining frontiers are hard-BL).
                         goal_blacklist.clear();
-                        hard_blacklist.clear();
                         no_frontier_streak = 0;
+                        if !hard_blacklist.is_empty() {
+                            warn!(no_frontier_streak, cells, hard_bl = hard_blacklist.len(),
+                                "Planning: no reachable frontiers after hard-BL — robot isolated, forcing new room");
+                            { let mut s = stats_plan.lock().unwrap(); s.next_room_reason = Some("hard_bl_isolated"); }
+                            let _ = explore_done_tx_plan.send(()).await;
+                            while plan_rx.try_recv().is_ok() {}
+                            let _ = episode_rx_plan.borrow_and_update();
+                            let _ = episode_rx_plan.changed().await;
+                            let _ = episode_rx_plan.borrow_and_update();
+                            goal_blacklist.clear();
+                            hard_blacklist.clear();
+                            consecutive_failures = 0;
+                            escape_failures = 0;
+                            escape_cycles = 0;
+                            no_frontier_streak = 0;
+                            last_goal = None;
+                            last_path_sent_at = None;
+                            goal_first_sent_at = None;
+                            no_progress_pos = None;
+                            last_crash_plan = *bus_plan.collision_count.borrow();
+                            while plan_rx.try_recv().is_ok() {}
+                            continue;
+                        }
+                        warn!(no_frontier_streak, cells,
+                            "Planning: frontier streak reset (cells < {MIN_CELLS_FOR_DONE}, pre-arm)");
                     }
                     break 'planning;
                 };
@@ -2112,7 +2277,11 @@ async fn run_sim_mode(
                 if goal_matches_last && path_sent_recently {
                     break 'planning;
                 }
-                const PATH_COMMIT_S: u64 = 5;
+                // Reduced from 5 s → 2 s: the "3-second frontier delay" in the UI was this
+                // window — the goal annotation won't change until PATH_COMMIT_S expires.
+                // 2 s still protects active paths (robot takes 2-7 s per goal at 0.3 m/s);
+                // shorter commit means the next frontier is selected faster after goal reach.
+                const PATH_COMMIT_S: u64 = 2;
                 let path_committed = !goal_matches_last
                     && last_path_sent_at.map_or(false, |t| {
                         now.duration_since(t) < std::time::Duration::from_secs(PATH_COMMIT_S)
@@ -2279,8 +2448,9 @@ async fn run_sim_mode(
     });
 
     // ── Control task ──────────────────────────────────────────────────────────
+    let min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * control::MAX_VX;
     spawn_control_task(Arc::clone(&bus), control_path_rx,
-        cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone());
+        cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), min_vx);
 
     // ── Sim tick task ─────────────────────────────────────────────────────────
     // Physics loop at 10 Hz: reads latest motor command + gimbal pan from the
@@ -2441,7 +2611,7 @@ fn spawn_sim_tick_task(
             // metric-accurate and match real-mode threshold values (0.70 / 0.25 m).
             //
             // ToF mode: the 48-ray lidar scan still feeds vision_pseudo_lidar for
-            // mapping (wide FOV needed).  The VL53L5CX 8-ray scan separately drives
+            // mapping (wide FOV needed).  The VL53L8CX 8-ray scan separately drives
             // nearest_obstacle_m / nearest_obstacle_angle_rad with metric-accurate,
             // no-dropout depth — matching the real hardware role of the sensor.
             {
@@ -2473,7 +2643,7 @@ fn spawn_sim_tick_task(
                     let sim = sim_state.sim.lock().await;
                     let mut tof = sim.cast_tof(pan_deg);
                     drop(sim);
-                    // 1.5 cm noise, no dropout (VL53L5CX characteristics).
+                    // 1.5 cm noise, no dropout (VL53L8CX characteristics).
                     for ray in &mut tof.rays {
                         let noise = sim_fast::hal_impls::gaussian(&mut scan_rng, 0.015);
                         if ray.range_m < 3.0 {
@@ -2968,8 +3138,8 @@ async fn run_slam_debug(
                                 }
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
-                                let _ = bus_perc.nearest_obstacle_m.send(near_m);
-                                let _ = bus_perc.nearest_obstacle_angle_rad.send(near_angle_rad);
+                                // nearest_obstacle_m/angle_rad are owned by the ToF task (~20 Hz).
+                                // Do not overwrite from MiDaS (~3 Hz, noisier).
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }

@@ -57,11 +57,12 @@ impl PseudoLidarExtractor {
         let h = depth.height as usize;
         let mask_row = depth.mask_start_row as usize;
         let usable_rows = mask_row.min(h);
-        // Use the top half of usable rows (strictly above the horizon) to
-        // exclude floor pixels.  MiDaS normalises inverse-depth per frame;
-        // floor tiles at ~0.43 m would otherwise pin max_depth ≈ 1.0 and
-        // compress all wall pixel depths toward zero.
-        let upper_rows = (usable_rows / 2).max(1);
+        // Use the top 3/4 of usable rows.  Excluding the bottom quarter avoids
+        // floor pixels dominating the scene mean; the contrast threshold handles
+        // remaining floor discrimination.  Using 3/4 (vs the previous 1/2) lets
+        // low obstacles (short boxes, chair legs) appear in the used region when
+        // the camera is tilted down 25°.
+        let upper_rows = ((usable_rows * 3) / 4).max(1);
 
         // ── Scene mean depth (first pass) ────────────────────────────────────
         // Computed over the same upper region used for ray sampling so that
@@ -85,7 +86,7 @@ impl PseudoLidarExtractor {
         let rays: Vec<LidarRay> = (0..self.num_rays)
             .map(|i| {
                 // Map ray index to horizontal angle (0 = forward, +left / -right).
-                // Standard camera: col 0 = leftmost = left-looking = +HFOV/2.
+                // col 0 = left of image = left of robot frame = +angle.
                 let frac = i as f32 / (self.num_rays - 1).max(1) as f32;
                 let angle_rad = HFOV_RAD * (0.5 - frac);
 

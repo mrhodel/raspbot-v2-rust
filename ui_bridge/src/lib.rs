@@ -430,13 +430,25 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       }
     });
 
-    // Key-hold repeat: re-send held velocity at sim-tick rate (100 ms) so the
-    // motor task always has a fresh command and the robot doesn't stutter.
-    // All keys use the same 100 ms rate — fast H-bridge braking (BRAKE_TAU_S)
-    // keeps rotation fine-grained without needing a separate skip interval.
+    // Key-hold repeat + zero heartbeat: re-send current velocity at 100 ms so
+    // the motor task always has a fresh command.  Sending even when keysDown is
+    // empty (zero velocity) is the critical fix: without it, a missed single
+    // zero command (e.g. transient I2C write failure) leaves one motor spinning
+    // until the next user input — the 500 ms watchdog never fires because the
+    // control task's 10 Hz CmdVel discards keep resetting it in ManualDrive mode.
     setInterval(() => {
-      if (manualMode && ws && keysDown.size > 0) ws.send(manualVelFromKeys());
+      if (manualMode && ws) ws.send(manualVelFromKeys());
     }, 100);
+
+    // If the browser window loses focus while a key is held, the keyup event
+    // never fires and the robot keeps spinning indefinitely.  Zero everything
+    // on blur so the robot stops as soon as focus is lost.
+    window.addEventListener('blur', () => {
+      if (manualMode && keysDown.size > 0) {
+        keysDown.clear();
+        ws && ws.send(manualVelFromKeys()); // sends vel:0,0,0
+      }
+    });
 
     function sendManual() { manualMode = true;  ws && ws.send('manual'); }
     function sendAuto()   { manualMode = false; keysDown.clear(); ws && ws.send('auto'); }
@@ -1058,6 +1070,12 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     let last_ground_truth: Arc<std::sync::Mutex<Option<Arc<String>>>> =
         Arc::new(std::sync::Mutex::new(None));
 
+    // Cache the full occupancy grid (cell → log_odds).  New clients receive the
+    // current map as a single GridDelta snapshot so the map doesn't go blank on
+    // page refresh.
+    let map_cache: Arc<std::sync::Mutex<std::collections::HashMap<(i32,i32), f32>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Sim process start time — sent once to every new client so the browser
     // can compute elapsed time without resetting on refresh or episode reset.
     let sim_start_ms: u64 = std::time::SystemTime::now()
@@ -1135,6 +1153,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     let fanout_agg = Arc::clone(&fanout_tx);
     let bus_agg = Arc::clone(&bus);
     let gt_cache_agg = Arc::clone(&last_ground_truth);
+    let map_cache_agg = Arc::clone(&map_cache);
     tokio::spawn(async move {
         let mut rx_grid       = bus_agg.map_grid_delta.subscribe();
         let mut rx_frontier   = bus_agg.map_frontiers.subscribe();
@@ -1162,6 +1181,12 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                     }
                 }
                 Ok(delta) = rx_grid.recv() => {
+                    // Update the full-map cache so new clients get the current map.
+                    if let Ok(mut cache) = map_cache_agg.lock() {
+                        for &(cx, cy, lo) in &delta.cells {
+                            cache.insert((cx, cy), lo);
+                        }
+                    }
                     if let Ok(msg) = serde_json::to_string(&serde_json::json!({
                         "topic": "map/grid_delta",
                         "t_ms":  delta.t_ms,
@@ -1284,6 +1309,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
     let bus_listener = Arc::clone(&bus);
     let fanout_listener = Arc::clone(&fanout_tx);
     let gt_cache_listener = Arc::clone(&last_ground_truth);
+    let map_cache_listener = Arc::clone(&map_cache);
     let sim_start_json_listener = Arc::clone(&sim_start_json);
     let mut connected: u32 = 0;
     let bytes_sent: u64 = 0;
@@ -1330,6 +1356,21 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                         if let Some(gt) = gt_cache_listener.lock().ok().and_then(|g| g.clone()) {
                             initial.push(gt);
                         }
+                        // Snapshot the full occupancy grid so the client immediately sees
+                        // the current map instead of a blank canvas after page refresh.
+                        if let Ok(cache) = map_cache_listener.lock() {
+                            if !cache.is_empty() {
+                                let cells: Vec<(i32, i32, f32)> =
+                                    cache.iter().map(|(&(cx, cy), &lo)| (cx, cy, lo)).collect();
+                                if let Ok(m) = serde_json::to_string(&serde_json::json!({
+                                    "topic": "map/grid_delta",
+                                    "t_ms":  0u64,
+                                    "data":  { "t_ms": 0u64, "cells": cells },
+                                })) {
+                                    initial.push(Arc::new(m));
+                                }
+                            }
+                        }
                         tokio::spawn(handle_client(stream, rx, initial, bus_listener.bridge_cmd.clone(), bus_listener.manual_cmd_vel.clone()));
 
                         let status = BridgeStatus {
@@ -1355,10 +1396,31 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
 
 /// Serve an HTML page to a plain HTTP client.
 ///
-/// Flushes and half-closes the write side so the OS sends FIN instead of RST
-/// (without this the kernel may reset the connection before all bytes leave
-/// the send buffer, especially when there is unread request data pending).
+/// We must drain the incoming request before closing, otherwise the OS issues a
+/// TCP RST (ERR_CONNECTION_RESET in Chrome) instead of a clean FIN when there
+/// is still unread data in the receive buffer.  Browsers send much larger
+/// requests than curl (many headers, cookies), so the 512-byte peek we use for
+/// URL detection leaves most of the request unread.
 async fn serve_page(mut stream: TcpStream, html: &'static str) {
+    // Drain the rest of the HTTP request (ignore errors — we don't need it).
+    let mut drain = [0u8; 4096];
+    // Read until we see the end of the headers (\r\n\r\n) or run out of data.
+    let mut buf = Vec::with_capacity(4096);
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            stream.peek(&mut drain),
+        ).await {
+            Ok(Ok(n)) if n > 0 => {
+                // Consume the peeked bytes.
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut drain[..n]).await;
+                buf.extend_from_slice(&drain[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+            }
+            _ => break,
+        }
+    }
+
     let body = html.as_bytes();
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
