@@ -1532,8 +1532,13 @@ async fn run_sim_mode(
     let mut motor: Box<dyn MotorController>  = Box::new(sim_state.motor_controller());
     let mut gimbal: Box<dyn Gimbal>          = Box::new(sim_state.gimbal(&cfg.hal.gimbal));
     let max_motor_duty = cfg.hal.motor.max_speed as i8;
-    // min_motor_duty not used in sim — sim has no hardware deadband.
-    // cmdvel_to_motor is called with min_duty=0 in all sim motor paths.
+    // Apply the same deadband as real hardware: any non-zero wheel duty below
+    // min_motor_duty (30) is snapped to min_motor_duty.  Without this, the sim
+    // executes sub-stall speeds (e.g. 0.05 m/s) that the real motors cannot
+    // achieve — the slow-zone in the control task produces duties of 1-29 which
+    // silently stall on hardware.  Replicating the snap makes the sim faithfully
+    // show the same snap-to-minimum-speed behaviour the real robot exhibits.
+    let min_motor_duty = cfg.robot.min_speed as i8;
     info!(seed, "Sim HAL initialised");
 
     // ── Perception pipeline ───────────────────────────────────────────────────
@@ -1904,10 +1909,7 @@ async fn run_sim_mode(
                     );
                     if armed && safe {
                         watchdog_logged = false;
-                        // Sim has no motor deadband — pass min_duty=0 so sub-threshold
-                        // wheel duties are not snapped up, preventing asymmetric lurching
-                        // when vx and omega combine near the deadband threshold.
-                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, 0);
+                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (ctrl): {e}");
                         }
@@ -1929,7 +1931,7 @@ async fn run_sim_mode(
                     if matches!(*rx_exec_m.borrow(), ExecutiveState::ManualDrive) {
                         let vel = *manual_rx.borrow_and_update();
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, 0);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (manual): {e}");
                         }
@@ -1940,7 +1942,7 @@ async fn run_sim_mode(
                     if matches!(state, ExecutiveState::ManualDrive) {
                         // In manual drive: re-send held velocity so keys feel responsive.
                         let vel = *manual_rx.borrow();
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, 0);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor watchdog manual error: {e}");
                         }
