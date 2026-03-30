@@ -277,7 +277,7 @@ pub fn spawn_control_task(
                         if backup_until.is_none() && !is_safety_estop {
                             let stuck_since = cam_obstacle_stopped_since
                                 .get_or_insert_with(std::time::Instant::now);
-                            if stuck_since.elapsed() >= Duration::from_millis(1500) {
+                            if stuck_since.elapsed() >= Duration::from_millis(800) {
                                 // Rotate away from the nearest obstacle during backup.
                                 // Obstacle on left (angle > 0) → spin right (omega < 0).
                                 // Only spin when obstacle is clearly to one side (> 20°).
@@ -546,12 +546,15 @@ pub fn spawn_control_task(
                             && nearest < obstacle_stop_m + DEEP_STOP_MARGIN_M
                             && obs_deg.abs() <= DEEP_STOP_ARC_DEG;
                         // Frozen-in-near-zone: when in_near_zone and combined_scale is
-                        // negligible (< 5%), the robot creeps at ≈ 0 m/s with no obstacle STOP
-                        // ever firing.  Happens when a side obstacle (e.g. 55°) pulls the robot
-                        // to nearest ≈ 16 cm — just above stop_m (15 cm) — via in_near_zone's
-                        // effective_factor=1.0.  STOP now and let deadlock recovery back out.
-                        // Effective stop threshold ≈ stop_m + 0.05×(slow_m - stop_m) ≈ 18 cm.
-                        const NEAR_ZONE_STOP_SCALE: f32 = 0.05;
+                        // negligible (< 25%), the commanded vx falls below the motor deadband
+                        // and cmdvel_to_motor snaps it up to min_duty (30% → 0.484 m/s).
+                        // At that speed the robot would coast past the safety emergency-stop
+                        // threshold (20 cm) before the brakes engage — triggering a 5-second
+                        // latch.  Stop earlier (nearest ≈ stop_m + 0.25×(slow_m−stop_m) ≈ 36 cm
+                        // for real robot) so momentum carries to ~26 cm, well above the 20 cm
+                        // e-stop.  The 0.05 threshold was too low: the robot overshot to 17 cm,
+                        // the safety task fired, and the 5s latch dominated cycle time.
+                        const NEAR_ZONE_STOP_SCALE: f32 = 0.25;
                         let frozen_in_near_zone = in_near_zone && combined_scale < NEAR_ZONE_STOP_SCALE;
 
                         if combined_scale <= 0.0 || deep_near_stop || frozen_in_near_zone {
