@@ -74,10 +74,10 @@ hal:
     body_mask_bottom_rows: 0
 
   tof:
-    # VL53L8CX on bit-banged I2C bus 4 (GPIO 12=SDA, GPIO 13=SCL).
+    # VL53L8CX on hardware I2C2 (/dev/i2c-2, GPIO 4=SDA / GPIO 5=SCL).
     # Enable in /boot/firmware/config.txt:
-    #   dtoverlay=i2c-gpio,bus=4,i2c_gpio_sda=12,i2c_gpio_scl=13,i2c_gpio_delay_us=2
-    i2c_bus: 4
+    #   dtoverlay=i2c2-pi5
+    i2c_bus: 2
     i2c_address: 0x29      # 7-bit (= 0x52 write / 0x53 read in 8-bit notation)
     ranging_mode: 1        # 1=short ≤135 cm (fastest, 5 ms budget), 2=long ≤400 cm
     integration_time_ms: 5 # measurement time budget (5 ms → up to 60 Hz)
@@ -120,8 +120,7 @@ navigation:
     smoothing_iterations: 3
 
   controller:
-    lookahead_dist_m: 0.20     # pure-pursuit lookahead
-    goal_tolerance_m: 0.10
+    lookahead_dist_m: 0.20     # pure-pursuit lookahead (not yet read by config — see agent.navigation.goal_tolerance_m)
     angle_kp: 1.2
     linear_kp: 0.8
     max_angular_vel: 60        # motor duty-cycle units
@@ -145,15 +144,13 @@ rl:
     include_heading: true      # sin(θ), cos(θ)
 
   actions:
-    # 0-5 → base motion, 6-9 → gimbal, 10 → stop
+    # 0-5 → base motion, 6 → stop
     names: [forward, backward, strafe_left, strafe_right,
-            rotate_left, rotate_right, gimbal_pan_left,
-            gimbal_pan_right, gimbal_tilt_up, gimbal_tilt_down, stop]
+            rotate_left, rotate_right, stop]
     base_speed: 55             # duty cycle for forward
     strafe_speed: 35           # lower = fewer cm/step sideways (no side sensors); above RL stall threshold
     reverse_speed: 35          # lower = fewer cm/step backward (no rear sensor); above RL stall threshold
     rotate_speed: 45
-    gimbal_step_deg: 10
     # Safety pre-checks for blind directions (robot mode only)
     spin_180_duration_s: 0.7   # timed spin to face rear before reversing; tune on floor
     side_depth_close: 0.75     # depth map value (0-1, higher=closer) above which strafe blocked
@@ -167,7 +164,6 @@ rl:
     smooth_motion_bonus: 0.05  # momentum bonus for repeating same locomotion action
     forward_bonus: 0.5       # per-step bonus for forward action (encourages exploration)
     backward_step_cost: -0.05  # per-step cost for backward action (discourages wall-backing exploit)
-    gimbal_step_cost: -0.04    # extra per-step cost for gimbal-only actions (6-9)
     spin_penalty: -0.5        # per-step penalty for sustained rotation/strafe (after 2 consecutive)
     strafe_step_cost: -0.8     # per-step cost for strafing (discourages overuse of strafe in absence of side sensors)
 
@@ -194,14 +190,15 @@ agent:
   learn_in_run_mode: false     # Enable to update policy weights during 'run' mode (not recommended for deployment)
 
   safety:
-    emergency_stop_cm: 25      # unconditional halt if anything < N cm (25 = gimbal protrusion clearance)
+    emergency_stop_cm: 20      # unconditional halt if anything < N cm (gimbal protrusion ~5 cm; 20 cm = 15 cm physical clearance)
     low_battery_voltage: 6.8   # volts (if voltage monitor available)
     us_slow_m: 0.70            # US range at which speed scaling begins
     us_stop_m: 0.30            # US range → full stop
     emstop_latch_s: 5.0        # emergency stop latch duration (seconds)
     escape_delay_ms: 200       # pause before escape reverse (ms)
-    escape_duration_ms: 400    # escape reverse duration (ms)
-    escape_rotation_ms: 600    # escape rotation duration (ms)
+    escape_duration_ms: 300    # escape reverse duration (ms) — reduced from 600ms to avoid rear-wall crashes
+    escape_rotation_ms: 400    # escape rotation duration (ms) — 110° at 35% duty
+    escape_reverse_spd: 35     # motor duty % for escape reverse/rotate (matches rl.actions.reverse_speed)
     clear_hold_s: 0.8          # hysteresis before clearing obstacle_stopped
 
   crash:
@@ -221,6 +218,7 @@ agent:
   navigation:
     max_consecutive_failures: 15  # planning failures before goal blacklisted
     goal_blacklist_s: 10          # seconds a blacklisted goal stays blocked
+    goal_tolerance_m: 0.25        # waypoint reached threshold (must be ≥ lookahead 0.20 m)
 
   exploration:
     frontier_min_size: 3       # minimum frontier cells to pursue
@@ -237,9 +235,13 @@ sim:
   seed: 42                     # default maze seed (overridden by --seed CLI flag)
   obstacles: 18                # number of random rectangular obstacles (0 = empty room)
   obstacle_slow_m: 0.70        # Nearest-obstacle distance (m) that begins forward speed scaling
+                               # A* clearance=7 cells = 0.35 m, so robot on a planned path is at
+                               # ≥0.35 m from obstacles → almost always outside the slow zone.
+                               # 0.40 m caused safety cascade: robot approached walls fast enough
+                               # to dip below emergency_stop_cm=25cm → repeated US-triggered stops.
+                               # 0.70 m keeps robot in slow zone near walls but avoids US threshold.
   obstacle_stop_m: 0.15        # Nearest-obstacle distance (m) → forward hard stop
-  # A* clearance=5 guarantees path cells are ≥5 grid cells (0.25 m) from walls,
-  # but with sub-cell robot positioning the actual nearest_m can be as low as ~0.20 m.
+  # A* clearance=7 guarantees path cells are ≥7 grid cells (0.35 m) from walls.
   # obstacle_stop_m must be below that (~0.15 m) or A*-planned corridors immediately
   # trigger a hard stop and livelock.  0.15 m = robot radius — genuine collision risk.
   # Sensor noise parameters — calibrate against logs/robot.ndjson deceleration curves
@@ -247,6 +249,8 @@ sim:
   imu_noise_accel_m_s2: 0.05   # Gaussian sigma on simulated lateral accel axes (m/s²)
   range_dropout: 0.08          # fraction of pseudo-lidar rays dropped per scan
   range_noise_m: 0.02          # Gaussian sigma on pseudo-lidar range (metres)
+  ultrasonic_noise_cm: 1.5     # Gaussian sigma on simulated US range (cm); median of samples_per_reading draws
+  crash_spike_accel_m_s2: 20.0 # IMU accel spike on collision (m/s²); must exceed agent.crash.accel_threshold_m_s2
 
 # ── IMU Bias Calibration ──────────────────────────────────────────
 # Run "robot calibrate" with robot flat and stationary to regenerate.

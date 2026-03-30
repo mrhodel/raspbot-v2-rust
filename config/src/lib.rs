@@ -223,6 +223,9 @@ pub struct SafetyConfig {
     /// Hysteresis: obstacle_stopped clears only after range > 2×stop_m for this many seconds.
     #[serde(default = "default_clear_hold_s")]
     pub clear_hold_s: f32,
+    /// Motor duty cycle for escape reverse/rotate maneuver (0-100).
+    #[serde(default = "default_escape_reverse_spd")]
+    pub escape_reverse_spd: u8,
 }
 
 impl Default for SafetyConfig {
@@ -236,6 +239,7 @@ impl Default for SafetyConfig {
             escape_duration_ms: default_escape_duration_ms(),
             escape_rotation_ms: default_escape_rotation_ms(),
             clear_hold_s:       default_clear_hold_s(),
+            escape_reverse_spd: default_escape_reverse_spd(),
         }
     }
 }
@@ -245,9 +249,10 @@ fn default_us_slow_m()         -> f32 { 0.70 }
 fn default_us_stop_m()         -> f32 { 0.30 }
 fn default_emstop_latch_s()    -> f64 { 5.0 }
 fn default_escape_delay_ms()   -> u64 { 200 }
-fn default_escape_duration_ms()-> u64 { 400 }
-fn default_escape_rotation_ms()-> u64 { 600 }
+fn default_escape_duration_ms()-> u64 { 300 }  // reduced from 600ms — avoids reversing into rear walls (crash 8)
+fn default_escape_rotation_ms()-> u64 { 400 }  // 110° at 35% duty: 35/100 × 13.7 rad/s × 0.4s ≈ 1.9 rad
 fn default_clear_hold_s()      -> f32 { 0.8 }
+fn default_escape_reverse_spd()-> u8  { 35 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrashConfig {
@@ -331,6 +336,10 @@ pub struct NavigationAgentConfig {
     /// Seconds a blacklisted goal stays blocked.
     #[serde(default = "default_goal_blacklist_s")]
     pub goal_blacklist_s: u64,
+    /// Distance (m) within which the robot considers a path waypoint reached.
+    /// Must be ≥ lookahead_dist_m (0.20 m) to avoid oscillation.
+    #[serde(default = "default_goal_tolerance_m")]
+    pub goal_tolerance_m: f32,
 }
 
 impl Default for NavigationAgentConfig {
@@ -338,12 +347,14 @@ impl Default for NavigationAgentConfig {
         Self {
             max_consecutive_failures: default_max_consecutive_failures(),
             goal_blacklist_s:         default_goal_blacklist_s(),
+            goal_tolerance_m:         default_goal_tolerance_m(),
         }
     }
 }
 
-fn default_max_consecutive_failures() -> u32 { 15 }
-fn default_goal_blacklist_s()         -> u64 { 10 }
+fn default_max_consecutive_failures() -> u32  { 15 }
+fn default_goal_blacklist_s()         -> u64  { 10 }
+fn default_goal_tolerance_m()         -> f32  { 0.25 }
 
 // ── Sim ───────────────────────────────────────────────────────────────────────
 
@@ -373,6 +384,15 @@ pub struct SimConfig {
     /// Gaussian noise sigma on pseudo-lidar range (metres).
     #[serde(default = "default_sim_range_noise_m")]
     pub range_noise_m: f32,
+    /// Gaussian sigma on simulated ultrasonic range (cm).
+    /// Real HC-SR04 takes a median of `hal.ultrasonic.samples_per_reading` pings;
+    /// sim replicates this by drawing that many noise samples and returning the median.
+    #[serde(default = "default_sim_us_noise_cm")]
+    pub ultrasonic_noise_cm: f32,
+    /// Magnitude of the IMU accel spike injected on a simulated collision (m/s²).
+    /// Must exceed `agent.crash.accel_threshold_m_s2` so crash detection fires.
+    #[serde(default = "default_sim_crash_spike_accel")]
+    pub crash_spike_accel_m_s2: f32,
 }
 
 impl Default for SimConfig {
@@ -386,6 +406,8 @@ impl Default for SimConfig {
             imu_noise_accel_m_s2:  default_sim_imu_noise_accel(),
             range_dropout:         default_sim_range_dropout(),
             range_noise_m:         default_sim_range_noise_m(),
+            ultrasonic_noise_cm:   default_sim_us_noise_cm(),
+            crash_spike_accel_m_s2: default_sim_crash_spike_accel(),
         }
     }
 }
@@ -400,6 +422,8 @@ fn default_sim_imu_noise_gyro()     -> f32    { 0.01 }
 fn default_sim_imu_noise_accel()    -> f32    { 0.05 }
 fn default_sim_range_dropout()      -> f32    { 0.08 }
 fn default_sim_range_noise_m()      -> f32    { 0.02 }
+fn default_sim_us_noise_cm()        -> f32    { 1.5  }
+fn default_sim_crash_spike_accel()  -> f32    { 20.0 }
 
 // ── Perception ────────────────────────────────────────────────────────────────
 

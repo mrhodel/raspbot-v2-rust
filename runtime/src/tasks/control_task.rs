@@ -34,11 +34,11 @@ pub fn spawn_control_task(
     mut episode_rx: tokio::sync::watch::Receiver<u32>,
     min_vx_m_s: f32,
     us_stop_m: f32,
+    us_slow_m: f32,
+    clear_hold_s: f32,
+    goal_tolerance_m: f32,
 ) -> tokio::task::JoinHandle<()> {
     const CONTROL_HZ: f64 = 10.0;
-    const GOAL_TOLERANCE_M: f32 = 0.25;
-    // US slow zone starts at a fixed 70 cm regardless of mode.
-    const US_SLOW_M: f32 = 0.70;
 
     let bus_ctrl           = Arc::clone(&bus);
     let mut ctrl_rx        = ctrl_rx;
@@ -84,7 +84,8 @@ pub fn spawn_control_task(
         // same stale borrow() value multiple times when perception updates slower
         // than the control tick rate (~3 Hz MiDaS vs 10 Hz control).
         let clear_hysteresis_m = obstacle_stop_m * 2.0;
-        const CLEAR_HOLD_S: f32 = 0.8; // must stay clear for 0.8 s before resuming (~2-3 MiDaS frames)
+        // clear_hold_s and us_slow_m come from config (agent.safety).
+        // goal_tolerance_m from config (navigation.controller).
         let mut clear_since: Option<std::time::Instant> = None;
         let mut last_collision_count: u32 = 0;
         // Dropout filter: MiDaS occasionally misses a close obstacle for one frame, causing
@@ -96,7 +97,7 @@ pub fn spawn_control_task(
         let mut smoothed_nearest: f32 = f32::MAX;
         const MAX_NEAREST_DELTA_PER_TICK: f32 = 0.15; // m per 100 ms tick
         // Near-zone latch: once nearest drops below clear_hysteresis_m, stay latched until
-        // nearest has been ABOVE clear_hysteresis_m continuously for CLEAR_HOLD_S (same
+        // nearest has been ABOVE clear_hysteresis_m continuously for clear_hold_s (same
         // threshold used by obstacle_stopped).  Distance-only exit was insufficient: at a
         // corner the side wall exits the FOV and smoothed_nearest rises quickly from 0.22 m
         // to 0.67 m over 3 ticks (each at the 0.15 m/tick rate limit), base_scale climbs
@@ -227,7 +228,7 @@ pub fn spawn_control_task(
                 // Control tick — re-compute CmdVel from current pose.
                 _ = tick.tick() => {
                     // Auto-clear depth stop with time hysteresis — nearest must stay above
-                    // clear_hysteresis_m (2× stop distance) continuously for CLEAR_HOLD_S
+                    // clear_hysteresis_m (2× stop distance) continuously for clear_hold_s
                     // before resuming.  Any dip below the threshold resets the timer, preventing
                     // noisy MiDaS readings from causing a false clear.  Using wall-clock time
                     // avoids counting the same stale borrow() value across multiple ticks.
@@ -336,10 +337,10 @@ pub fn spawn_control_task(
                             continue;
                         }
                         // If this was a US-triggered stop and the US has now recovered past
-                        // US_SLOW_M (comfortably clear), release immediately.  Do NOT wait
+                        // us_slow_m (comfortably clear), release immediately.  Do NOT wait
                         // for the camera/lidar nearest hysteresis — the lidar sees ALL walls
                         // in all directions, so near any wall nearest < 0.60 m permanently.
-                        if obstacle_stopped_by_us && latest_us_m >= US_SLOW_M {
+                        if obstacle_stopped_by_us && latest_us_m >= us_slow_m {
                             info!(us_m = latest_us_m, "Control: US-stop cleared (US recovered)");
                             obstacle_stopped = false;
                             obstacle_stopped_by_us = false;
@@ -350,8 +351,8 @@ pub fn spawn_control_task(
 
                         if nearest > clear_hysteresis_m {
                             let since = clear_since.get_or_insert_with(std::time::Instant::now);
-                            if since.elapsed().as_secs_f32() >= CLEAR_HOLD_S {
-                                info!(clear_hysteresis_m, CLEAR_HOLD_S, "Control: obstacle cleared (hysteresis satisfied)");
+                            if since.elapsed().as_secs_f32() >= clear_hold_s {
+                                info!(clear_hysteresis_m, clear_hold_s, "Control: obstacle cleared (hysteresis satisfied)");
                                 obstacle_stopped = false;
                                 obstacle_stopped_by_us = false;
                                 clear_since = None;
@@ -377,7 +378,7 @@ pub fn spawn_control_task(
                     if let Some(&[gx, gy]) = path.waypoints.last() {
                         let dx = gx - pose.x_m;
                         let dy = gy - pose.y_m;
-                        if dx * dx + dy * dy < GOAL_TOLERANCE_M * GOAL_TOLERANCE_M {
+                        if dx * dx + dy * dy < goal_tolerance_m * goal_tolerance_m {
                             // Continue-if-clear: if forward space is open, synthesise a
                             // short coast extension in the current heading instead of
                             // stopping cold.  This fills the A* replan gap (100-500 ms)
@@ -445,14 +446,14 @@ pub fn spawn_control_task(
                     };
                     let angle_factor = nearest_angle.cos().max(0.0_f32);
                     // Near-zone latch (time-based exit): enter when nearest < clear_hysteresis_m;
-                    // only exit once nearest has been ABOVE clear_hysteresis_m for CLEAR_HOLD_S
+                    // only exit once nearest has been ABOVE clear_hysteresis_m for clear_hold_s
                     // (0.8 s) continuously — the same hysteresis used for obstacle_stopped.
                     //
                     // Corner-crash scenario: robot at 0.22 m, side wall exits FOV as robot turns,
                     // smoothed nearest rises 0.22→0.37→0.52→0.67 m at 0.15 m/tick rate-limit
                     // over ~300 ms.  base_scale climbs from 0.40 to 0.95 and vx spikes to 27 cm/s
                     // while the front corner wall is invisible to MiDaS at oblique angles — crash.
-                    // With CLEAR_HOLD_S=0.8 s, the latch stays active for those 300 ms, keeping
+                    // With clear_hold_s=0.8 s, the latch stays active for those 300 ms, keeping
                     // speed capped at NEAR_ZONE_SPEED_CAP until the area is confirmed clear.
                     if nearest < clear_hysteresis_m {
                         in_near_zone = true;
@@ -460,7 +461,7 @@ pub fn spawn_control_task(
                     } else if in_near_zone {
                         let since = near_zone_clear_since
                             .get_or_insert_with(std::time::Instant::now);
-                        if since.elapsed().as_secs_f32() >= CLEAR_HOLD_S {
+                        if since.elapsed().as_secs_f32() >= clear_hold_s {
                             in_near_zone = false;
                             near_zone_clear_since = None;
                         }
@@ -486,12 +487,12 @@ pub fn spawn_control_task(
 
                     // US-based speed scaling (forward sensor, independent of gimbal).
                     // Takes minimum with MiDaS scale — whichever is more restrictive wins.
-                    let us_scale = if latest_us_m >= US_SLOW_M {
+                    let us_scale = if latest_us_m >= us_slow_m {
                         1.0_f32
                     } else if latest_us_m <= us_stop_m {
                         0.0_f32
                     } else {
-                        (latest_us_m - us_stop_m) / (US_SLOW_M - us_stop_m)
+                        (latest_us_m - us_stop_m) / (us_slow_m - us_stop_m)
                     };
                     let combined_scale = speed_scale.min(us_scale);
                     if us_scale < 1.0 {

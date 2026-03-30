@@ -37,10 +37,16 @@ const HFOV_RAD: f32 = 110.0_f32 * std::f32::consts::PI / 180.0;
 const OBSTACLE_CONTRAST: f32 = 0.10;
 
 /// Any computed range below this value is treated as free space rather than
-/// a close obstacle.  Values near 0 m arise from floor-pixel artifacts (floor
-/// tiles at ~0.43 m anchor MiDaS inverse-depth to 1.0 → formula gives 0 m).
-/// Real obstacles at < 0.10 m are handled by the ultrasonic safety interlock.
-const MIN_OBS_RANGE_M: f32 = 0.10;
+/// a close obstacle.  Values near 0 m arise from two sources:
+///   1. Floor-pixel artifacts (floor at ~0.43 m anchors MiDaS inverse-depth
+///      to 1.0 → formula gives 0 m).
+///   2. Dark objects against bright backgrounds — MiDaS assigns near-maximum
+///      inverse depth to high-contrast edges (e.g. dark shirt on white wall),
+///      producing falsely small range estimates (< 0.20 m) for objects that
+///      are actually > 0.5 m away.
+/// Real obstacles at < 0.20 m are handled by the ultrasonic safety interlock
+/// and ToF (±20° forward arc).
+const MIN_OBS_RANGE_M: f32 = 0.20;
 
 pub struct PseudoLidarExtractor {
     num_rays: usize,

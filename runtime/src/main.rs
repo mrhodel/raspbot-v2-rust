@@ -379,8 +379,8 @@ async fn main() -> anyhow::Result<()> {
     // a wall impact at typical nav speeds produces 10–30 m/s².
     // Debounce: 2 s between events so a single impact counts once.
     {
-        const CRASH_ACCEL_THRESHOLD: f32 = 15.0; // m/s²
-        const CRASH_DEBOUNCE_MS: u64 = 2_000;
+        let crash_accel_threshold = cfg.agent.crash.accel_threshold_m_s2;
+        let crash_debounce_ms    = cfg.agent.crash.debounce_ms;
         let bus_crash  = Arc::clone(&bus);
         let mut rx_imu_c  = bus.imu_raw.subscribe();
         let rx_exec_crash = bus.executive_state.subscribe();
@@ -395,7 +395,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         if !armed { continue; }
                         let horiz = (s.accel_x * s.accel_x + s.accel_y * s.accel_y).sqrt();
-                        if horiz > CRASH_ACCEL_THRESHOLD && s.t_ms > last_crash_ms + CRASH_DEBOUNCE_MS {
+                        if horiz > crash_accel_threshold && s.t_ms > last_crash_ms + crash_debounce_ms {
                             last_crash_ms = s.t_ms;
                             let n = *bus_crash.collision_count.borrow() + 1;
                             let _ = bus_crash.collision_count.send(n);
@@ -570,8 +570,16 @@ async fn main() -> anyhow::Result<()> {
     let map_handle = spawn_mapping_task(Arc::clone(&bus), Arc::clone(&mapper));
 
     // ── Safety task ───────────────────────────────────────────────────────────
-    let emergency_stop_cm  = cfg.agent.safety.emergency_stop_cm;
-    let safety_handle = spawn_safety_task(Arc::clone(&bus), emergency_stop_cm, true);
+    let safety_handle = spawn_safety_task(
+        Arc::clone(&bus),
+        cfg.agent.safety.emergency_stop_cm,
+        true,
+        cfg.agent.safety.emstop_latch_s,
+        cfg.agent.safety.escape_delay_ms,
+        cfg.agent.safety.escape_duration_ms,
+        cfg.agent.safety.escape_rotation_ms,
+        cfg.agent.safety.escape_reverse_spd as i8,
+    );
 
     // ── Planning task ─────────────────────────────────────────────────────────
     // Triggered by FrontierChoice from exploration_rl (Phase 10).
@@ -772,8 +780,13 @@ async fn main() -> anyhow::Result<()> {
     // min_vx=0: let the motor hardware handle sub-deadband commands naturally.
     // Snapping to min_vx in a garage (walls always within 70 cm) zeroes forward
     // motion completely — the robot never moves forward.
-    let ctrl_handle = spawn_control_task(Arc::clone(&bus), control_path_rx, 0.70, 0.25, episode_dummy_rx, 0.0,
-        cfg.agent.safety.us_stop_m);
+    let ctrl_handle = spawn_control_task(
+        Arc::clone(&bus), control_path_rx, 0.70, 0.25, episode_dummy_rx, 0.0,
+        cfg.agent.safety.us_stop_m,
+        cfg.agent.safety.us_slow_m,
+        cfg.agent.safety.clear_hold_s,
+        cfg.agent.navigation.goal_tolerance_m,
+    );
 
     // ── Motor execution task ──────────────────────────────────────────────────
     // Drains both the safety motor_command channel and the controller cmdvel
@@ -1528,7 +1541,7 @@ async fn run_sim_mode(
 
     let camera: Box<dyn Camera>              = Box::new(SimCameraHal::new(&sim_state, &cfg.hal.camera));
     let imu: Box<dyn Imu>                    = Box::new(sim_state.imu(&cfg.sim));
-    let ultrasonic: Box<dyn Ultrasonic>      = Box::new(sim_state.ultrasonic(&cfg.hal.ultrasonic));
+    let ultrasonic: Box<dyn Ultrasonic>      = Box::new(sim_state.ultrasonic(&cfg.hal.ultrasonic, &cfg.sim));
     let mut motor: Box<dyn MotorController>  = Box::new(sim_state.motor_controller());
     let mut gimbal: Box<dyn Gimbal>          = Box::new(sim_state.gimbal(&cfg.hal.gimbal));
     let max_motor_duty = cfg.hal.motor.max_speed as i8;
@@ -1662,7 +1675,16 @@ async fn run_sim_mode(
     exploration_rl::spawn_selector_task(Arc::clone(&bus)).await;
 
     // ── Safety task (shared with robot-run) ───────────────────────────────────
-    spawn_safety_task(Arc::clone(&bus), cfg.agent.safety.emergency_stop_cm, false);
+    spawn_safety_task(
+        Arc::clone(&bus),
+        cfg.agent.safety.emergency_stop_cm,
+        false,
+        cfg.agent.safety.emstop_latch_s,
+        cfg.agent.safety.escape_delay_ms,
+        cfg.agent.safety.escape_duration_ms,
+        cfg.agent.safety.escape_rotation_ms,
+        cfg.agent.safety.escape_reverse_spd as i8,
+    );
 
     // ── Mapping task ──────────────────────────────────────────────────────────
     spawn_mapping_task(Arc::clone(&bus), Arc::clone(&mapper));
@@ -1715,8 +1737,8 @@ async fn run_sim_mode(
     // threshold — so this task fires on simulated wall impacts exactly as it
     // would on the real robot.
     {
-        const CRASH_ACCEL_THRESHOLD: f32 = 15.0;
-        const CRASH_DEBOUNCE_MS: u64 = 2_000;
+        let crash_accel_threshold = cfg.agent.crash.accel_threshold_m_s2;
+        let crash_debounce_ms    = cfg.agent.crash.debounce_ms;
         let bus_crash  = Arc::clone(&bus);
         let mut rx_imu_c  = bus.imu_raw.subscribe();
         let rx_exec_crash = bus.executive_state.subscribe();
@@ -1731,7 +1753,7 @@ async fn run_sim_mode(
                         );
                         if !armed { continue; }
                         let horiz = (s.accel_x * s.accel_x + s.accel_y * s.accel_y).sqrt();
-                        if horiz > CRASH_ACCEL_THRESHOLD && s.t_ms > last_crash_ms + CRASH_DEBOUNCE_MS {
+                        if horiz > crash_accel_threshold && s.t_ms > last_crash_ms + crash_debounce_ms {
                             last_crash_ms = s.t_ms;
                             let n = *bus_crash.collision_count.borrow() + 1;
                             let _ = bus_crash.collision_count.send(n);
@@ -2674,7 +2696,11 @@ async fn run_sim_mode(
     // robot every time it passes near a sim obstacle; camera already handles close stops.
     spawn_control_task(Arc::clone(&bus), control_path_rx,
         cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), 0.0,
-        cfg.sim.obstacle_stop_m);
+        cfg.sim.obstacle_stop_m,
+        cfg.agent.safety.us_slow_m,
+        cfg.agent.safety.clear_hold_s,
+        cfg.agent.navigation.goal_tolerance_m,
+    );
 
     // ── Sim tick task ─────────────────────────────────────────────────────────
     // Physics loop at 10 Hz: reads latest motor command + gimbal pan from the

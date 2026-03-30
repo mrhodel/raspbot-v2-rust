@@ -71,14 +71,17 @@ impl SimState {
             self.seed ^ 0xABCD_ABCD,
             cfg.imu_noise_gyro_rad_s,
             cfg.imu_noise_accel_m_s2,
+            cfg.crash_spike_accel_m_s2,
         )
     }
 
-    pub fn ultrasonic(&self, us_cfg: &UltrasonicConfig) -> SimUltrasonic {
+    pub fn ultrasonic(&self, us_cfg: &UltrasonicConfig, sim_cfg: &SimConfig) -> SimUltrasonic {
         SimUltrasonic::new(
             self.step_rx.clone(),
             us_cfg.max_range_cm,
             us_cfg.min_range_cm,
+            sim_cfg.ultrasonic_noise_cm,
+            us_cfg.samples_per_reading,
         )
     }
 

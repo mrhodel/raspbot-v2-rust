@@ -50,6 +50,7 @@ const MAX_RANGE_M: f32 = 3.0;
 // ── OccupancyGrid ─────────────────────────────────────────────────────────────
 
 /// Sparse log-odds occupancy grid. Cells absent from the map are unknown (0.0).
+#[derive(Clone)]
 pub struct OccupancyGrid {
     cells: HashMap<(i32, i32), f32>,
 }
@@ -98,6 +99,7 @@ impl OccupancyGrid {
 // ── Mapper ────────────────────────────────────────────────────────────────────
 
 /// Stateful occupancy grid mapper.
+#[derive(Clone)]
 pub struct Mapper {
     pub grid: OccupancyGrid,
     resolution: f32,

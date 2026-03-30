@@ -11,10 +11,14 @@ pub fn spawn_safety_task(
     bus: Arc<Bus>,
     emergency_stop_cm: f32,
     enable_watchdog: bool,
+    emstop_latch_s: f64,
+    escape_delay_ms: u64,
+    escape_duration_ms: u64,
+    escape_rotation_ms: u64,
+    escape_reverse_spd: i8,
 ) -> tokio::task::JoinHandle<()> {
     let bus_safety = Arc::clone(&bus);
     let mut rx_us  = bus.ultrasonic.subscribe();
-    let escape_reverse_spd: i8 = 35; // duty cycle for escape reverse (matches reverse_speed in config)
     tokio::spawn(async move {
         let mut monitor  = SafetyMonitor::new();
         monitor.stop_threshold_cm = emergency_stop_cm;
@@ -24,14 +28,10 @@ pub fn spawn_safety_task(
             "Safety task started"
         );
         let watchdog_dur = tokio::time::Duration::from_millis(monitor.watchdog_timeout_ms);
-        // Latch: once EmergencyStop fires, hold it for at least this duration even if
-        // the US returns a good reading (e.g. blind spot <3 cm → driver returns 400 cm).
-        const EMSTOP_LATCH: tokio::time::Duration = tokio::time::Duration::from_secs(5);
-        // Escape: after EmergencyStop the robot reverses briefly to clear the obstacle.
-        // The escape window suppresses re-stop commands so the reverse isn't interrupted.
-        const ESCAPE_DELAY:    tokio::time::Duration = tokio::time::Duration::from_millis(200);
-        const ESCAPE_DURATION: tokio::time::Duration = tokio::time::Duration::from_millis(300);  // ~18 cm reverse — reduced from 600ms to avoid reversing into rear walls (crash 8)
-        const ESCAPE_ROTATION: tokio::time::Duration = tokio::time::Duration::from_millis(400);  // 110° at 35% duty (35/100 × 13.7 × 0.4s) — break heading deadlock
+        let latch_dur    = tokio::time::Duration::from_secs_f64(emstop_latch_s);
+        let delay_dur    = tokio::time::Duration::from_millis(escape_delay_ms);
+        let reverse_dur  = tokio::time::Duration::from_millis(escape_duration_ms);
+        let rotate_dur   = tokio::time::Duration::from_millis(escape_rotation_ms);
         let mut emstop_until:  Option<tokio::time::Instant> = None;
         let mut escape_until:  Option<tokio::time::Instant> = None;
         loop {
@@ -60,9 +60,9 @@ pub fn spawn_safety_task(
                                 let (state, maybe_stop) = monitor.evaluate(&reading);
                                 let _ = bus_safety.safety_state.send(state);
                                 if let Some(cmd) = maybe_stop {
-                                    warn!(range_cm = reading.range_cm, "Safety: EMERGENCY STOP — latching for {}s", EMSTOP_LATCH.as_secs());
-                                    emstop_until = Some(now + EMSTOP_LATCH);
-                                    escape_until = Some(now + ESCAPE_DELAY + ESCAPE_DURATION + ESCAPE_ROTATION);
+                                    warn!(range_cm = reading.range_cm, "Safety: EMERGENCY STOP — latching for {}s", latch_dur.as_secs());
+                                    emstop_until = Some(now + latch_dur);
+                                    escape_until = Some(now + delay_dur + reverse_dur + rotate_dur);
                                     // Count each fresh EmergencyStop as a near-miss.
                                     let n = *bus_safety.estop_count.borrow() + 1;
                                     let _ = bus_safety.estop_count.send(n);
@@ -74,11 +74,11 @@ pub fn spawn_safety_task(
                                     let bus_esc = Arc::clone(&bus_safety);
                                     let spd = escape_reverse_spd;
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(ESCAPE_DELAY).await;
+                                        tokio::time::sleep(delay_dur).await;
                                         // Reverse: send repeatedly so sim sustains the command each tick.
-                                        info!("Safety: escape — reversing for {}ms", ESCAPE_DURATION.as_millis());
+                                        info!("Safety: escape — reversing for {}ms", reverse_dur.as_millis());
                                         let reverse = MotorCommand { t_ms: 0, fl: -spd, fr: -spd, rl: -spd, rr: -spd };
-                                        let deadline = tokio::time::Instant::now() + ESCAPE_DURATION;
+                                        let deadline = tokio::time::Instant::now() + reverse_dur;
                                         while tokio::time::Instant::now() < deadline {
                                             let _ = bus_esc.motor_command.try_send(reverse);
                                             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -93,9 +93,9 @@ pub fn spawn_safety_task(
                                             (-spd, spd, -spd, spd)   // CCW: obstacle right → turn left
                                         };
                                         info!(obs_angle_rad = obs_angle, cw = (obs_angle >= 0.0),
-                                              "Safety: escape — rotating for {}ms", ESCAPE_ROTATION.as_millis());
+                                              "Safety: escape — rotating for {}ms", rotate_dur.as_millis());
                                         let rotate = MotorCommand { t_ms: 0, fl, fr, rl, rr };
-                                        let deadline = tokio::time::Instant::now() + ESCAPE_ROTATION;
+                                        let deadline = tokio::time::Instant::now() + rotate_dur;
                                         while tokio::time::Instant::now() < deadline {
                                             let _ = bus_esc.motor_command.try_send(rotate);
                                             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -114,7 +114,7 @@ pub fn spawn_safety_task(
                     // Only arm a fresh latch; don't extend an existing one so the
                     // latch can expire naturally (e.g. during episode reset).
                     if emstop_until.map_or(true, |u| now >= u) {
-                        emstop_until = Some(now + EMSTOP_LATCH);
+                        emstop_until = Some(now + latch_dur);
                     }
                     let (state, cmd) = monitor.evaluate_timeout(0);
                     let _ = bus_safety.safety_state.send(state);

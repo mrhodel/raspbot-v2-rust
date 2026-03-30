@@ -173,6 +173,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // ── Overlay state ──────────────────────────────────────────────────────
     let pose = null;
     let frontiers = [];
+    let frontierStatus = new Map(); // centroid key → status from last annotation
     let frontiersAnnotated = false; // true once planner annotations arrive
     let lidarRays = null;
     let lastPan = 0;       // gimbal pan in degrees; 0 = forward
@@ -459,7 +460,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       ws = new WebSocket('ws://' + host + ':9000/');
       const wsSt = document.getElementById('ws_st');
       wsSt.className = 'warn'; wsSt.textContent = 'connecting';
-      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; startCamStream(); };
+      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; startCamStream(); startDepthStream(); };
       ws.onclose = () => {
         wsSt.className = 'err'; wsSt.textContent = 'reconnecting';
         if (simStartMs !== null) {
@@ -480,13 +481,24 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
             case 'map/grid_delta':
               if (msg.data && msg.data.cells) applyDelta(msg.data.cells);
               break;
-            case 'map/frontiers':
-              // Raw frontiers from mapper (no status). Only apply if no annotated
-              // version has arrived yet, so planner annotations take precedence.
-              if (!frontiersAnnotated) frontiers = msg.data || [];
+            case 'map/frontiers': {
+              // Always update frontier positions at scan rate.
+              // Merge in last-known status so colors don't reset while planner is busy.
+              const raw = msg.data || [];
+              frontiers = raw.map(f => {
+                const key = Math.round(f.centroid_x_m * 20) + ',' + Math.round(f.centroid_y_m * 20);
+                const st = frontierStatus.get(key);
+                return st !== undefined ? {...f, status: st} : f;
+              });
               break;
+            }
             case 'map/frontier_annotations':
               frontiers = msg.data || [];
+              frontierStatus.clear();
+              for (const f of frontiers) {
+                const key = Math.round(f.centroid_x_m * 20) + ',' + Math.round(f.centroid_y_m * 20);
+                frontierStatus.set(key, f.status || 0);
+              }
               frontiersAnnotated = true;
               break;
             case 'vision/pseudo_lidar':
@@ -509,6 +521,13 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
                 flashColor = '#ffaa00'; flashLabel = 'NEAR MISS'; flashFrames = 60;
               } else if (lbl === 'Fault' && lastExecState !== 'Fault') {
                 flashColor = '#ff2200'; flashLabel = 'CRASH';   flashFrames = 60;
+              } else if (lbl === 'Exploring' && lastExecState !== 'Exploring') {
+                // Reset frontier annotations on arm so stale status colours from the
+                // previous exploration phase don't persist.  The mapper is not cleared
+                // (accumulated map is still valid), but planner annotation statuses
+                // (Active/Explored/Blacklisted) are all stale.  Raw map/frontiers
+                // updates will take effect immediately until fresh annotations arrive.
+                frontiersAnnotated = false; frontierStatus.clear();
               }
               lastExecState = lbl;
               break;
@@ -537,7 +556,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               // Initial session start — clear everything including counts.
               grid.clear();
               crashMarkers = []; crashCount = 0;
-              frontiers = []; frontiersAnnotated = false; lidarRays = null; pose = null;
+              frontiers = []; frontierStatus.clear(); frontiersAnnotated = false; lidarRays = null; pose = null;
               truWalls = null; truW = 0; truH = 0;
               minCX = maxCX = minCY = maxCY = null;
               bgC.width = bgC.height = fgC.width = fgC.height = 4;
@@ -551,7 +570,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
               const epNum = msg.data || 0;
               grid.clear();
               crashMarkers = [];
-              frontiers = []; frontiersAnnotated = false; lidarRays = null; pose = null;
+              frontiers = []; frontierStatus.clear(); frontiersAnnotated = false; lidarRays = null; pose = null;
               truWalls = null; truW = 0; truH = 0;
               minCX = maxCX = minCY = maxCY = null;
               bgC.width = bgC.height = fgC.width = fgC.height = 4;
@@ -952,7 +971,7 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       const wsSt = document.getElementById('ws_st');
       wsSt.className = 'warn'; wsSt.textContent = 'connecting';
 
-      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; startStream(); };
+      ws.onopen  = () => { wsSt.className = 'val'; wsSt.textContent = 'ok'; startStream(); startDepthStreamOv(); };
       ws.onclose = () => {
         wsSt.className = 'err'; wsSt.textContent = 'reconnecting';
         setTimeout(connect, 2000);

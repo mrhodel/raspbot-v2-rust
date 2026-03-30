@@ -13,20 +13,22 @@ use crate::SimStep;
 use super::{gaussian, xorshift};
 
 pub struct SimImu {
-    step_rx:          watch::Receiver<Arc<SimStep>>,
-    rng:              u64,
-    noise_gyro_rad_s: f32,
-    noise_accel_m_s2: f32,
+    step_rx:                watch::Receiver<Arc<SimStep>>,
+    rng:                    u64,
+    noise_gyro_rad_s:       f32,
+    noise_accel_m_s2:       f32,
+    crash_spike_accel_m_s2: f32,
 }
 
 impl SimImu {
     pub fn new(
-        step_rx:          watch::Receiver<Arc<SimStep>>,
-        seed:             u64,
-        noise_gyro_rad_s: f32,
-        noise_accel_m_s2: f32,
+        step_rx:                watch::Receiver<Arc<SimStep>>,
+        seed:                   u64,
+        noise_gyro_rad_s:       f32,
+        noise_accel_m_s2:       f32,
+        crash_spike_accel_m_s2: f32,
     ) -> Self {
-        Self { step_rx, rng: seed, noise_gyro_rad_s, noise_accel_m_s2 }
+        Self { step_rx, rng: seed, noise_gyro_rad_s, noise_accel_m_s2, crash_spike_accel_m_s2 }
     }
 }
 
@@ -51,10 +53,10 @@ impl Imu for SimImu {
         };
 
         // Inject crash spike so the crash-detection task fires in sim.
-        // Spike magnitude (~20 m/s²) is well above the 15 m/s² threshold.
+        // Magnitude is from config (crash_spike_accel_m_s2 > agent.crash.accel_threshold_m_s2).
         if step.collision {
             let sign = if xorshift(rng) & 1 == 0 { 1.0_f32 } else { -1.0_f32 };
-            sample.accel_x += sign * 20.0;
+            sample.accel_x += sign * self.crash_spike_accel_m_s2;
         }
 
         Ok(sample)
