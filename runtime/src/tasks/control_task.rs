@@ -506,14 +506,13 @@ pub fn spawn_control_task(
                     if original_vx < 0.0 && cmd_vel.vx < original_vx {
                         cmd_vel.vx = original_vx;
                     }
-                    // Motor deadband: any forward vx below min_vx_m_s maps to less than
-                    // min_motor_duty and gets silently rounded UP by the hardware.  In tight
-                    // spaces the speed scaling reduces vx to ~0.14 m/s, but rounding to
-                    // min_vx (0.257 m/s) overrides the scaling and the robot creeps into walls.
-                    // Fix: treat sub-deadband as STOP rather than snap-up — the obstacle is
-                    // close enough that we should not move at hardware-minimum speed.
+                    // Motor deadband: any forward vx below min_vx_m_s would stall the motors.
+                    // Snap up to min_vx_m_s so the robot moves at stall speed rather than
+                    // issuing a sub-stall command the hardware cannot execute.  The
+                    // obstacle_stopped latch (nearest < obstacle_stop_m) handles the actual
+                    // close-range stop; we do not need to pre-emptively zero vx here.
                     if cmd_vel.vx > 0.0 && cmd_vel.vx < min_vx_m_s {
-                        cmd_vel.vx = 0.0;
+                        cmd_vel.vx = min_vx_m_s;
                     }
                     // Scale omega by us_scale only when moving forward — prevents sweeping
                     // the US sensor into an obstacle while turning.  When vx=0 (spinning in
