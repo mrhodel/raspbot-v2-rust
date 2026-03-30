@@ -22,13 +22,12 @@ use tracing::{debug, warn};
 /// Used when calling `plan()`; use `plan_with_clearance()` to override.
 const CLEARANCE_CELLS: i32 = 7;
 
-/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 15 cells = 75 cm).
-/// Pure-pursuit lookahead handles sub-waypoint tracking; sparser waypoints mean longer
-/// path segments per replan cycle and fewer artificial pauses.
-/// 15 cells (75 cm) vs the old 10 cells (50 cm): at 0.20 m lookahead the robot snaps to
-/// each waypoint individually (decelerate-turn-accelerate), so wider spacing reduces the
-/// frequency of visible direction changes ("drunk" navigation) from once/1.7 s to once/2.5 s.
-const WAYPOINT_STEP: usize = 15;
+/// Keep one waypoint per this many cells along the raw path (5 cm/cell → 8 cells = 40 cm).
+/// With 0.20 m lookahead and 75 cm spacing (old WAYPOINT_STEP=15), a sharp A* turn caused
+/// the heading error to jump past 90° between consecutive waypoints — vx → 0, omega → MAX,
+/// causing stop-and-pivot at every bend.  At 40 cm spacing the max heading change per step
+/// is smaller and the lookahead point stays ahead in the intended direction.
+const WAYPOINT_STEP: usize = 8;
 
 /// Maximum A* nodes to expand before giving up.
 /// The robot's reachable connected component is typically 10 000–20 000 cells
@@ -54,6 +53,79 @@ impl AStarPlanner {
     /// Find a collision-free path using the default clearance (`CLEARANCE_CELLS`).
     pub fn plan(&self, mapper: &Mapper, start: &Pose2D, goal_m: [f32; 2]) -> Option<Path> {
         self.plan_with_clearance(mapper, start, goal_m, CLEARANCE_CELLS)
+    }
+
+    /// Like `plan_with_clearance` but also returns whether the failure was due to
+    /// the node budget being exhausted (`true`) vs the open set being drained
+    /// (`false`).  Callers that need to distinguish "budget hit" from "proven
+    /// unreachable" should use this variant.
+    pub fn plan_with_clearance_detail(
+        &self,
+        mapper: &Mapper,
+        start: &Pose2D,
+        goal_m: [f32; 2],
+        clearance: i32,
+    ) -> (Option<Path>, bool) {
+        // Re-use the full implementation but capture which failure path fired.
+        // We duplicate the inner loop rather than wrapping plan_with_clearance so
+        // the two failure returns are directly observable here.
+        let (sx, sy) = mapper.world_to_cell(start.x_m, start.y_m);
+        let (gx, gy) = mapper.world_to_cell(goal_m[0], goal_m[1]);
+
+        let (sx, sy) = if self.passable(mapper, sx, sy, clearance) {
+            (sx, sy)
+        } else {
+            match self.nearest_passable(mapper, sx, sy, clearance) {
+                Some(cell) => cell,
+                None => return (None, false),
+            }
+        };
+        let (gx, gy) = if self.passable(mapper, gx, gy, clearance) {
+            (gx, gy)
+        } else {
+            match self.nearest_passable(mapper, gx, gy, clearance) {
+                Some(cell) => cell,
+                None => return (None, false),
+            }
+        };
+
+        let mut open: BinaryHeap<Node> = BinaryHeap::new();
+        let mut g_cost: HashMap<(i32, i32), f32> = HashMap::new();
+        let mut came_from: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
+
+        g_cost.insert((sx, sy), 0.0);
+        open.push(Node::new((sx, sy), 0.0, heuristic(sx, sy, gx, gy)));
+
+        let mut expanded = 0usize;
+        while let Some(node) = open.pop() {
+            let (cx, cy) = node.pos;
+
+            if cx == gx && cy == gy {
+                return (Some(self.reconstruct(mapper, &came_from, (sx, sy), (gx, gy), start.t_ms)), false);
+            }
+
+            expanded += 1;
+            if expanded > MAX_NODES {
+                warn!("A*: node limit reached ({MAX_NODES}) — no path found");
+                return (None, true); // node_limit_hit = true
+            }
+
+            let g = g_cost[&(cx, cy)];
+            for (nx, ny) in neighbors8(cx, cy) {
+                if !self.passable(mapper, nx, ny, clearance) { continue; }
+                let step_cost = if (nx - cx).abs() + (ny - cy).abs() == 2 {
+                    std::f32::consts::SQRT_2
+                } else { 1.0 };
+                let ng = g + step_cost;
+                if ng < *g_cost.get(&(nx, ny)).unwrap_or(&f32::INFINITY) {
+                    g_cost.insert((nx, ny), ng);
+                    came_from.insert((nx, ny), (cx, cy));
+                    open.push(Node::new((nx, ny), ng, heuristic(nx, ny, gx, gy)));
+                }
+            }
+        }
+        warn!("A*: open set exhausted — no path found");
+        (None, false) // node_limit_hit = false (proven unreachable at this clearance)
     }
 
     /// Find a collision-free path from `start` pose to `goal_m` (world coords)
@@ -169,7 +241,7 @@ impl AStarPlanner {
         }
         cells.reverse();
 
-        let waypoints: Vec<[f32; 2]> = cells
+        let mut waypoints: Vec<[f32; 2]> = cells
             .iter()
             .enumerate()
             .filter(|(i, _)| i % WAYPOINT_STEP == 0 || *i == cells.len() - 1)
@@ -178,6 +250,13 @@ impl AStarPlanner {
                 [wx, wy]
             })
             .collect();
+
+        // Laplacian path smoothing: pull each intermediate waypoint 50% toward
+        // the midpoint of its neighbours.  Removes A* grid zigzag while keeping
+        // start and goal fixed.  3 iterations is enough to round 90° kinks into
+        // smooth curves.  With clearance=7 (35 cm margin) the small waypoint
+        // displacement from smoothing stays well within the obstacle-free zone.
+        smooth_waypoints(&mut waypoints, 3);
 
         Path { t_ms, waypoints }
     }
@@ -276,6 +355,21 @@ pub fn reachable_set(
         }
     }
     visited
+}
+
+/// Laplacian path smoother: pull each intermediate waypoint 50% toward the
+/// midpoint of its neighbours, keeping start and goal fixed.
+/// Removes A* grid zigzag while staying well within obstacle clearance margins.
+fn smooth_waypoints(pts: &mut Vec<[f32; 2]>, iterations: usize) {
+    let n = pts.len();
+    if n <= 2 || iterations == 0 { return; }
+    for _ in 0..iterations {
+        let prev = pts.clone();
+        for i in 1..n - 1 {
+            pts[i][0] = 0.5 * prev[i][0] + 0.25 * prev[i - 1][0] + 0.25 * prev[i + 1][0];
+            pts[i][1] = 0.5 * prev[i][1] + 0.25 * prev[i - 1][1] + 0.25 * prev[i + 1][1];
+        }
+    }
 }
 
 /// Octile distance heuristic (consistent, admissible for 8-connected grids).

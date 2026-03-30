@@ -2501,15 +2501,44 @@ async fn run_sim_mode(
                 // a 3-second timeout was firing on reachable frontiers, permanently
                 // hard-blacklisting them and starving the planner of valid goals.
                 // spawn_blocking keeps async worker threads free regardless of duration.
-                let (planned, total_failure) = tokio::task::spawn_blocking(move || {
+                // plan_with_clearance_detail returns (path, node_limit_hit):
+                //   node_limit_hit = true  → budget exhausted (50k nodes); the path MAY
+                //                           exist but the search gave up — soft-BL and retry
+                //                           from a closer position.  Do NOT fall back to a
+                //                           lower clearance: this was the ep7 crash mechanism
+                //                           (budget hit → clearance=5 found a 13-step path
+                //                           through a tight corner → robot clipped the wall).
+                //   node_limit_hit = false → open set drained; A* PROVED there is no
+                //                           clearance=7 path.  Try clearance=5: the frontier
+                //                           is accessible through a slightly tighter corridor.
+                //                           If clearance=5 also fails → hard-BL.
+                let (planned, node_limit_hit) = tokio::task::spawn_blocking(move || {
                     let pl = AStarPlanner::new();
-                    let path = pl.plan_with_clearance(&map_snap, &pose_bl, goal_bl, 7);
-                    let failed = path.is_none();
-                    (path, failed)
+                    pl.plan_with_clearance_detail(&map_snap, &pose_bl, goal_bl, 7)
                 }).await.unwrap_or_else(|_| {
                     warn!(x = goal[0], y = goal[1], "Sim planning: A* task panicked");
-                    (None, true)
+                    (None, false)
                 });
+                // If the primary clearance=7 search exhausted the open set (proven no path),
+                // attempt clearance=5 as a tight-corridor fallback.
+                let (planned, total_failure) = if planned.is_none() && !node_limit_hit {
+                    let map_snap2 = { mapper_plan.read().await.clone() };
+                    let pose_bl2 = *rx_pose_p.borrow_and_update();
+                    let goal_bl2 = goal;
+                    let result = tokio::task::spawn_blocking(move || {
+                        let pl = AStarPlanner::new();
+                        let path = pl.plan_with_clearance(&map_snap2, &pose_bl2, goal_bl2, 5);
+                        let failed = path.is_none();
+                        (path, failed)
+                    }).await.unwrap_or((None, true));
+                    if result.0.is_some() {
+                        info!(x = goal[0], y = goal[1], "Sim planning: clearance=5 tight-corridor fallback succeeded");
+                    }
+                    result
+                } else {
+                    // node_limit_hit: soft-BL, don't attempt fallback
+                    (planned, node_limit_hit)
+                };
                 match planned {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Sim planning: path found");
@@ -2522,13 +2551,11 @@ async fn run_sim_mode(
                     }
                     None => {
                         { let mut s = stats_plan.lock().unwrap(); s.astar_fail += 1; }
-                        warn!(_retry, ?choice, total_failure, "Sim planning: no path to frontier");
-                        // Goals that fail at ALL clearance levels are structurally unreachable
-                        // (e.g. frontier centroid beyond arena wall, or A* exhausted 50k nodes
-                        // on both clearance levels — each search holds the map read-lock the
-                        // entire time, starving the mapper).  Hard-blacklist immediately so we
-                        // never waste another 20-second double A* search on the same dead end.
-                        if total_failure {
+                        warn!(_retry, ?choice, total_failure, node_limit_hit, "Sim planning: no path to frontier");
+                        // total_failure: both clearance levels tried and failed → hard-BL.
+                        // node_limit_hit (soft fail): budget exhausted at clearance=7 — soft-BL
+                        // so the robot retries this frontier later from a closer position.
+                        if total_failure && !node_limit_hit {
                             warn!(x = goal[0], y = goal[1], "Sim planning: A* total failure — hard-blacklisting");
                             let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 4);
                             hard_blacklist.push((goal, exp));
