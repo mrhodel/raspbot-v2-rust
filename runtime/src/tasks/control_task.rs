@@ -5,7 +5,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use bus::Bus;
-use core_types::{CmdVel, Path, SafetyState};
+use core_types::{CmdVel, ExecutiveState, Path, SafetyState};
 use control::PurePursuitController;
 
 /// Spawn the pure-pursuit control task.
@@ -33,9 +33,12 @@ pub fn spawn_control_task(
     obstacle_stop_m: f32,
     mut episode_rx: tokio::sync::watch::Receiver<u32>,
     min_vx_m_s: f32,
+    us_stop_m: f32,
 ) -> tokio::task::JoinHandle<()> {
     const CONTROL_HZ: f64 = 10.0;
     const GOAL_TOLERANCE_M: f32 = 0.25;
+    // US slow zone starts at a fixed 70 cm regardless of mode.
+    const US_SLOW_M: f32 = 0.70;
 
     let bus_ctrl           = Arc::clone(&bus);
     let mut ctrl_rx        = ctrl_rx;
@@ -45,15 +48,16 @@ pub fn spawn_control_task(
     let mut rx_safety_ctrl = bus.safety_state.subscribe();
     let mut rx_us_ctrl     = bus.ultrasonic.subscribe();
     let mut rx_collision_c = bus.collision_count.subscribe();
+    let mut rx_exec_ctrl   = bus.executive_state.subscribe();
     tokio::spawn(async move {
         // US-based speed scaling — independent of MiDaS, always forward-facing.
-        // Slow zone: 70 cm → 30 cm linearly; below 30 cm: vx=0.
-        // us_scale also applied to omega to prevent sweeping into obstacles while rotating.
-        // The US emergency stop still fires at 15 cm (safety task), this is the soft pre-stop.
-        const US_SLOW_M: f32 = 0.70;
-        const US_STOP_M: f32 = 0.30;
+        // us_stop_m is caller-supplied: real robot uses 0.30 m (safety margin before
+        // the 0.25 m safety-task e-stop); sim uses obstacle_stop_m (0.15 m) so that
+        // A* paths at clearance=7 (35 cm wall gap − 15 cm robot radius = 20 cm body
+        // clearance) don't trigger a US stop while the robot navigates around obstacles.
+        let us_stop_m = us_stop_m;
         let mut latest_us_m: f32 = f32::MAX;
-        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.20 m, min_vx {min_vx_m_s:.3} m/s)");
+        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.20 m, min_vx {min_vx_m_s:.3} m/s, us_stop {us_stop_m:.2} m)");
         let controller = PurePursuitController::with_lookahead(0.20);
         let mut current_path: Option<Path> = None;
         let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / CONTROL_HZ));
@@ -118,6 +122,21 @@ pub fn spawn_control_task(
                     smoothed_nearest = f32::MAX;
                     in_near_zone = false;
                     near_zone_clear_since = None;
+                }
+                // Arm event (real robot) — discard any stale pre-arm path so the
+                // robot doesn't lurch on the cached path the moment motors unlock.
+                Ok(()) = rx_exec_ctrl.changed() => {
+                    if *rx_exec_ctrl.borrow_and_update() == ExecutiveState::Exploring {
+                        info!("Control: arm transition — clearing stale path");
+                        current_path = None;
+                        obstacle_stopped = false;
+                        obstacle_stopped_by_us = false;
+                        clear_since = None;
+                        backup_until = None;
+                        cam_obstacle_stopped_since = None;
+                        in_near_zone = false;
+                        near_zone_clear_since = None;
+                    }
                 }
                 // Sim physics collision — clear path and back up if the safety task
                 // is not already handling it (safety escape fires only for US < 25 cm;
@@ -264,41 +283,35 @@ pub fn spawn_control_task(
                                 // Near-center obstacles (±20°): back up straight — spinning
                                 // sweeps the robot body into the same wall (crashes 6, 7).
                                 //
-                                // Proximity guard: only spin when there is enough clearance
-                                // for the body to rotate without clipping the obstacle.
-                                // At nearest < stop_m + 0.15 m (e.g. < 0.30 m in sim) the
-                                // shoulder has < 15 cm to spare — spinning sweeps the robot
-                                // body into the wall even when rotating away from it (crash 9).
+                                // Proximity guard: block spin only when the obstacle is
+                                // near-forward (≤ 20°) AND the robot is too close for the
+                                // body to rotate safely (crash 9: shoulder swept into wall).
+                                // For SIDE obstacles (> 20°) spin is always safe — rotating
+                                // away from a flank obstacle curves the backup arc away from it
+                                // and prevents reversing straight into a rear wall (ep80: robot
+                                // spawned 13cm from 45° obstacle, straight backup → rear crash).
                                 const SPIN_THRESHOLD_RAD: f32 = 0.35; // ~20°
-                                // Raised from 0.15 to 0.20 m: crash 12 had nearest=0.31 m
-                                // (0.01 m above old threshold) → full-speed backup → 0.354 m
-                                // into rear wall at 1.18 s.  0.35 m threshold catches these
-                                // borderline cases; slow/short backup (0.09 m max) stays safe.
                                 const SAFE_SPIN_CLEARANCE_M: f32 = 0.20;
-                                let safe_to_spin = nearest >= obstacle_stop_m + SAFE_SPIN_CLEARANCE_M;
-                                backup_escape_omega = if !safe_to_spin {
-                                    0.0 // too close — straight backup only
-                                } else if nearest_angle > SPIN_THRESHOLD_RAD {
+                                let obstacle_is_side = nearest_angle.abs() > SPIN_THRESHOLD_RAD;
+                                let safe_to_spin = obstacle_is_side
+                                    || nearest >= obstacle_stop_m + SAFE_SPIN_CLEARANCE_M;
+                                backup_escape_omega = if nearest_angle > SPIN_THRESHOLD_RAD {
                                     -1.0 // obstacle left → spin right
                                 } else if nearest_angle < -SPIN_THRESHOLD_RAD {
                                     1.0  // obstacle right → spin left
+                                } else if safe_to_spin {
+                                    0.0  // center obstacle with clearance — straight backup
                                 } else {
-                                    0.0  // obstacle ≤ 20° off-center: straight backup
+                                    0.0  // center obstacle, too close — straight backup
                                 };
-                                // Proximity zone: use half speed to limit blind reverse
-                                // distance.  !safe_to_spin means nearest < stop_m+0.15 m —
-                                // the robot body has < 15 cm shoulder clearance and the
-                                // forward-only US can't see rear obstacles.  At -0.30 m/s
-                                // the robot travels 0.36 m in 1.2 s; at -0.15 m/s it
-                                // travels only 0.18 m, staying clear of corner rear walls.
-                                // Proximity zone: half speed AND shorter duration.
-                                // At -0.15 m/s for 1200 ms = 0.18 m max travel;
-                                // crash 12 had rear gap ≈ 0.125 m → crash at 0.836 s.
-                                // 600 ms → 0.09 m < 0.125 m (35 mm margin).
-                                // 0.09 m + nearest(0.28) = 0.37 m > clear_hysteresis(0.30)
-                                // so obstacle_stopped clears via hysteresis after backup.
-                                backup_escape_vx = if safe_to_spin { -0.30 } else { -0.15 };
-                                let backup_ms = if safe_to_spin { 1200 } else { 600 };
+                                // Proximity zone backup must clear clear_hysteresis_m = 2×stop_m.
+                                // Worst case: nearest = obstacle_stop_m at backup start.
+                                // clear_hysteresis = 2×stop → need travel > stop_m to clear.
+                                // At -0.20 m/s for 900 ms = 0.18 m: from nearest=0.15 m (sim)
+                                // or 0.25 m (real), final nearest = 0.33–0.43 m → above
+                                // clear_hysteresis (0.30 m sim / 0.50 m real).
+                                backup_escape_vx = if safe_to_spin { -0.30 } else { -0.20 };
+                                let backup_ms = if safe_to_spin { 1200 } else { 900 };
                                 warn!(
                                     nearest_m = nearest,
                                     nearest_angle_deg = nearest_angle.to_degrees(),
@@ -317,7 +330,7 @@ pub fn spawn_control_task(
 
                         // If US is still in the stop zone and not yet running a timed backup,
                         // actively reverse to create distance.
-                        if latest_us_m < US_STOP_M && backup_until.is_none() {
+                        if latest_us_m < us_stop_m && backup_until.is_none() {
                             let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: -0.15, vy: 0.0, omega: 0.0 });
                             clear_since = None;
                             continue;
@@ -475,10 +488,10 @@ pub fn spawn_control_task(
                     // Takes minimum with MiDaS scale — whichever is more restrictive wins.
                     let us_scale = if latest_us_m >= US_SLOW_M {
                         1.0_f32
-                    } else if latest_us_m <= US_STOP_M {
+                    } else if latest_us_m <= us_stop_m {
                         0.0_f32
                     } else {
-                        (latest_us_m - US_STOP_M) / (US_SLOW_M - US_STOP_M)
+                        (latest_us_m - us_stop_m) / (US_SLOW_M - us_stop_m)
                     };
                     let combined_scale = speed_scale.min(us_scale);
                     if us_scale < 1.0 {
@@ -492,16 +505,23 @@ pub fn spawn_control_task(
                     if original_vx < 0.0 && cmd_vel.vx < original_vx {
                         cmd_vel.vx = original_vx;
                     }
-                    // Motor deadband floor: any forward vx below min_vx_m_s maps to less than
-                    // min_motor_duty and gets rounded up by cmdvel_to_motor anyway.  Snap to
-                    // min_vx_m_s so the intended slow speed is explicit, not a silent round-up.
+                    // Motor deadband: any forward vx below min_vx_m_s maps to less than
+                    // min_motor_duty and gets silently rounded UP by the hardware.  In tight
+                    // spaces the speed scaling reduces vx to ~0.14 m/s, but rounding to
+                    // min_vx (0.257 m/s) overrides the scaling and the robot creeps into walls.
+                    // Fix: treat sub-deadband as STOP rather than snap-up — the obstacle is
+                    // close enough that we should not move at hardware-minimum speed.
                     if cmd_vel.vx > 0.0 && cmd_vel.vx < min_vx_m_s {
-                        cmd_vel.vx = min_vx_m_s;
+                        cmd_vel.vx = 0.0;
                     }
-                    // Also scale omega by us_scale — prevents sweeping the US sensor into an
-                    // obstacle while rotating (e.g. omega=0.4 sweeps forward-facing US across
-                    // a box, causing sudden 49→15 cm reading with no time to brake).
-                    cmd_vel.omega *= us_scale;
+                    // Scale omega by us_scale only when moving forward — prevents sweeping
+                    // the US sensor into an obstacle while turning.  When vx=0 (spinning in
+                    // place to align with a waypoint), do NOT scale omega: at us_scale≈0.44
+                    // the resulting omega maps to ~15% motor duty, below the 30% stall floor,
+                    // so the robot cannot physically rotate and gets permanently stuck.
+                    if cmd_vel.vx > 0.0 {
+                        cmd_vel.omega *= us_scale;
+                    }
 
                     if combined_scale < 1.0 {
                         let obs_deg     = nearest_angle.to_degrees();
@@ -512,14 +532,29 @@ pub fn spawn_control_task(
                         let obs_side = if obs_deg > 5.0 { "left" } else if obs_deg < -5.0 { "right" } else { "center" };
                         // `toward` is already computed above from unscaled omega.
                         // Deep near-zone hard stop: when in_near_zone and already within
-                        // 8 cm of the stop threshold (nearest ≤ stop_m + 0.08 m ≈ 0.23 m),
+                        // 8 cm of the stop threshold (nearest ≤ stop_m + 0.08 m ≈ 0.33 m),
                         // stop immediately rather than creeping forward at 5–17% speed.
                         // Fixes corner-clip crashes where the robot crept at ~7% into a 55°
                         // side wall — combined_scale was > 0 so the block below was skipped.
+                        // Limit to the forward arc (|obs_deg| ≤ 25°): ToF side-edge columns
+                        // at ±19.69° can see garage walls/objects within 33 cm that are not
+                        // in the robot's path — triggering deep_near_stop there prevents any
+                        // motion even when forward is clear.
                         const DEEP_STOP_MARGIN_M: f32 = 0.08;
-                        let deep_near_stop = in_near_zone && nearest < obstacle_stop_m + DEEP_STOP_MARGIN_M;
+                        const DEEP_STOP_ARC_DEG: f32 = 25.0;
+                        let deep_near_stop = in_near_zone
+                            && nearest < obstacle_stop_m + DEEP_STOP_MARGIN_M
+                            && obs_deg.abs() <= DEEP_STOP_ARC_DEG;
+                        // Frozen-in-near-zone: when in_near_zone and combined_scale is
+                        // negligible (< 5%), the robot creeps at ≈ 0 m/s with no obstacle STOP
+                        // ever firing.  Happens when a side obstacle (e.g. 55°) pulls the robot
+                        // to nearest ≈ 16 cm — just above stop_m (15 cm) — via in_near_zone's
+                        // effective_factor=1.0.  STOP now and let deadlock recovery back out.
+                        // Effective stop threshold ≈ stop_m + 0.05×(slow_m - stop_m) ≈ 18 cm.
+                        const NEAR_ZONE_STOP_SCALE: f32 = 0.05;
+                        let frozen_in_near_zone = in_near_zone && combined_scale < NEAR_ZONE_STOP_SCALE;
 
-                        if combined_scale <= 0.0 || deep_near_stop {
+                        if combined_scale <= 0.0 || deep_near_stop || frozen_in_near_zone {
                             // Hard stop: fire whenever the robot is at or near the stop
                             // threshold, regardless of obstacle angle.
                             //
@@ -535,6 +570,7 @@ pub fn spawn_control_task(
                                     us_m        = latest_us_m,
                                     us_stopped,
                                     deep_near_stop,
+                                    frozen_in_near_zone,
                                     obs_deg,
                                     obs_side,
                                     heading_deg,
@@ -544,7 +580,7 @@ pub fn spawn_control_task(
                                     "Control: obstacle STOP — replan"
                                 );
                                 obstacle_stopped = true;
-                                obstacle_stopped_by_us = !deep_near_stop && us_stopped && !in_forward_arc && !toward;
+                                obstacle_stopped_by_us = !deep_near_stop && !frozen_in_near_zone && us_stopped && !in_forward_arc && !toward;
                                 clear_since = None;
                                 current_path = None;
                                 let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: 0.0, vy: 0.0, omega: 0.0 });

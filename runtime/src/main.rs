@@ -435,22 +435,26 @@ async fn main() -> anyhow::Result<()> {
         loop {
             match tof.read_scan().await {
                 Ok(scan) => {
-                    // Nearest obstacle across all rays.
+                    // Nearest obstacle — restricted to inner 6 of 8 columns (±14.06°).
+                    // The outer two columns (col 0 / col 7 at ±19.69°) pick up the
+                    // garage side walls at ~42 cm.  That's within the 50 cm
+                    // clear-hysteresis threshold and permanently latches
+                    // obstacle_stopped, preventing any forward motion.  The US
+                    // sensor covers the true forward emergency stop (25 cm); ToF
+                    // safety channels only need the ±14° forward cone.
+                    // All 8 columns still feed vision_pseudo_lidar for mapping.
+                    const SAFETY_ARC_RAD: f32 = 14.1 * std::f32::consts::PI / 180.0;
                     let (nearest_m, nearest_angle_rad) = scan.rays.iter()
+                        .filter(|r| r.angle_rad.abs() <= SAFETY_ARC_RAD)
                         .fold((f32::MAX, 0.0_f32), |(min_r, min_a), r| {
                             if r.range_m < min_r { (r.range_m, r.angle_rad) } else { (min_r, min_a) }
                         });
                     let nearest_m = if nearest_m == f32::MAX { 3.0 } else { nearest_m };
-                    // Only override nearest_obstacle_m if ToF sees something CLOSER than
-                    // the current MiDaS reading.  MiDaS (wide FOV) is the baseline owner;
-                    // ToF (narrow ±20°, precise) overrides only when it detects an imminent
-                    // forward obstacle.  This prevents the 20 Hz ToF open-space value (3.0m)
-                    // from washing out MiDaS detections at wider angles.
-                    let current_nearest = *bus_tof.nearest_obstacle_m.borrow();
-                    if nearest_m < current_nearest {
-                        let _ = bus_tof.nearest_obstacle_m.send(nearest_m);
-                        let _ = bus_tof.nearest_obstacle_angle_rad.send(nearest_angle_rad);
-                    }
+                    // ToF is the sole owner of nearest_obstacle_m — MiDaS was removed from
+                    // safety channels (mapping-only).  Always publish so VIS correctly reflects
+                    // current ToF reading and clears when obstacles leave the arc.
+                    let _ = bus_tof.nearest_obstacle_m.send(nearest_m);
+                    let _ = bus_tof.nearest_obstacle_angle_rad.send(nearest_angle_rad);
                 }
                 Err(e) => tracing::error!("ToF error: {e}"),
             }
@@ -542,15 +546,13 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 let _ = bus_perc.vision_depth.send(Arc::new(depth));
                                 let _ = bus_perc.vision_pseudo_lidar.send(Arc::new(scan));
-                                // Publish MiDaS nearest obstacle too: ToF covers ±20° forward
-                                // only, MiDaS provides wider FOV coverage for the safety channels.
-                                // Rolling-min (near_m_min) prevents single noisy far readings
-                                // from causing false clears.
-                                let _ = bus_perc.nearest_obstacle_m.send(near_m_min);
-                                // Reset angle to 0 when clear so the orange dot doesn't
-                                // float at a stale angle when nearest_m returns to 3.0m.
-                                let publish_angle = if near_m_min >= 3.0 { 0.0 } else { near_angle_rad };
-                                let _ = bus_perc.nearest_obstacle_angle_rad.send(publish_angle);
+                                // MiDaS is a MAPPING sensor only — it feeds the occupancy grid
+                                // via vision_pseudo_lidar.  It must NOT publish to the safety
+                                // channels (nearest_obstacle_m / nearest_obstacle_angle_rad)
+                                // because MiDaS assigns near-maximum inverse depth to dark
+                                // objects against bright backgrounds (e.g. dark shirt on white
+                                // wall reads as 0.03–0.30 m when the real distance is > 1 m).
+                                // Safety distances come from US (forward) and ToF (±20° arc).
                             }
                             Err(e) => error!("Depth inference error: {e}"),
                         }
@@ -578,19 +580,21 @@ async fn main() -> anyhow::Result<()> {
     let mapper_plan     = Arc::clone(&mapper);
     let mut plan_rx     = plan_frontier_rx;
     let mut rx_pose_p   = bus.slam_pose2d.subscribe();
+    let mut rx_exec_p   = bus.executive_state.subscribe();
     let plan_handle = tokio::spawn(async move {
         use tokio::time::Instant;
+        use core_types::ExecutiveState;
         const GOAL_BLACKLIST_SECS: u64 = 30;
-        info!("Planning task started (A*, 4-cell clearance)");
-        let planner = AStarPlanner::new();
+        info!("Planning task started (A*, 6-cell min clearance)");
         // (goal_m, expiry): goals to skip — filled when A* fails OR same goal repeats.
         let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
         let mut last_goal: Option<[f32; 2]> = None;
         let mut last_path_sent_at: Option<Instant> = None;
         // How many consecutive times the same goal must be selected before it is
-        // blacklisted.  2 is too eager — a replan after an obstacle stop often
-        // re-selects the nearest frontier before the robot has moved at all.
-        const SAME_GOAL_BLACKLIST_COUNT: u32 = 3;
+        // blacklisted.  With PATH_COMMIT_S=2 each streak step takes ≥2 s, so
+        // count=6 gives the robot ~12 s on a goal before soft-blacklisting —
+        // enough to circumnavigate a single obstacle (was 3 → 6 s, too eager).
+        const SAME_GOAL_BLACKLIST_COUNT: u32 = 6;
         let mut same_goal_streak: u32 = 0;
         // Safety valve: if every frontier fails A* repeatedly the blacklist
         // saturates and the robot is permanently stuck.  After this many
@@ -605,21 +609,40 @@ async fn main() -> anyhow::Result<()> {
         const MAX_STUCK_RESETS: u32 = 3;
         let mut stuck_resets: u32 = 0;
         loop {
+            // Clear blacklist on arm so goals burned pre-arm don't block real exploration.
+            if rx_exec_p.has_changed().unwrap_or(false) {
+                if *rx_exec_p.borrow_and_update() == ExecutiveState::Exploring {
+                    info!("Planning: arm transition — clearing blacklist for fresh start");
+                    goal_blacklist.clear();
+                    same_goal_streak = 0;
+                    consecutive_failures = 0;
+                    no_frontier_streak = 0;
+                    stuck_resets = 0;
+                    last_goal = None;
+                    last_path_sent_at = None;
+                }
+            }
             let Some(choice) = plan_rx.recv().await else { break };
             let now = Instant::now();
             goal_blacklist.retain(|(_, exp)| *exp > now);
             let bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
 
             let pose = *rx_pose_p.borrow_and_update();
-            let reach = {
+            let (map_snap, start_cell, raw_frontiers) = {
                 let m = mapper_plan.read().await;
                 let start_cell = m.world_to_cell(pose.x_m, pose.y_m);
-                reachable_set(&m, start_cell, 5, 50_000)
+                let frontiers = m.last_frontiers.clone();
+                (m.clone(), start_cell, frontiers)
             };
-            let raw_frontiers: Vec<core_types::Frontier> = {
-                let m = mapper_plan.read().await;
-                m.last_frontiers.clone()
-            };
+            // Quick annotation before BFS: empty reach = all reachable.
+            // Goal/blacklist/distance colors appear immediately; gray unreachable
+            // colors follow after BFS completes below.
+            let _ = bus_plan.map_frontier_annotations.send(
+                annotate_frontiers(&raw_frontiers, &Default::default(), &bl, &[], last_goal, &pose)
+            );
+            let reach = tokio::task::spawn_blocking(move || {
+                reachable_set(&map_snap, start_cell, 5, 50_000)
+            }).await.expect("BFS blocking task panicked");
             let annotated = annotate_frontiers(&raw_frontiers, &reach, &bl, &[], last_goal, &pose);
             let _ = bus_plan.map_frontier_annotations.send(annotated);
             let maybe_goal = {
@@ -674,11 +697,20 @@ async fn main() -> anyhow::Result<()> {
                 }
                 last_goal = Some(goal);
 
-                let planned = {
-                    let m = mapper_plan.read().await;
-                    planner.plan_with_clearance(&m, &pose, goal, 7)
-                        .or_else(|| planner.plan_with_clearance(&m, &pose, goal, 5))
-                        .or_else(|| planner.plan_with_clearance(&m, &pose, goal, 3))
+                // Run A* on a blocking thread (same reasoning as sim path above).
+                let map_snap = { mapper_plan.read().await.clone() };
+                let pose_bl = pose; let goal_bl = goal;
+                let planned = match tokio::time::timeout(
+                    tokio::time::Duration::from_secs(3),
+                    tokio::task::spawn_blocking(move || {
+                        // Minimum clearance = 6 cells (30 cm from walls).
+                        let pl = AStarPlanner::new();
+                        pl.plan_with_clearance(&map_snap, &pose_bl, goal_bl, 7)
+                            .or_else(|| pl.plan_with_clearance(&map_snap, &pose_bl, goal_bl, 6))
+                    })
+                ).await {
+                    Ok(Ok(result)) => result,
+                    _ => { warn!(x = goal[0], y = goal[1], "Planning: A* timeout — blacklisting"); None }
                 };
                 match planned {
                     Some(path) => {
@@ -737,8 +769,11 @@ async fn main() -> anyhow::Result<()> {
     // The ToF task publishes to nearest_obstacle_m at up to 60 Hz (much faster than
     // MiDaS at ~3 Hz), giving the control task clean metric readings for speed scaling.
     // US (70 cm slow, 30 cm stop) provides an independent forward-facing interlock.
-    let min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * control::MAX_VX;
-    let ctrl_handle = spawn_control_task(Arc::clone(&bus), control_path_rx, 0.70, 0.25, episode_dummy_rx, min_vx);
+    // min_vx=0: let the motor hardware handle sub-deadband commands naturally.
+    // Snapping to min_vx in a garage (walls always within 70 cm) zeroes forward
+    // motion completely — the robot never moves forward.
+    let ctrl_handle = spawn_control_task(Arc::clone(&bus), control_path_rx, 0.70, 0.25, episode_dummy_rx, 0.0,
+        cfg.agent.safety.us_stop_m);
 
     // ── Motor execution task ──────────────────────────────────────────────────
     // Drains both the safety motor_command channel and the controller cmdvel
@@ -1013,7 +1048,7 @@ async fn main() -> anyhow::Result<()> {
 /// matching real hardware behaviour in both real and sim modes.
 fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8, min_duty: i8) -> MotorCommand {
     const MAX_VX:    f32 = 0.3;  // m/s — matches PurePursuitController::MAX_VX
-    const MAX_OMEGA: f32 = 1.5;  // rad/s — matches PurePursuitController::MAX_OMEGA
+    const MAX_OMEGA: f32 = 4.0;  // rad/s — real robot: 4.8 rad/s @ 35% duty; must match control/lib.rs
 
     let vx_n    = (cmd.vx    / MAX_VX   ).clamp(-1.0, 1.0);
     let vy_n    = (cmd.vy    / MAX_VX   ).clamp(-1.0, 1.0);
@@ -1275,7 +1310,9 @@ fn annotate_frontiers(
         };
         let fcx = (f.centroid_x_m / RES).floor() as i32;
         let fcy = (f.centroid_y_m / RES).floor() as i32;
-        let reachable = (-8_i32..=8).any(|ddx| {
+        // Empty reach set = skip reachability check (treat all as reachable).
+        // Used for quick pre-BFS annotations so goal/blacklist colors appear instantly.
+        let reachable = reach.is_empty() || (-8_i32..=8).any(|ddx| {
             (-8_i32..=8).any(|ddy| reach.contains(&(fcx + ddx, fcy + ddy)))
         });
         let status = if is_goal {
@@ -1401,7 +1438,7 @@ fn print_sim_summary(stats: &SimRunStats, bus: &bus::Bus) {
     sect("ROOM OUTCOMES");
     kv("Explored (complete)", format!("{}", n_complete));
     kv("Timed out",           format!("{}", n_timeout));
-    kv("Phys. blocked exit",  format!("{}", n_bl_stuck));
+    kv("BL-stuck (partial)",  format!("{}", n_bl_stuck));
     kv("Cascade crash exit",  format!("{}", n_cascade));
     kv("Isolated (A* stuck)", format!("{}", n_isolated));
     kv("Episode reset",       format!("{}", n_reset));
@@ -1495,7 +1532,8 @@ async fn run_sim_mode(
     let mut motor: Box<dyn MotorController>  = Box::new(sim_state.motor_controller());
     let mut gimbal: Box<dyn Gimbal>          = Box::new(sim_state.gimbal(&cfg.hal.gimbal));
     let max_motor_duty = cfg.hal.motor.max_speed as i8;
-    let min_motor_duty = cfg.robot.min_speed as i8;
+    // min_motor_duty not used in sim — sim has no hardware deadband.
+    // cmdvel_to_motor is called with min_duty=0 in all sim motor paths.
     info!(seed, "Sim HAL initialised");
 
     // ── Perception pipeline ───────────────────────────────────────────────────
@@ -1866,7 +1904,10 @@ async fn run_sim_mode(
                     );
                     if armed && safe {
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty);
+                        // Sim has no motor deadband — pass min_duty=0 so sub-threshold
+                        // wheel duties are not snapped up, preventing asymmetric lurching
+                        // when vx and omega combine near the deadband threshold.
+                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, 0);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (ctrl): {e}");
                         }
@@ -1888,7 +1929,7 @@ async fn run_sim_mode(
                     if matches!(*rx_exec_m.borrow(), ExecutiveState::ManualDrive) {
                         let vel = *manual_rx.borrow_and_update();
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, 0);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (manual): {e}");
                         }
@@ -1899,7 +1940,7 @@ async fn run_sim_mode(
                     if matches!(state, ExecutiveState::ManualDrive) {
                         // In manual drive: re-send held velocity so keys feel responsive.
                         let vel = *manual_rx.borrow();
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, 0);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor watchdog manual error: {e}");
                         }
@@ -1932,6 +1973,7 @@ async fn run_sim_mode(
     let mut rx_pose_p = bus.slam_pose2d.subscribe();
     let mut rx_scan_p = bus.vision_pseudo_lidar.subscribe();
     let mut episode_rx_plan = episode_reset_rx.clone();
+    let mut rx_exec_plan = bus.executive_state.subscribe();
     let timeout_tx_plan = timeout_tx.clone();
     let _force_respawn_tx_plan = force_respawn_tx.clone();
     let explore_done_tx_plan = explore_done_tx.clone();
@@ -1944,7 +1986,6 @@ async fn run_sim_mode(
         // force an episode reset rather than cycling indefinitely until MAX_STEPS.
         const MAX_ESCAPE_FAILURES: u32 = 3;
         info!("Sim planning task started (A*, 4-cell clearance)");
-        let planner = AStarPlanner::new();
         let mut goal_blacklist: Vec<([f32; 2], Instant)> = Vec::new();
         // Hard blacklist: no-progress and collision-based entries.
         // NOT cleared on A*-saturation so the robot doesn't immediately retry
@@ -1978,6 +2019,10 @@ async fn run_sim_mode(
         // The 6 s window is shorter than REPLAN_HOLD_S=15 s to break the spin cycle
         // quickly; it's longer than typical planning ticks (~1 s) to avoid false fires.
         let mut no_progress_pos: Option<([f32; 2], Instant)> = None;
+        // Wall-clock start of the current room (reset on episode reset).
+        // Used by the fast-fail check: if cells explored is negligible after
+        // FAST_FAIL_SECS, the robot is isolated in a pocket — exit early.
+        let mut room_start_plan = Instant::now();
         loop {
             let choice;
             tokio::select! {
@@ -2000,7 +2045,29 @@ async fn run_sim_mode(
                     // trigger a false "crash detected" the first time the loop runs).
                     last_crash_plan = *bus_plan.collision_count.borrow();
                     no_progress_pos = None;
+                    room_start_plan = Instant::now();
                     while plan_rx.try_recv().is_ok() {}
+                    continue;
+                }
+                Ok(()) = rx_exec_plan.changed() => {
+                    if *rx_exec_plan.borrow_and_update() == core_types::ExecutiveState::Exploring {
+                        // Soft blacklist (goal_blacklist) cleared on arm: pre-arm "reached"
+                        // entries shouldn't block post-arm exploration.
+                        // Hard blacklist kept: hard entries are proven A* failures; clearing
+                        // them on arm causes the robot to immediately retry just-timed-out
+                        // frontiers, saturating the planner before exploration begins.
+                        info!("Sim planning: arm transition — clearing soft blacklist");
+                        goal_blacklist.clear();
+                        consecutive_failures = 0;
+                        escape_failures = 0;
+                        escape_cycles = 0;
+                        no_frontier_streak = 0;
+                        last_goal = None;
+                        last_path_sent_at = None;
+                        goal_first_sent_at = None;
+                        no_progress_pos = None;
+                        while plan_rx.try_recv().is_ok() {}
+                    }
                     continue;
                 }
                 maybe = plan_rx.recv() => {
@@ -2075,6 +2142,7 @@ async fn run_sim_mode(
                         goal_first_sent_at = None;
                         no_progress_pos = None;
                         last_crash_plan = *bus_plan.collision_count.borrow();
+                        room_start_plan = Instant::now();
                         while plan_rx.try_recv().is_ok() {}
                         continue;
                     }
@@ -2084,27 +2152,29 @@ async fn run_sim_mode(
             // BFS reachability pre-screen: compute the robot's reachable cell set once
             // per planning trigger (not per retry).  Used by select_frontier_goal to
             // skip frontiers that A* can never reach, avoiding MAX_NODES exhaustion.
-            // clearance=5 matches the single A* level we attempt, so the BFS pre-screen
-            // rejects exactly the frontiers A* will also reject at clearance=5.
+            // Run on a blocking thread (same reason as A*: CPU-bound, must not block
+            // the async worker threads used by the mapping task).
             let pose_pre = *rx_pose_p.borrow_and_update();
-            let reach = {
+            let soft_bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
+            let hard_bl: Vec<[f32; 2]> = hard_blacklist.iter().map(|(g, _)| *g).collect();
+            let (map_snap_bfs, raw_frontiers) = {
                 let m = mapper_plan.read().await;
-                let start_cell = m.world_to_cell(pose_pre.x_m, pose_pre.y_m);
-                reachable_set(&m, start_cell, 5, 50_000)
+                let frontiers = m.last_frontiers.clone();
+                (m.clone(), frontiers)
             };
-
-            // Annotate frontiers with planner state for display.
-            // Clone frontier list quickly then release the lock, then annotate lock-free.
-            {
-                let soft_bl: Vec<[f32; 2]> = goal_blacklist.iter().map(|(g, _)| *g).collect();
-                let hard_bl: Vec<[f32; 2]> = hard_blacklist.iter().map(|(g, _)| *g).collect();
-                let raw_frontiers: Vec<core_types::Frontier> = {
-                    let m = mapper_plan.read().await;
-                    m.last_frontiers.clone()
-                };
-                let annotated = annotate_frontiers(&raw_frontiers, &reach, &soft_bl, &hard_bl, last_goal, &pose_pre);
-                let _ = bus_plan.map_frontier_annotations.send(annotated);
-            }
+            // Quick annotation before BFS: goal/blacklist/distance colors appear
+            // immediately; gray unreachable colors follow after BFS completes.
+            let _ = bus_plan.map_frontier_annotations.send(
+                annotate_frontiers(&raw_frontiers, &Default::default(), &soft_bl, &hard_bl, last_goal, &pose_pre)
+            );
+            let pose_bfs = pose_pre;
+            let reach = tokio::task::spawn_blocking(move || {
+                let start_cell = map_snap_bfs.world_to_cell(pose_bfs.x_m, pose_bfs.y_m);
+                reachable_set(&map_snap_bfs, start_cell, 5, 50_000)
+            }).await.expect("BFS blocking task panicked");
+            // Full annotation with reachability (updates gray unreachable frontiers).
+            let annotated = annotate_frontiers(&raw_frontiers, &reach, &soft_bl, &hard_bl, last_goal, &pose_pre);
+            let _ = bus_plan.map_frontier_annotations.send(annotated);
 
             // Goal-reached blacklist: if the robot has closed within MIN_GOAL_DIST of
             // last_goal, the control task already cleared its path on arrival.  Blacklist
@@ -2115,7 +2185,19 @@ async fn run_sim_mode(
                 if let Some(lg) = last_goal {
                     let dx = lg[0] - pose_pre.x_m;
                     let dy = lg[1] - pose_pre.y_m;
-                    if (dx * dx + dy * dy).sqrt() < MIN_GOAL_DIST {
+                    // Also check current centroid of any frontier near the committed goal:
+                    // frontier centroids drift as new cells are observed, so the yellow
+                    // marker may now be within MIN_GOAL_DIST of the robot even though
+                    // `lg` (the original committed position) is farther away.
+                    let near_current_centroid = {
+                        let m = mapper_plan.read().await;
+                        m.last_frontiers.iter().any(|f| {
+                            let df = ((f.centroid_x_m - lg[0]).powi(2) + (f.centroid_y_m - lg[1]).powi(2)).sqrt();
+                            let dr = ((f.centroid_x_m - pose_pre.x_m).powi(2) + (f.centroid_y_m - pose_pre.y_m).powi(2)).sqrt();
+                            df < 1.0 && dr < MIN_GOAL_DIST
+                        })
+                    };
+                    if (dx * dx + dy * dy).sqrt() < MIN_GOAL_DIST || near_current_centroid {
                         info!(gx = lg[0], gy = lg[1], "Sim planning: robot reached goal area — blacklisting");
                         let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
                         goal_blacklist.push((lg, exp));
@@ -2154,7 +2236,30 @@ async fn run_sim_mode(
                         // blacklist and reset the streak so post-arm exploration proceeds.
                         const MIN_CELLS_FOR_DONE: usize = 10_000;
                         if cells >= MIN_CELLS_FOR_DONE {
-                            info!(no_frontier_streak, cells, "Exploration complete — no reachable frontiers remaining");
+                            // Three cases:
+                            // A) Both BLs empty → all remaining frontiers are genuinely
+                            //    unreachable (too small / too close / BFS-unreachable).
+                            //    Genuine exploration complete.
+                            // B) Hard-BL non-empty → A*-proven unreachable frontiers are
+                            //    blocking; robot is isolated.  Stalled exit.
+                            // C) Soft-BL non-empty, hard-BL empty → slow-nav timeouts
+                            //    filled the soft list.  Clear it and retry — the robot
+                            //    may reach those frontiers from a different approach angle.
+                            if !goal_blacklist.is_empty() && hard_blacklist.is_empty() {
+                                info!(no_frontier_streak, cells, soft_bl = goal_blacklist.len(),
+                                    "Exploration: soft-BL saturated — clearing and retrying");
+                                goal_blacklist.clear();
+                                no_frontier_streak = 0;
+                                break 'planning; // continue outer loop, try again
+                            }
+                            if hard_blacklist.is_empty() {
+                                info!(no_frontier_streak, cells, "Exploration complete — room fully explored");
+                            } else {
+                                warn!(no_frontier_streak, cells, hard_bl = hard_blacklist.len(),
+                                    "Exploration stalled — hard-blacklist exhausted all frontiers (partial room)");
+                                let mut s = stats_plan.lock().unwrap();
+                                s.next_room_reason = Some("hard_bl_isolated");
+                            }
                             // Signal the sim tick task to start a new room.
                             let _ = explore_done_tx_plan.send(()).await;
                             // Drain any queued FrontierChoice so we don't plan on the old map.
@@ -2175,9 +2280,46 @@ async fn run_sim_mode(
                             goal_first_sent_at = None;
                             no_progress_pos = None;
                             last_crash_plan = *bus_plan.collision_count.borrow();
+                            room_start_plan = Instant::now();
                             while plan_rx.try_recv().is_ok() {}
                             continue; // back to the outer select! loop
                         }
+                        // Fast-fail: if the robot has been in this room for
+                        // FAST_FAIL_SECS and has explored fewer than MIN_PROGRESS_CELLS,
+                        // it spawned in an isolated pocket and will never reach the main
+                        // arena.  Exit immediately rather than wasting 15 min.
+                        // Observed pattern: 7/82 rooms (0, 30, 109, 403, 1066, 1928,
+                        // 2951 cells at timeout) each burned a full 900 s episode.
+                        const MIN_PROGRESS_CELLS: usize = 3_000;
+                        const FAST_FAIL_SECS: u64 = 180; // 3 minutes
+                        if explore_mode
+                            && cells < MIN_PROGRESS_CELLS
+                            && room_start_plan.elapsed().as_secs() >= FAST_FAIL_SECS
+                        {
+                            warn!(cells, elapsed_s = room_start_plan.elapsed().as_secs(),
+                                "Planning: fast-fail — robot isolated in pocket (< {MIN_PROGRESS_CELLS} cells after {FAST_FAIL_SECS}s)");
+                            { let mut s = stats_plan.lock().unwrap(); s.next_room_reason = Some("isolated_pocket"); }
+                            let _ = explore_done_tx_plan.send(()).await;
+                            while plan_rx.try_recv().is_ok() {}
+                            let _ = episode_rx_plan.borrow_and_update();
+                            let _ = episode_rx_plan.changed().await;
+                            let _ = episode_rx_plan.borrow_and_update();
+                            goal_blacklist.clear();
+                            hard_blacklist.clear();
+                            consecutive_failures = 0;
+                            escape_failures = 0;
+                            escape_cycles = 0;
+                            no_frontier_streak = 0;
+                            last_goal = None;
+                            last_path_sent_at = None;
+                            goal_first_sent_at = None;
+                            no_progress_pos = None;
+                            last_crash_plan = *bus_plan.collision_count.borrow();
+                            room_start_plan = Instant::now();
+                            while plan_rx.try_recv().is_ok() {}
+                            continue;
+                        }
+
                         // Two cases:
                         // A) Pre-arm: robot hasn't moved, soft-blacklisted the spawn
                         //    scan frontiers.  Clear soft blacklist only.
@@ -2211,6 +2353,7 @@ async fn run_sim_mode(
                             goal_first_sent_at = None;
                             no_progress_pos = None;
                             last_crash_plan = *bus_plan.collision_count.borrow();
+                            room_start_plan = Instant::now();
                             while plan_rx.try_recv().is_ok() {}
                             continue;
                         }
@@ -2223,9 +2366,9 @@ async fn run_sim_mode(
 
                 // REPLAN_HOLD_S: how long a frontier must persist after we sent a path
                 // to it before it's considered stuck (robot couldn't make progress).
-                // 15 s gives enough time for the robot to reach frontiers 3-5 m away
-                // at 0.3 m/s.  Premature blacklisting was causing 91%+ blacklist ratios.
-                const REPLAN_HOLD_S: u64 = 15;
+                // 25 s: at 0.3 m/s in slow zone, robot needs ~13 s to reach a 4 m goal.
+                // 15 s was too short — nearly every goal timed out in rooms with obstacles.
+                const REPLAN_HOLD_S: u64 = 25;
                 // RESEND_HOLD_S: minimum time before resending the same path.
                 // 1 s keeps path fresh from current pose; paths refreshed every second
                 // also reset last_path_sent_at, preventing path_sent_and_expired from
@@ -2246,9 +2389,12 @@ async fn run_sim_mode(
                     && goal_first_sent_at.map_or(false, |t| {
                         now.duration_since(t).as_secs() >= REPLAN_HOLD_S
                     });
-                // No-progress blacklist: robot hasn't moved ≥ 0.2 m in 6 s while
-                // pursuing this goal → deadlock/spin cycle near a blocked frontier.
-                // Blacklist sooner than REPLAN_HOLD_S to break the spin cycle fast.
+                // No-progress blacklist: robot hasn't moved ≥ 0.2 m closer to goal within
+                // the adaptive timeout → deadlock/spin cycle near a blocked frontier.
+                // Toward-goal (not raw displacement) so backup cycles don't reset the timer.
+                // Timeout is adaptive: 6 s when goal is close (livelock next to obstacle),
+                // up to 12 s when goal is far away (time to circumnavigate an obstacle).
+                // Formula: 1.5 × (goal_dist / 0.30 m/s), clamped [6, 12] s.
                 let pose_now = *rx_pose_p.borrow();
                 let no_progress_timeout = if goal_matches_last {
                     let (ref_pos, ref_t) = no_progress_pos.get_or_insert_with(|| {
@@ -2259,15 +2405,25 @@ async fn run_sim_mode(
                     // the goal), which used to reset the timer and prevent no_progress
                     // from ever firing during repeated backup/retry cycles.
                     // Only reset if the robot got ≥ 0.20 m closer to the goal.
-                    let prev_dist = ((ref_pos[0] - goal[0]).powi(2) + (ref_pos[1] - goal[1]).powi(2)).sqrt();
-                    let curr_dist = ((pose_now.x_m - goal[0]).powi(2) + (pose_now.y_m - goal[1]).powi(2)).sqrt();
-                    if prev_dist - curr_dist >= 0.20 {
-                        // Robot advanced ≥ 0.2 m toward goal — genuine progress.
+                    // Displacement from last checkpoint (not toward-goal distance).
+                    // Toward-goal failed when A* routes around obstacles — lateral
+                    // movement doesn't decrease straight-line goal distance even though
+                    // the robot is navigating correctly, causing premature no-progress.
+                    // Displacement resets the timer as long as the robot is moving
+                    // anywhere.  Backup cycles don't fool it: 0.18 m back then 0.18 m
+                    // forward returns to the reference position (displacement ≈ 0).
+                    let disp = ((pose_now.x_m - ref_pos[0]).powi(2) + (pose_now.y_m - ref_pos[1]).powi(2)).sqrt();
+                    if disp >= 0.20 {
+                        // Robot moved ≥ 0.2 m from last checkpoint — genuine progress.
                         *ref_pos = [pose_now.x_m, pose_now.y_m];
                         *ref_t   = now;
                         false
                     } else {
-                        now.duration_since(*ref_t).as_secs() >= 6
+                        // Adaptive timeout: short when close (spin livelock next to goal),
+                        // longer when far away (navigating around obstacles).
+                        let goal_dist = ((pose_now.x_m - goal[0]).powi(2) + (pose_now.y_m - goal[1]).powi(2)).sqrt();
+                        let no_progress_secs = (goal_dist / 0.30 * 1.5).clamp(6.0, 12.0) as u64;
+                        now.duration_since(*ref_t).as_secs() >= no_progress_secs
                     }
                 } else {
                     // New goal — reset checkpoint.
@@ -2291,15 +2447,29 @@ async fn run_sim_mode(
                 }
                 if path_sent_and_expired || no_progress_timeout {
                     let age = goal_first_sent_at.map_or(0, |t| now.duration_since(t).as_secs());
-                    let reason = if no_progress_timeout && !path_sent_and_expired {
-                        "no-progress (stuck/spinning)"
+                    if no_progress_timeout && !path_sent_and_expired {
+                        // No-progress: robot was navigating but not closing on the goal —
+                        // wrong approach angle or temporary obstacle.  Use soft BL so the
+                        // area can be retried when no other frontiers remain (soft BL is
+                        // cleared by the no-frontier-streak logic).  Hard BL here caused
+                        // premature room exit: one blocked frontier isolated the robot
+                        // before the room was meaningfully explored.
+                        warn!(x = goal[0], y = goal[1], age_s = age,
+                              "Sim planning: goal unreached — soft-blacklisting (no-progress)");
+                        let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                        goal_blacklist.push((goal, exp));
                     } else {
-                        "timeout"
-                    };
-                    warn!(x = goal[0], y = goal[1], age_s = age, reason,
-                          "Sim planning: goal unreached — hard-blacklisting");
-                    let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 4);
-                    hard_blacklist.push((goal, exp));
+                        // Slow navigation: robot was making displacement progress (backup
+                        // maneuvers reset the no-progress timer) but didn't reach the goal
+                        // within REPLAN_HOLD_S.  Soft-BL so the frontier can be retried
+                        // after the blacklist expires.  Hard-BL here caused rooms to exit
+                        // early after just 1-2 such events even with plenty of open space —
+                        // the robot was navigating legitimately, just slowly.
+                        warn!(x = goal[0], y = goal[1], age_s = age,
+                              "Sim planning: goal unreached — soft-blacklisting (slow nav)");
+                        let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 2);
+                        goal_blacklist.push((goal, exp));
+                    }
                     last_goal = None;
                     last_path_sent_at = None;
                     goal_first_sent_at = None;
@@ -2312,24 +2482,34 @@ async fn run_sim_mode(
                 }
                 last_goal = Some(goal);
 
-                // Plan at clearance=7 (35 cm from walls) first. With robot radius 0.15 m
-                // this gives 20 cm of body clearance, preventing corner-clip crashes where
-                // the obstacle is just outside the ±55° sensor FOV. Falls back to clearance=5
-                // (25 cm, 10 cm body clearance) for tight corridors where clearance=7 finds
-                // no path. Clearance=3 is no longer tried — it allowed the robot body to
-                // touch walls outside the FOV, causing physics collisions.
+                // Plan at clearance=7 (35 cm from walls) only.  With robot radius 0.15 m
+                // this gives 20 cm of body clearance.  The previous clearance=5 fallback
+                // (25 cm, 10 cm body clearance) caused crashes: when clearance=7 exhausts
+                // its 50k-node budget (tight pocket in maze), clearance=5 finds a marginal
+                // path through a narrow corridor; the robot follows it and clips the wall.
+                // When clearance=7 fails, hard-blacklist the goal — the area is genuinely
+                // too tight for safe navigation in sim.
                 // Tight-corridor escape still uses [7,5,3,2,1,0] separately below.
-                let mut planned = None;
-                let mut total_failure = false;
-                {
-                    let m = mapper_plan.read().await;
-                    if let Some(path) = planner.plan_with_clearance(&m, &pose, goal, 7)
-                        .or_else(|| planner.plan_with_clearance(&m, &pose, goal, 5)) {
-                        planned = Some(path);
-                    } else {
-                        total_failure = true;
-                    }
-                }
+                // Run A* on a blocking thread so the tokio async worker threads
+                // remain free for mapping/control during the search.
+                // A* at 50k nodes is synchronous CPU work — running it inline in
+                // an async task monopolises a worker thread and starves the mapper.
+                let map_snap = { mapper_plan.read().await.clone() };
+                let pose_bl = pose; let goal_bl = goal;
+                // No wall-clock timeout — A* runs until it finds a path or exhausts
+                // MAX_NODES (50k).  In debug builds A* is ~10× slower than release;
+                // a 3-second timeout was firing on reachable frontiers, permanently
+                // hard-blacklisting them and starving the planner of valid goals.
+                // spawn_blocking keeps async worker threads free regardless of duration.
+                let (planned, total_failure) = tokio::task::spawn_blocking(move || {
+                    let pl = AStarPlanner::new();
+                    let path = pl.plan_with_clearance(&map_snap, &pose_bl, goal_bl, 7);
+                    let failed = path.is_none();
+                    (path, failed)
+                }).await.unwrap_or_else(|_| {
+                    warn!(x = goal[0], y = goal[1], "Sim planning: A* task panicked");
+                    (None, true)
+                });
                 match planned {
                     Some(path) => {
                         info!(waypoints = path.waypoints.len(), "Sim planning: path found");
@@ -2344,27 +2524,36 @@ async fn run_sim_mode(
                         { let mut s = stats_plan.lock().unwrap(); s.astar_fail += 1; }
                         warn!(_retry, ?choice, total_failure, "Sim planning: no path to frontier");
                         // Goals that fail at ALL clearance levels are structurally unreachable
-                        // (e.g. frontier centroid beyond arena wall).  Use a 10× longer
-                        // blacklist so they don't dominate retry cycles.
-                        let bl_secs = if total_failure { GOAL_BLACKLIST_SECS * 10 } else { GOAL_BLACKLIST_SECS };
-                        let exp = now + std::time::Duration::from_secs(bl_secs);
-                        goal_blacklist.push((goal, exp));
+                        // (e.g. frontier centroid beyond arena wall, or A* exhausted 50k nodes
+                        // on both clearance levels — each search holds the map read-lock the
+                        // entire time, starving the mapper).  Hard-blacklist immediately so we
+                        // never waste another 20-second double A* search on the same dead end.
+                        if total_failure {
+                            warn!(x = goal[0], y = goal[1], "Sim planning: A* total failure — hard-blacklisting");
+                            let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 4);
+                            hard_blacklist.push((goal, exp));
+                        } else {
+                            let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
+                            goal_blacklist.push((goal, exp));
+                        }
                         last_goal = None;
                         consecutive_failures += 1;
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                             let mut escaped = false;
                             if let Some(ref scan) = last_scan {
                                 if let Some(target) = sim_escape(&bus_plan, &pose, scan, consecutive_failures).await {
-                                    // Release lock between each level so mapping can write.
-                                    let mut escape_path = None;
-                                    'esc: for clearance in [7i32, 5, 3, 2, 1, 0] {
-                                        let m = mapper_plan.read().await;
-                                        if let Some(p) = planner.plan_with_clearance(&m, &pose, target, clearance) {
-                                            escape_path = Some(p);
-                                            break 'esc;
+                                    // Run escape A* on a blocking thread.
+                                    let esc_snap = { mapper_plan.read().await.clone() };
+                                    let pose_esc = pose; let target_esc = target;
+                                    let escape_path = tokio::task::spawn_blocking(move || {
+                                        let pl = AStarPlanner::new();
+                                        for clearance in [7i32, 5, 3, 2, 1, 0] {
+                                            if let Some(p) = pl.plan_with_clearance(&esc_snap, &pose_esc, target_esc, clearance) {
+                                                return Some(p);
+                                            }
                                         }
-                                        drop(m);
-                                    }
+                                        None
+                                    }).await.expect("escape A* blocking task panicked");
                                     match escape_path {
                                         Some(path) => {
                                             info!(waypoints = path.waypoints.len(), wx = target[0], wy = target[1], "Sim escape: A* path validated — injecting");
@@ -2448,9 +2637,15 @@ async fn run_sim_mode(
     });
 
     // ── Control task ──────────────────────────────────────────────────────────
-    let min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * control::MAX_VX;
+    // Sim has no motor deadband — sub-deadband commands are executed faithfully.
+    // Passing min_vx=0 lets speed scaling work across the full [0, MAX_VX] range.
+    // (Real robot path uses min_vx=0 too — hardware deadband handled by cmdvel_to_motor.)
+    // us_stop_m = obstacle_stop_m (0.15 m): A* clearance=7 (35 cm) − robot radius (15 cm)
+    // = 20 cm effective body gap at corners.  The real-robot value (0.30 m) would stop the
+    // robot every time it passes near a sim obstacle; camera already handles close stops.
     spawn_control_task(Arc::clone(&bus), control_path_rx,
-        cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), min_vx);
+        cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), 0.0,
+        cfg.sim.obstacle_stop_m);
 
     // ── Sim tick task ─────────────────────────────────────────────────────────
     // Physics loop at 10 Hz: reads latest motor command + gimbal pan from the
@@ -2474,6 +2669,49 @@ async fn run_sim_mode(
         max_motor_duty,
         std::sync::Arc::clone(&sim_stats),
     );
+
+    // ── CPU / scheduler monitor (sim only) ───────────────────────────────────
+    // Logs system load average + scheduling jitter every 10 s.
+    // Jitter = how late this task actually woke up vs. requested — high jitter
+    // (> ~200 ms) means the process is CPU-starved, which explains mapping lag.
+    tokio::spawn(async move {
+        const INTERVAL_S: u64 = 10;
+        let dur = tokio::time::Duration::from_secs(INTERVAL_S);
+        loop {
+            let intended = tokio::time::Instant::now() + dur;
+            tokio::time::sleep(dur).await;
+            let jitter_ms = intended.elapsed().as_millis();
+
+            // /proc/loadavg: "1min 5min 15min runnable/total last_pid"
+            let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+            let parts: Vec<&str> = load.split_whitespace().collect();
+            let (l1, l5, l15) = (
+                parts.first().copied().unwrap_or("?"),
+                parts.get(1).copied().unwrap_or("?"),
+                parts.get(2).copied().unwrap_or("?"),
+            );
+
+            // /proc/meminfo: MemTotal and MemAvailable
+            let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+            let mem_avail_kb: u64 = meminfo.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let mem_total_kb: u64 = meminfo.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let mem_used_pct = 100 - mem_avail_kb * 100 / mem_total_kb;
+
+            tracing::info!(
+                load_1m = l1, load_5m = l5, load_15m = l15,
+                jitter_ms, mem_used_pct,
+                "CPU monitor"
+            );
+        }
+    });
 
     // ── UI Bridge — same port 9000 WebSocket telemetry as real robot ─────────
     start_ui_bridge(Arc::clone(&bus), UiBridgeConfig::default()).await?;
@@ -2745,11 +2983,17 @@ fn spawn_sim_tick_task(
                     let reason = s.next_room_reason.take().unwrap_or_else(||
                         if is_timeout { "timeout" } else { "complete" }
                     );
+                    let dur = room_start_time.elapsed().as_secs_f64();
+                    let room_crashes = bus.collision_count.borrow().saturating_sub(crashes_at_room_start);
+                    info!(episode, reason, cells = latest_cells,
+                          duration_s = format!("{:.1}", dur),
+                          crashes = room_crashes,
+                          "── Room summary ──");
                     s.rooms.push(RoomRecord {
                         reason,
-                        duration_s: room_start_time.elapsed().as_secs_f64(),
+                        duration_s: dur,
                         cells:      latest_cells,
-                        crashes:    bus.collision_count.borrow().saturating_sub(crashes_at_room_start),
+                        crashes:    room_crashes,
                     });
                 }
                 if is_timeout {
