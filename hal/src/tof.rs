@@ -110,6 +110,8 @@ mod vl53l8cx_ffi {
             handle: *mut c_void,
             out_ranges_m: *mut c_float,
             out_t_ms: *mut u64,
+            row_min: c_int,
+            row_max: c_int,
         ) -> c_int;
 
         fn tof_close(handle: *mut c_void);
@@ -127,6 +129,8 @@ mod vl53l8cx_ffi {
 
     pub struct Vl53l8cxTof {
         handle: *mut c_void,
+        row_min: c_int,
+        row_max: c_int,
     }
 
     // The C wrapper owns the only reference to the handle.
@@ -140,6 +144,8 @@ mod vl53l8cx_ffi {
             i2c_addr_7bit: u8,
             ranging_mode: u8,
             integration_time_ms: u32,
+            row_min: u8,
+            row_max: u8,
         ) -> Result<Self> {
             let mut errbuf = [0u8; 256];
             let handle = unsafe {
@@ -160,16 +166,18 @@ mod vl53l8cx_ffi {
             }
             info!(
                 "VL53L8CX: /dev/i2c-{i2c_bus} @ 0x{i2c_addr_7bit:02X}, \
-                 8×8 zones, mode={ranging_mode}, integration={integration_time_ms} ms"
+                 8×8 zones, mode={ranging_mode}, integration={integration_time_ms} ms, \
+                 rows {row_min}–{row_max}"
             );
-            Ok(Self { handle })
+            Ok(Self { handle, row_min: row_min as c_int, row_max: row_max as c_int })
         }
 
         fn read_scan_sync(&mut self) -> Result<PseudoLidarScan> {
             let mut ranges = [0.0f32; 8];
             let mut t_ms: u64 = 0;
             let rc = unsafe {
-                tof_read(self.handle, ranges.as_mut_ptr(), &mut t_ms)
+                tof_read(self.handle, ranges.as_mut_ptr(), &mut t_ms,
+                         self.row_min, self.row_max)
             };
             if rc != 0 {
                 anyhow::bail!("tof_read error: rc={rc}");

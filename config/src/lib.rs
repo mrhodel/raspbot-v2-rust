@@ -127,6 +127,16 @@ pub struct TofConfig {
     pub ranging_mode: u8,   // 1=short (≤135 cm, fastest), 2=long (≤400 cm)
     #[serde(default = "default_tof_integration_time_ms")]
     pub integration_time_ms: u32,
+    /// First row to include in per-column minimum (0 = topmost zone, 7 = bottommost).
+    /// Row 0 points forward/upward; Row 7 points toward the floor.
+    /// Raise row_min to skip top rows if sensor is mounted upside-down.
+    #[serde(default = "default_tof_row_min")]
+    pub row_min: u8,
+    /// Last row to include (inclusive). Set row_max < 7 to exclude floor-facing
+    /// bottom rows that produce false close-obstacle readings on open floor.
+    /// Default 5 skips rows 6–7 (~14° and ~20° below horizontal at typical mounting).
+    #[serde(default = "default_tof_row_max")]
+    pub row_max: u8,
 }
 
 impl Default for TofConfig {
@@ -136,6 +146,8 @@ impl Default for TofConfig {
             i2c_address:         default_tof_i2c_address(),
             ranging_mode:        default_tof_ranging_mode(),
             integration_time_ms: default_tof_integration_time_ms(),
+            row_min:             default_tof_row_min(),
+            row_max:             default_tof_row_max(),
         }
     }
 }
@@ -144,6 +156,8 @@ fn default_tof_i2c_bus()             -> u8  { 2 }
 fn default_tof_i2c_address()         -> u8  { 0x29 }
 fn default_tof_ranging_mode()        -> u8  { 1 }
 fn default_tof_integration_time_ms() -> u32 { 5 }
+fn default_tof_row_min()             -> u8  { 0 }
+fn default_tof_row_max()             -> u8  { 5 } // skip rows 6–7 (floor-facing)
 
 // ── IMU ───────────────────────────────────────────────────────────────────────
 

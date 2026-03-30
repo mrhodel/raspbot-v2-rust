@@ -188,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "vl53l8cx")]
         {
             let tc = &cfg.hal.tof;
-            match Vl53l8cxTof::new(tc.i2c_bus, tc.i2c_address, tc.ranging_mode, tc.integration_time_ms) {
+            match Vl53l8cxTof::new(tc.i2c_bus, tc.i2c_address, tc.ranging_mode, tc.integration_time_ms, tc.row_min, tc.row_max) {
                 Ok(t)  => { info!("ToF: VL53L8CX on /dev/i2c-{}", tc.i2c_bus); Box::new(t) as Box<dyn Tof> }
                 Err(e) => { warn!("ToF: VL53L8CX unavailable ({e:#}), using stub"); Box::new(StubTof::new()) }
             }

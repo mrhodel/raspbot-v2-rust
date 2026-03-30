@@ -34,10 +34,17 @@ void *tof_open(uint8_t bus, uint8_t addr_7bit,
  *
  *   out_ranges_m   : caller-supplied float[8], filled on success
  *   out_t_ms       : milliseconds since tof_open (for scan timestamp)
+ *   row_min        : first row to include in per-column minimum (0–7)
+ *   row_max        : last row to include (inclusive, 0–7, must be >= row_min)
+ *
+ * Row 0 is the topmost zone (sensor aperture looking forward on a flat robot).
+ * Row 7 is the bottommost zone — typically angled downward toward the floor.
+ * Use row_min=0, row_max=5 to skip the two bottom floor-facing rows.
  *
  * Returns 0 on success, nonzero on error.
  */
-int tof_read(void *handle, float *out_ranges_m, uint64_t *out_t_ms);
+int tof_read(void *handle, float *out_ranges_m, uint64_t *out_t_ms,
+             int row_min, int row_max);
 
 /*
  * tof_close  — stop ranging and free all resources.

@@ -81,6 +81,13 @@ hal:
     i2c_address: 0x29      # 7-bit (= 0x52 write / 0x53 read in 8-bit notation)
     ranging_mode: 1        # 1=short ≤135 cm (fastest, 5 ms budget), 2=long ≤400 cm
     integration_time_ms: 5 # measurement time budget (5 ms → up to 60 Hz)
+    # Row range for per-column minimum (0=top zone, 7=bottom zone in ST layout).
+    # Row 7 (~20° below horizontal) and row 6 (~14° below) see the floor at
+    # 35–50 cm on a ~12 cm tall robot — within the near-zone threshold.
+    # Excluding them eliminates false "floor = obstacle" stops in open space.
+    # If the sensor is mounted upside-down, swap: row_min=2, row_max=7.
+    row_min: 0
+    row_max: 5
 
 # ── Perception ────────────────────────────────────────────────────
 perception:

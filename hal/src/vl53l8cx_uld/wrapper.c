@@ -130,9 +130,15 @@ fail:
     return NULL;
 }
 
-int tof_read(void *handle, float *out_ranges_m, uint64_t *out_t_ms)
+int tof_read(void *handle, float *out_ranges_m, uint64_t *out_t_ms,
+             int row_min, int row_max)
 {
     TofHandle *h = (TofHandle *)handle;
+
+    /* Clamp row range to valid bounds. */
+    if (row_min < 0) row_min = 0;
+    if (row_max > 7) row_max = 7;
+    if (row_max < row_min) row_max = row_min;
 
     /* Poll for data ready — up to 1 s (100 × 10 ms). */
     uint8_t is_ready = 0;
@@ -156,11 +162,13 @@ int tof_read(void *handle, float *out_ranges_m, uint64_t *out_t_ms)
     /*
      * distance_mm is a flat row-major array [row * 8 + col], int16_t,
      * already divided by 4 (mm units) by the ULD.
-     * Compute the column-minimum across all 8 rows for each of 8 columns.
+     * Compute the column-minimum across the caller-specified row range.
+     * Row 0 = topmost zone (forward/upward); Row 7 = bottommost (floor-facing).
+     * Excluding bottom rows (e.g. row_max=5) avoids false floor detections.
      */
     for (int col = 0; col < 8; col++) {
         int16_t min_mm = INT16_MAX;
-        for (int row = 0; row < 8; row++) {
+        for (int row = row_min; row <= row_max; row++) {
             int16_t v = h->results.distance_mm[row * 8 + col];
             if (v > 0 && v < min_mm)
                 min_mm = v;
