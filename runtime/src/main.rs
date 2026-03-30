@@ -40,6 +40,7 @@ use hal::Vl53l8cxTof;
 use mapping::Mapper;
 use micro_slam::ImuDeadReckon;
 use perception::{DepthInference, EventGate, PseudoLidarExtractor};
+use control;
 use planning::{AStarPlanner, reachable_set};
 use telemetry::TelemetryWriter;
 use ui_bridge::{UiBridgeConfig, start as start_ui_bridge};
@@ -2688,14 +2689,16 @@ async fn run_sim_mode(
     });
 
     // ── Control task ──────────────────────────────────────────────────────────
-    // Sim has no motor deadband — sub-deadband commands are executed faithfully.
-    // Passing min_vx=0 lets speed scaling work across the full [0, MAX_VX] range.
-    // (Real robot path uses min_vx=0 too — hardware deadband handled by cmdvel_to_motor.)
+    // min_vx: with motor deadband min_duty=30 and max_duty=35, any vx below
+    // (30/35)×MAX_VX ≈ 0.257 m/s produces wheel duties < 30 which all snap to 30,
+    // making [fl,fr,rl,rr] uniform and killing steering.  Floor vx to stall speed
+    // so the left/right asymmetry from omega survives the deadband snap.
     // us_stop_m = obstacle_stop_m (0.15 m): A* clearance=7 (35 cm) − robot radius (15 cm)
     // = 20 cm effective body gap at corners.  The real-robot value (0.30 m) would stop the
     // robot every time it passes near a sim obstacle; camera already handles close stops.
+    let sim_min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * control::MAX_VX;
     spawn_control_task(Arc::clone(&bus), control_path_rx,
-        cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), 0.0,
+        cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), sim_min_vx,
         cfg.sim.obstacle_stop_m,
         cfg.agent.safety.us_slow_m,
         cfg.agent.safety.clear_hold_s,
