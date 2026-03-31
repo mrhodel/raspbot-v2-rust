@@ -230,13 +230,26 @@ impl Mapper {
         }
 
         // Second pass: apply Bresenham updates.
-        // Max-range rays are skipped — they carry no reliable obstacle depth.
+        //
+        // Real robot (seeded_walls empty): max-range rays are unreliable —
+        // MiDaS returns max range when depth contrast is low, not necessarily
+        // when the path is clear.  Skip them to avoid freeing cells that may
+        // contain obstacles.
+        //
+        // Sim mode (seeded_walls non-empty): max-range rays are geometrically
+        // reliable — the sim raycast returns 3.0 only when no obstacle is
+        // within 3 m.  Apply MISS along the full Bresenham trace so that open
+        // space far from walls gets marked free.  No HIT at the endpoint
+        // (there is no obstacle there).  This fixes the "closed-in" problem
+        // where cells beyond 3 m from any wall stayed unknown forever.
+        let sim_mode = !self.seeded_walls.is_empty();
         for ray in &scan.rays {
-            if ray.confidence < MIN_CONFIDENCE
-                || ray.range_m < 0.05
-                || ray.range_m >= MAX_RANGE_M
-            {
+            if ray.confidence < MIN_CONFIDENCE || ray.range_m < 0.05 {
                 continue;
+            }
+            let is_max_range = ray.range_m >= MAX_RANGE_M;
+            if is_max_range && !sim_mode {
+                continue; // real robot: skip unreliable max-range rays
             }
             let world_angle = pose.theta_rad + ray.angle_rad;
             let end_x = pose.x_m + ray.range_m * world_angle.cos();
@@ -245,12 +258,11 @@ impl Mapper {
             let hy = world_to_cell(end_y, res);
 
             for (cx, cy) in bresenham(rx, ry, hx, hy) {
-                if cx == hx && cy == hy {
-                    // In sim mode (seeded_walls non-empty) only stamp HIT on known
-                    // obstacle cells.  Float arithmetic places computed endpoints
-                    // 1-4 cells from the true wall, creating phantom obstacle
-                    // markers in free space that block A* navigation.  All real
-                    // obstacles are pre-seeded; anything else is free space.
+                if cx == hx && cy == hy && !is_max_range {
+                    // Obstacle endpoint for a sub-max-range ray.
+                    // In sim only stamp HIT on pre-seeded cells — float arithmetic
+                    // places computed endpoints 1-4 cells from the true wall,
+                    // creating phantom obstacles in free space.
                     let apply_hit = self.seeded_walls.is_empty()
                         || self.seeded_walls.contains(&(cx, cy));
                     if apply_hit {
@@ -258,9 +270,8 @@ impl Mapper {
                         touched.insert((cx, cy), ());
                     }
                 } else if !hit_endpoints.contains(&(cx, cy)) {
-                    // Only apply MISS to cells that are not a HIT endpoint for
-                    // another ray — prevents adjacent Bresenham traces from
-                    // immediately overwriting obstacle cells with MISS.
+                    // Free cell: either an intermediate cell on any ray, or the
+                    // endpoint of a max-range ray (open space, no obstacle).
                     self.grid.apply(cx, cy, LOG_ODDS_MISS);
                     touched.insert((cx, cy), ());
                 }
