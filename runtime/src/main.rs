@@ -40,7 +40,6 @@ use hal::Vl53l8cxTof;
 use mapping::Mapper;
 use micro_slam::ImuDeadReckon;
 use perception::{DepthInference, EventGate, PseudoLidarExtractor};
-use control;
 use planning::{AStarPlanner, reachable_set};
 use telemetry::TelemetryWriter;
 use ui_bridge::{UiBridgeConfig, start as start_ui_bridge};
@@ -787,6 +786,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.agent.safety.us_slow_m,
         cfg.agent.safety.clear_hold_s,
         cfg.agent.navigation.goal_tolerance_m,
+        cfg.kinematics.max_vx,
+        cfg.kinematics.max_omega_rad_s,
+        cfg.agent.navigation.lookahead_dist_m,
     );
 
     // ── Motor execution task ──────────────────────────────────────────────────
@@ -797,6 +799,8 @@ async fn main() -> anyhow::Result<()> {
     /// How long without a motor command before the watchdog zeroes the motors.
     const MOTOR_WATCHDOG_MS: u64 = 500;
 
+    let motor_max_vx    = cfg.kinematics.max_vx;
+    let motor_max_omega = cfg.kinematics.max_omega_rad_s;
     let mut motor = motor;
     let mut motor_cmd_rx  = motor_cmd_rx;
     let mut cmdvel_rx     = cmdvel_rx;
@@ -848,7 +852,7 @@ async fn main() -> anyhow::Result<()> {
                     if armed && safe {
                         watchdog_logged = false;
                         let _ = bus_motor.effective_cmd_vel.send(cmd_vel);
-                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty, motor_max_vx, motor_max_omega);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor error (ctrl): {e}");
                         }
@@ -873,7 +877,7 @@ async fn main() -> anyhow::Result<()> {
                         let vel = *manual_rx_m.borrow_and_update();
                         watchdog_logged = false;
                         let _ = bus_motor.effective_cmd_vel.send(vel);
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty, motor_max_vx, motor_max_omega);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor error (manual): {e}");
                         }
@@ -889,7 +893,7 @@ async fn main() -> anyhow::Result<()> {
                         // Re-send held velocity so keys feel responsive.
                         let vel = *manual_rx_m.borrow();
                         let _ = bus_motor.effective_cmd_vel.send(vel);
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty, motor_max_vx, motor_max_omega);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Motor watchdog manual error: {e}");
                         }
@@ -924,9 +928,10 @@ async fn main() -> anyhow::Result<()> {
     let tilt_home = cfg.hal.gimbal.tilt_home_deg;
     let mut rx_depth_g = bus.vision_depth.subscribe();
     let bus_gimbal = Arc::clone(&bus);
-    let rx_exec_g = bus_gimbal.executive_state.subscribe();
-    let rx_nearest_g     = bus_gimbal.nearest_obstacle_m.subscribe();
-    let rx_near_angle_g  = bus_gimbal.nearest_obstacle_angle_rad.subscribe();
+    let rx_exec_g           = bus_gimbal.executive_state.subscribe();
+    let rx_nearest_g        = bus_gimbal.nearest_obstacle_m.subscribe();
+    let rx_near_angle_g     = bus_gimbal.nearest_obstacle_angle_rad.subscribe();
+    let rx_manual_gimbal_g  = bus_gimbal.manual_gimbal_cmd.subscribe();
     let gimbal_handle = tokio::spawn(async move {
         info!("Gimbal task started");
         if let Err(e) = gimbal.set_angles(0.0, tilt_home).await {
@@ -964,19 +969,19 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            // In manual mode lock pan to 0 so the camera points straight ahead.
-            let new_pan = if matches!(*rx_exec_g.borrow(), ExecutiveState::ManualDrive) {
-                0.0
+            // In manual mode use browser-commanded pan/tilt; otherwise auto sweep.
+            let (new_pan, new_tilt) = if matches!(*rx_exec_g.borrow(), ExecutiveState::ManualDrive) {
+                *rx_manual_gimbal_g.borrow()
             } else {
                 let t_s = gimbal_t0.elapsed().as_secs_f32();
                 let (cur_pan, _) = gimbal.angles();
-                gimbal_pan_target(last_bias, t_s, cur_pan, danger_angle)
+                (gimbal_pan_target(last_bias, t_s, cur_pan, danger_angle), tilt_home)
             };
             if let Err(e) = gimbal.set_pan(new_pan).await {
                 warn!("Gimbal pan error: {e}");
             }
             // Re-send tilt every tick — servo can drift under gravity if not refreshed.
-            if let Err(e) = gimbal.set_tilt(tilt_home).await {
+            if let Err(e) = gimbal.set_tilt(new_tilt).await {
                 warn!("Gimbal tilt error: {e}");
             }
             let (cur_pan_out, cur_tilt_out) = gimbal.angles();
@@ -1060,13 +1065,10 @@ async fn main() -> anyhow::Result<()> {
 /// up to `min_duty` (preserving sign).  Below this threshold the physical motors
 /// stall; snapping ensures the robot either moves at minimum speed or stops —
 /// matching real hardware behaviour in both real and sim modes.
-fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8, min_duty: i8) -> MotorCommand {
-    const MAX_VX:    f32 = 0.3;  // m/s — matches PurePursuitController::MAX_VX
-    const MAX_OMEGA: f32 = 4.0;  // rad/s — real robot: 4.8 rad/s @ 35% duty; must match control/lib.rs
-
-    let vx_n    = (cmd.vx    / MAX_VX   ).clamp(-1.0, 1.0);
-    let vy_n    = (cmd.vy    / MAX_VX   ).clamp(-1.0, 1.0);
-    let omega_n = (cmd.omega / MAX_OMEGA).clamp(-1.0, 1.0);
+fn cmdvel_to_motor(cmd: CmdVel, max_duty: i8, min_duty: i8, max_vx: f32, max_omega: f32) -> MotorCommand {
+    let vx_n    = (cmd.vx    / max_vx   ).clamp(-1.0, 1.0);
+    let vy_n    = (cmd.vy    / max_vx   ).clamp(-1.0, 1.0);
+    let omega_n = (cmd.omega / max_omega).clamp(-1.0, 1.0);
 
     // Standard mecanum kinematics (see hal/src/motor.rs for sign convention).
     //   FL = vx + vy − ω    FR = vx − vy + ω
@@ -1154,9 +1156,10 @@ fn select_frontier_goal(
                         (bx * bx + by * by).sqrt() < BLACKLIST_RADIUS
                     })
                     && {
-                        // Reachability check (same as main filter below).
+                        // Reachability check (same as main filter below — is_passable
+                        // not is_free, so arcing-centroid clusters are not dropped).
                         let (cx, cy) = mapper.world_to_cell(f.centroid_x_m, f.centroid_y_m);
-                        mapper.grid.is_free(cx, cy)
+                        mapper.grid.is_passable(cx, cy)
                     }
                     && {
                         let Some(r) = reach else { return true; };
@@ -1188,7 +1191,9 @@ fn select_frontier_goal(
         let d = (dx * dx + dy * dy).sqrt().max(0.001);
         let angle_to = dy.atan2(dx);
         let alignment = (angle_to - pose.theta_rad).cos().max(0.0);
-        let size_weight = (f.size_cells as f32).sqrt().max(1.0);
+        // Use size^0.75 (between sqrt and linear) so large frontier clusters are
+        // strongly preferred over small slivers — they reveal more unexplored area.
+        let size_weight = (f.size_cells as f32).powf(0.75).max(1.0);
         d * (1.0 - HEADING_WEIGHT * alignment) / size_weight
     };
 
@@ -1200,13 +1205,17 @@ fn select_frontier_goal(
         })
     };
 
-    // Reject frontiers whose centroid falls in unknown or obstacle space.
-    // This filters edge frontiers whose centroids land beyond the arena wall
-    // (the centroid averages free + unknown cells, pushing it outside the map).
-    // A* would exhaust MAX_NODES on every such goal — they are never reachable.
+    // Reject frontiers whose centroid falls inside a confirmed obstacle.
+    // Use is_passable (log-odds < OCC_THRESH) rather than is_free (< FREE_THRESH):
+    // large frontier clusters arc over unexplored territory, pushing their
+    // geometric centroid into unknown cells (log-odds = 0.0).  is_free rejects
+    // unknown cells (0.0 < -0.5 is false), silently dropping the whole cluster
+    // and causing the explorer to declare completion at only ~40% map coverage.
+    // is_passable accepts unknown (0.0) and free cells; only rejects confirmed
+    // obstacles (>= 0.5) — so genuine wall-projection artifacts still get filtered.
     let reachable_centroid = |f: &core_types::Frontier| -> bool {
         let (cx, cy) = mapper.world_to_cell(f.centroid_x_m, f.centroid_y_m);
-        mapper.grid.is_free(cx, cy)
+        mapper.grid.is_passable(cx, cy)
     };
 
     // BFS reachability pre-screen: reject frontiers that are topologically
@@ -1234,13 +1243,14 @@ fn select_frontier_goal(
     let large_enough = |f: &&core_types::Frontier| f.size_cells >= MIN_FRONTIER_SIZE;
 
     // Primary: far enough away, not blacklisted, centroid in free space, BFS-reachable.
-    // Fallback 1: far enough away and centroid in free space (ignoring blacklist).
-    // Fallback 2: any large-enough frontier (blacklist and distance both waived).
+    // Fallback 1: any distance, not blacklisted (drop distance filter so nearby non-
+    //             blacklisted frontiers are tried before triggering the streak counter).
+    // Fallback 2: drop BFS reachability (last resort before returning None).
     let candidates: Vec<_> = frontiers.iter()
         .filter(|f| large_enough(f) && dist(f) >= MIN_GOAL_DIST && !blacklisted(f) && reachable_centroid(f) && reachable_frontier(f))
         .collect();
     let fallback1: Vec<_> = frontiers.iter()
-        .filter(|f| large_enough(f) && dist(f) >= MIN_GOAL_DIST && !blacklisted(f) && reachable_centroid(f) && reachable_frontier(f))
+        .filter(|f| large_enough(f) && !blacklisted(f) && reachable_centroid(f) && reachable_frontier(f))
         .collect();
 
     let pool: &[&core_types::Frontier] = if !candidates.is_empty() {
@@ -1837,9 +1847,10 @@ async fn run_sim_mode(
     let tilt_home = cfg.hal.gimbal.tilt_home_deg;
     let mut rx_depth_g = bus.vision_depth.subscribe();
     let bus_gimbal = Arc::clone(&bus);
-    let rx_exec_g    = bus_gimbal.executive_state.subscribe();
-    let rx_nearest_g    = bus_gimbal.nearest_obstacle_m.subscribe();
-    let rx_near_angle_g = bus_gimbal.nearest_obstacle_angle_rad.subscribe();
+    let rx_exec_g            = bus_gimbal.executive_state.subscribe();
+    let rx_nearest_g         = bus_gimbal.nearest_obstacle_m.subscribe();
+    let rx_near_angle_g      = bus_gimbal.nearest_obstacle_angle_rad.subscribe();
+    let rx_manual_gimbal_g   = bus_gimbal.manual_gimbal_cmd.subscribe();
     let sim_danger_m = cfg.sim.obstacle_stop_m * 4.0; // 0.60 m
     tokio::spawn(async move {
         info!("Sim gimbal task started");
@@ -1872,19 +1883,19 @@ async fn run_sim_mode(
             } else {
                 None
             };
-            // In manual mode lock pan to 0 so the camera points straight ahead.
-            let new_pan = if matches!(*rx_exec_g.borrow(), ExecutiveState::ManualDrive) {
-                0.0
+            // In manual mode use browser-commanded pan/tilt; otherwise auto sweep.
+            let (new_pan, new_tilt) = if matches!(*rx_exec_g.borrow(), ExecutiveState::ManualDrive) {
+                *rx_manual_gimbal_g.borrow()
             } else {
                 let t_s = gimbal_t0.elapsed().as_secs_f32();
                 let (cur_pan, _) = gimbal.angles();
-                gimbal_pan_target(last_bias, t_s, cur_pan, danger_angle)
+                (gimbal_pan_target(last_bias, t_s, cur_pan, danger_angle), tilt_home)
             };
             if let Err(e) = gimbal.set_pan(new_pan).await {
                 warn!("Sim gimbal pan error: {e}");
             }
             // Re-send tilt every tick — keeps it at home if servo drifts.
-            if let Err(e) = gimbal.set_tilt(tilt_home).await {
+            if let Err(e) = gimbal.set_tilt(new_tilt).await {
                 warn!("Sim gimbal tilt error: {e}");
             }
             let (cur_pan_out, cur_tilt_out) = gimbal.angles();
@@ -1898,6 +1909,8 @@ async fn run_sim_mode(
     // CmdVel, honours armed/safety state, watchdog-zeros when idle.
     // SimMotorController stores the latest MotorCommand in Arc<Mutex> so the
     // sim tick task reads it without blocking the async executor.
+    let sim_motor_max_vx    = cfg.kinematics.max_vx;
+    let sim_motor_max_omega = cfg.kinematics.max_omega_rad_s;
     let mut motor_cmdvel_rx  = cmdvel_rx;
     let mut motor_cmd_rx_m   = motor_cmd_rx;
     let rx_exec_m    = bus.executive_state.subscribe();
@@ -1932,7 +1945,7 @@ async fn run_sim_mode(
                     );
                     if armed && safe {
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(cmd_vel, max_motor_duty, min_motor_duty, sim_motor_max_vx, sim_motor_max_omega);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (ctrl): {e}");
                         }
@@ -1954,7 +1967,7 @@ async fn run_sim_mode(
                     if matches!(*rx_exec_m.borrow(), ExecutiveState::ManualDrive) {
                         let vel = *manual_rx.borrow_and_update();
                         watchdog_logged = false;
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty, sim_motor_max_vx, sim_motor_max_omega);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor error (manual): {e}");
                         }
@@ -1965,7 +1978,7 @@ async fn run_sim_mode(
                     if matches!(state, ExecutiveState::ManualDrive) {
                         // In manual drive: re-send held velocity so keys feel responsive.
                         let vel = *manual_rx.borrow();
-                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty);
+                        let cmd = cmdvel_to_motor(vel, max_motor_duty, min_motor_duty, sim_motor_max_vx, sim_motor_max_omega);
                         if let Err(e) = motor.send_command(cmd).await {
                             error!("Sim motor watchdog manual error: {e}");
                         }
@@ -2696,13 +2709,16 @@ async fn run_sim_mode(
     // us_stop_m = obstacle_stop_m (0.15 m): A* clearance=7 (35 cm) − robot radius (15 cm)
     // = 20 cm effective body gap at corners.  The real-robot value (0.30 m) would stop the
     // robot every time it passes near a sim obstacle; camera already handles close stops.
-    let sim_min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * control::MAX_VX;
+    let sim_min_vx = (min_motor_duty as f32 / max_motor_duty as f32) * cfg.kinematics.max_vx;
     spawn_control_task(Arc::clone(&bus), control_path_rx,
         cfg.sim.obstacle_slow_m, cfg.sim.obstacle_stop_m, episode_reset_rx.clone(), sim_min_vx,
         cfg.sim.obstacle_stop_m,
         cfg.agent.safety.us_slow_m,
         cfg.agent.safety.clear_hold_s,
         cfg.agent.navigation.goal_tolerance_m,
+        cfg.kinematics.max_vx,
+        cfg.kinematics.max_omega_rad_s,
+        cfg.agent.navigation.lookahead_dist_m,
     );
 
     // ── Sim tick task ─────────────────────────────────────────────────────────
@@ -2727,6 +2743,21 @@ async fn run_sim_mode(
         max_motor_duty,
         std::sync::Arc::clone(&sim_stats),
     );
+
+    // ── Sim startup auto-arm ─────────────────────────────────────────────────
+    // Room resets already send arm_tx (sim_tick_task line ~3102).  For the first
+    // room we rely on SIGUSR1 from the Makefile, but if cargo compile takes > 5 s
+    // the signal fires before the process starts and is lost.  Send an arm here
+    // after a 2-second grace period so room 1 always starts armed regardless of
+    // build time.  Double-arming (if SIGUSR1 also arrives) is harmless.
+    {
+        let arm_tx_auto = arm_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            info!("Sim: auto-arming (startup)");
+            let _ = arm_tx_auto.send(()).await;
+        });
+    }
 
     // ── CPU / scheduler monitor (sim only) ───────────────────────────────────
     // Logs system load average + scheduling jitter every 10 s.

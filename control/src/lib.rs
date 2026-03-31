@@ -15,27 +15,25 @@
 
 use core_types::{CmdVel, Path, Pose2D};
 
-/// Default lookahead distance (metres).
-const DEFAULT_LOOKAHEAD_M: f32 = 0.3;
-/// Maximum forward speed equivalent (will be scaled to duty-cycle by HAL).
-pub const MAX_VX: f32 = 0.3;
-/// Maximum angular rate (rad/s equivalent) — used as cap for spin-in-place.
-const MAX_OMEGA: f32 = 4.0;  // rad/s — real robot: 13.7 rad/s @ 100% → 4.8 rad/s @ 35% duty
 /// Proportional gain for heading correction (rad/s per radian of heading error).
-/// Kept lower than MAX_OMEGA to avoid oscillation on small corrections.
+/// Kept lower than max_omega to avoid oscillation on small corrections.
 const OMEGA_GAIN: f32 = 2.0;  // rad/s per rad — tune up if tracking is too sluggish
 
 pub struct PurePursuitController {
-    lookahead_m: f32,
+    lookahead_m:    f32,
+    max_vx:         f32,
+    max_omega_rad_s: f32,
 }
 
 impl PurePursuitController {
+    /// Create with all defaults (0.20 m lookahead, max_vx=0.3, max_omega=4.0).
     pub fn new() -> Self {
-        Self { lookahead_m: DEFAULT_LOOKAHEAD_M }
+        Self { lookahead_m: 0.20, max_vx: 0.3, max_omega_rad_s: 4.0 }
     }
 
-    pub fn with_lookahead(lookahead_m: f32) -> Self {
-        Self { lookahead_m }
+    /// Create with config-driven values.  Use this in production code.
+    pub fn with_config(lookahead_m: f32, max_vx: f32, max_omega_rad_s: f32) -> Self {
+        Self { lookahead_m, max_vx, max_omega_rad_s }
     }
 
     /// Compute a `CmdVel` steering the robot toward the next lookahead point.
@@ -81,24 +79,24 @@ impl PurePursuitController {
 
         // Forward speed: smoothly scaled over ±120° heading error.
         // Old formula (cos.max(0)) zeroed vx at ±90°, causing stop-and-pivot
-        // at every A* path corner.  New formula maps [0°→120°] → [MAX_VX→0],
+        // at every A* path corner.  New formula maps [0°→120°] → [max_vx→0],
         // so the robot keeps ~33% forward speed through 90° turns (arc motion)
         // and only fully stops when the waypoint is >120° behind.
         const FORWARD_ARC_COS: f32 = -0.5; // cos(120°)
         let vx_factor = ((heading_err.cos() - FORWARD_ARC_COS) / (1.0 - FORWARD_ARC_COS))
             .clamp(0.0, 1.0);
-        let vx = MAX_VX * vx_factor * (dist / self.lookahead_m).min(1.0);
+        let vx = self.max_vx * vx_factor * (dist / self.lookahead_m).min(1.0);
 
         // Angular rate: proportional to heading error, but capped so the
         // turning radius never falls below MIN_RADIUS_M while moving forward.
-        // When stopped (vx≈0) the full MAX_OMEGA is allowed so the robot can
+        // When stopped (vx≈0) the full max_omega is allowed so the robot can
         // spin to face a waypoint that is behind it.
         // The cap must engage at any non-zero vx — not just above 0.15 m/s.
         // At low vx (e.g. 0.08 m/s near-zone) the old 0.15 threshold let
-        // omega reach MAX_OMEGA=4.0, causing the robot to spin 10× faster
-        // than it moved forward and waggle left/right visually.
+        // omega reach max_omega, causing the robot to spin 10× faster than it
+        // moved forward and waggle left/right visually.
         const MIN_RADIUS_M: f32 = 0.35;
-        let omega_cap = if vx > 0.01 { (vx / MIN_RADIUS_M).min(MAX_OMEGA) } else { MAX_OMEGA };
+        let omega_cap = if vx > 0.01 { (vx / MIN_RADIUS_M).min(self.max_omega_rad_s) } else { self.max_omega_rad_s };
         let omega = (OMEGA_GAIN * heading_err).clamp(-omega_cap, omega_cap);
 
         CmdVel { t_ms: pose.t_ms, vx, vy: 0.0, omega }

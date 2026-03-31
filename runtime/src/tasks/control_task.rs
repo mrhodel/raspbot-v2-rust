@@ -37,6 +37,9 @@ pub fn spawn_control_task(
     us_slow_m: f32,
     clear_hold_s: f32,
     goal_tolerance_m: f32,
+    max_vx: f32,
+    max_omega_rad_s: f32,
+    lookahead_m: f32,
 ) -> tokio::task::JoinHandle<()> {
     const CONTROL_HZ: f64 = 10.0;
 
@@ -57,8 +60,17 @@ pub fn spawn_control_task(
         // clearance) don't trigger a US stop while the robot navigates around obstacles.
         let us_stop_m = us_stop_m;
         let mut latest_us_m: f32 = f32::MAX;
-        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead 0.20 m, min_vx {min_vx_m_s:.3} m/s, us_stop {us_stop_m:.2} m)");
-        let controller = PurePursuitController::with_lookahead(0.20);
+        // Backup speeds derived from max_vx so they scale automatically when motors change.
+        // full reverse = max_vx (1.0 normalised → max_duty); tight = 0.67×; US creep = 0.50×.
+        let backup_vx_full:  f32 = -max_vx;
+        let backup_vx_tight: f32 = -(max_vx * 0.667);
+        let us_reverse_vx:   f32 = -(max_vx * 0.50);
+        // Dropout filter rate-limit: cap obstacle-range increases at ~5× max speed per tick
+        // so a single MiDaS miss cannot cause the robot to accelerate into a wall.
+        let max_nearest_delta_per_tick: f32 = max_vx * 0.5;
+        info!("Control task started (pure-pursuit {CONTROL_HZ} Hz, lookahead {lookahead_m:.2} m, \
+               max_vx {max_vx:.2}, min_vx {min_vx_m_s:.3} m/s, us_stop {us_stop_m:.2} m)");
+        let controller = PurePursuitController::with_config(lookahead_m, max_vx, max_omega_rad_s);
         let mut current_path: Option<Path> = None;
         let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / CONTROL_HZ));
         let mut obstacle_stopped = false;
@@ -72,7 +84,14 @@ pub fn spawn_control_task(
         // to limit blind reverse distance — crashes 10/11 were caused by backing 0.24 m
         // into a rear wall that the forward-only US couldn't detect.
         let mut backup_escape_omega: f32 = 0.0;
-        let mut backup_escape_vx: f32 = -0.30;
+        let mut backup_escape_vx: f32 = backup_vx_full;
+        // Omega rate limiter: pure-pursuit's closest-index search (min_by over the full
+        // waypoint list) can flip between two equidistant adjacent waypoints each tick,
+        // causing angle_world to jump >90° and omega to spike 0→4 rad/s in one cycle.
+        // Capping the change at 2 rad/s per tick (= 20 rad/s²) still reaches max_omega
+        // within 2 ticks (200 ms) — fast enough for intentional realignment but slow
+        // enough to absorb numerical flips.
+        let mut prev_omega: f32 = 0.0;
         // Camera-obstacle deadlock detection: timer that fires after the robot has
         // been in obstacle_stopped state for 3 s continuously without recovering.
         // When hysteresis never clears (nearest < 2×stop_m because robot can't move),
@@ -95,7 +114,6 @@ pub fn spawn_control_task(
         // Obstacles can appear instantly (safe direction); "clear sky" must be confirmed over
         // ~3 ticks (300 ms) before the robot fully accelerates past the previous closest reading.
         let mut smoothed_nearest: f32 = f32::MAX;
-        const MAX_NEAREST_DELTA_PER_TICK: f32 = 0.15; // m per 100 ms tick
         // Near-zone latch: once nearest drops below clear_hysteresis_m, stay latched until
         // nearest has been ABOVE clear_hysteresis_m continuously for clear_hold_s (same
         // threshold used by obstacle_stopped).  Distance-only exit was insufficient: at a
@@ -123,6 +141,7 @@ pub fn spawn_control_task(
                     smoothed_nearest = f32::MAX;
                     in_near_zone = false;
                     near_zone_clear_since = None;
+                    prev_omega = 0.0;
                 }
                 // Arm event (real robot) — discard any stale pre-arm path so the
                 // robot doesn't lurch on the cached path the moment motors unlock.
@@ -137,6 +156,7 @@ pub fn spawn_control_task(
                         cam_obstacle_stopped_since = None;
                         in_near_zone = false;
                         near_zone_clear_since = None;
+                        prev_omega = 0.0;
                     }
                 }
                 // Sim physics collision — clear path and back up if the safety task
@@ -165,7 +185,7 @@ pub fn spawn_control_task(
                             // emergency-stop (i.e. not already reversing for us).
                             if !is_safety_estop {
                                 let now = std::time::Instant::now();
-                                // 500ms backup at -0.30 m/s ≈ 15 cm clearance.
+                                // 500ms backup at full reverse speed (backup_vx_full).
                                 // No spin — planner blacklists the crash goal so new path avoids the area.
                                 backup_until = Some(now + Duration::from_millis(500));
                             }
@@ -220,6 +240,7 @@ pub fn spawn_control_task(
                             } else {
                                 info!(waypoints = p.waypoints.len(), "Control: new path, tracking");
                                 current_path = Some(p);
+                                prev_omega = 0.0; // Reset rate limiter — new path means new heading intent
                             }
                         }
                         None => break,
@@ -265,7 +286,7 @@ pub fn spawn_control_task(
                     let nearest = if smoothed_nearest == f32::MAX || raw_nearest <= smoothed_nearest {
                         raw_nearest
                     } else {
-                        raw_nearest.min(smoothed_nearest + MAX_NEAREST_DELTA_PER_TICK)
+                        raw_nearest.min(smoothed_nearest + max_nearest_delta_per_tick)
                     };
                     smoothed_nearest = nearest;
                     let nearest_angle = *rx_nearest_angle_c.borrow();
@@ -311,7 +332,7 @@ pub fn spawn_control_task(
                                 // At -0.20 m/s for 900 ms = 0.18 m: from nearest=0.15 m (sim)
                                 // or 0.25 m (real), final nearest = 0.33–0.43 m → above
                                 // clear_hysteresis (0.30 m sim / 0.50 m real).
-                                backup_escape_vx = if safe_to_spin { -0.30 } else { -0.20 };
+                                backup_escape_vx = if safe_to_spin { backup_vx_full } else { backup_vx_tight };
                                 let backup_ms = if safe_to_spin { 1200 } else { 900 };
                                 warn!(
                                     nearest_m = nearest,
@@ -332,7 +353,7 @@ pub fn spawn_control_task(
                         // If US is still in the stop zone and not yet running a timed backup,
                         // actively reverse to create distance.
                         if latest_us_m < us_stop_m && backup_until.is_none() {
-                            let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: -0.15, vy: 0.0, omega: 0.0 });
+                            let _ = bus_ctrl.controller_cmd_vel.try_send(CmdVel { t_ms: 0, vx: us_reverse_vx, vy: 0.0, omega: 0.0 });
                             clear_since = None;
                             continue;
                         }
@@ -419,6 +440,10 @@ pub fn spawn_control_task(
                     // toward obstacle" on the raw (unscaled) omega before we
                     // decide the speed_scale.
                     let mut cmd_vel = controller.compute(&pose, path);
+                    // Rate-limit omega to absorb waypoint-index flips (see prev_omega above).
+                    const MAX_OMEGA_DELTA: f32 = 2.0; // rad/s per tick
+                    cmd_vel.omega = prev_omega + (cmd_vel.omega - prev_omega).clamp(-MAX_OMEGA_DELTA, MAX_OMEGA_DELTA);
+                    prev_omega = cmd_vel.omega;
                     // Final-approach speed cap: when close to the goal (few waypoints left)
                     // halve forward speed. Obstacle corners outside the ±55° sensor FOV
                     // cannot be detected until the robot is very close; slowing down during

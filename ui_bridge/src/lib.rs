@@ -122,7 +122,7 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       <button onclick="sendManual()" style="background:#225;color:#fff;padding:6px 14px;border:none;cursor:pointer;font-family:monospace;width:100%;margin-bottom:4px">MANUAL</button>
       <button onclick="sendAuto()" style="background:#522;color:#fff;padding:6px 14px;border:none;cursor:pointer;font-family:monospace;width:100%">AUTO</button>
     </div>
-    <div id="manual-hint" style="margin-top:6px;font-size:11px;color:#555">WASD=drive QE=strafe</div>
+    <div id="manual-hint" style="margin-top:6px;font-size:11px;color:#555">WASD=drive QE=strafe IJKL=gimbal</div>
     <div id="legend">
       <h3 style="margin-top:8px">LEGEND</h3>
       <div><span class="ls" style="background:#1a4a1e"></span>free</div>
@@ -400,6 +400,12 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // ── Manual drive ───────────────────────────────────────────────────────
     let manualMode = false;
     const keysDown = new Set();
+    let manualPan  = 0;    // degrees; kept in sync with telemetry when not manual
+    let manualTilt = 30;   // degrees; kept in sync with telemetry when not manual
+    const GIMBAL_STEP = 3; // degrees per 100 ms tick while key held
+    const PAN_LIMIT   = 90;
+    const TILT_MIN    = -30;
+    const TILT_MAX    = 30;
 
     function manualVelFromKeys() {
       let vx = 0, vy = 0, omega = 0;
@@ -412,21 +418,32 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
       return 'vel:' + vx + ',' + vy + ',' + omega;
     }
 
+    function updateGimbalFromKeys() {
+      if (!keysDown.has('i') && !keysDown.has('k') &&
+          !keysDown.has('j') && !keysDown.has('l')) return;
+      if (keysDown.has('i')) manualTilt = Math.min(TILT_MAX,   manualTilt + GIMBAL_STEP);
+      if (keysDown.has('k')) manualTilt = Math.max(TILT_MIN,   manualTilt - GIMBAL_STEP);
+      if (keysDown.has('j')) manualPan  = Math.max(-PAN_LIMIT, manualPan  - GIMBAL_STEP);
+      if (keysDown.has('l')) manualPan  = Math.min(PAN_LIMIT,  manualPan  + GIMBAL_STEP);
+      ws.send('gimbal:' + manualPan.toFixed(1) + ',' + manualTilt.toFixed(1));
+    }
+
     document.addEventListener('keydown', (ev) => {
       if (!manualMode || !ws) return;
       const k = ev.key.toLowerCase();
-      if ('wasdqe'.includes(k) && k.length === 1 && !keysDown.has(k)) {
+      if ('wasdqeijkl'.includes(k) && k.length === 1 && !keysDown.has(k)) {
         keysDown.add(k);
-        ws.send(manualVelFromKeys());
+        if ('wasdqe'.includes(k)) ws.send(manualVelFromKeys());
+        if ('ijkl'.includes(k))   updateGimbalFromKeys();
         ev.preventDefault();
       }
     });
     document.addEventListener('keyup', (ev) => {
       if (!manualMode || !ws) return;
       const k = ev.key.toLowerCase();
-      if ('wasdqe'.includes(k) && k.length === 1) {
+      if ('wasdqeijkl'.includes(k) && k.length === 1) {
         keysDown.delete(k);
-        ws.send(manualVelFromKeys());
+        if ('wasdqe'.includes(k)) ws.send(manualVelFromKeys());
         ev.preventDefault();
       }
     });
@@ -438,7 +455,10 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
     // until the next user input — the 500 ms watchdog never fires because the
     // control task's 10 Hz CmdVel discards keep resetting it in ManualDrive mode.
     setInterval(() => {
-      if (manualMode && ws) ws.send(manualVelFromKeys());
+      if (manualMode && ws) {
+        ws.send(manualVelFromKeys());
+        updateGimbalFromKeys();
+      }
     }, 100);
 
     // If the browser window loses focus while a key is held, the keyup event
@@ -546,9 +566,11 @@ const MAP_HTML: &str = r#"<!DOCTYPE html>
             }
             case 'gimbal/pan':
               lastPan = msg.data || 0;
+              if (!manualMode) manualPan = lastPan;
               document.getElementById('pan').textContent = fmt(msg.data, 1);
               break;
             case 'gimbal/tilt':
+              if (!manualMode) manualTilt = (msg.data != null) ? msg.data : 30;
               document.getElementById('tilt').textContent = fmt(msg.data, 1);
               break;
             case 'sim/start_time':
@@ -816,10 +838,13 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       <div><span class="label">WS   </span><span id="ws_st" class="warn">connecting</span></div>
     </div>
   </div>
-  <div style="margin:8px;display:flex;gap:8px">
-    <button onclick="ws&&ws.send('arm')" style="background:#1a1;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">ARM</button>
+  <div style="margin:8px;display:flex;gap:8px;flex-wrap:wrap;justify-content:center">
+    <button onclick="ws&&ws.send('arm')"  style="background:#1a1;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">ARM</button>
     <button onclick="ws&&ws.send('stop')" style="background:#a11;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">STOP</button>
+    <button onclick="sendManual()"        style="background:#225;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">MANUAL</button>
+    <button onclick="sendAuto()"          style="background:#522;color:#fff;padding:8px 18px;border:none;cursor:pointer;font-family:monospace">AUTO</button>
   </div>
+  <div id="manual-hint-ov" style="margin-bottom:4px;font-size:11px;color:#555;font-family:monospace;text-align:center">WASD=drive QE=strafe IJKL=gimbal</div>
   <div id="sensor-row">
     <div class="sensor-block">
       <div class="sensor-label">DEPTH MAP &nbsp;<span style="font-size:9px">(white=near &nbsp;red=mask)</span></div>
@@ -860,6 +885,83 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
       if (cm < 30) return 'err';
       if (cm < 60) return 'warn';
       return 'val';
+    }
+
+    // ── Manual drive ───────────────────────────────────────────────────────
+    let manualMode = false;
+    const keysDown = new Set();
+    let manualPan  = 0;
+    let manualTilt = 30;
+    const GIMBAL_STEP = 3;
+    const PAN_LIMIT   = 90;
+    const TILT_MIN    = -30;
+    const TILT_MAX    = 30;
+
+    function manualVelFromKeys() {
+      let vx = 0, vy = 0, omega = 0;
+      if (keysDown.has('w')) vx    =  0.8;
+      if (keysDown.has('s')) vx    = -0.8;
+      if (keysDown.has('a')) omega =  2.0;
+      if (keysDown.has('d')) omega = -2.0;
+      if (keysDown.has('q')) vy    =  0.8;
+      if (keysDown.has('e')) vy    = -0.8;
+      return 'vel:' + vx + ',' + vy + ',' + omega;
+    }
+
+    function updateGimbalFromKeys() {
+      if (!keysDown.has('i') && !keysDown.has('k') &&
+          !keysDown.has('j') && !keysDown.has('l')) return;
+      if (keysDown.has('i')) manualTilt = Math.min(TILT_MAX,   manualTilt + GIMBAL_STEP);
+      if (keysDown.has('k')) manualTilt = Math.max(TILT_MIN,   manualTilt - GIMBAL_STEP);
+      if (keysDown.has('j')) manualPan  = Math.max(-PAN_LIMIT, manualPan  - GIMBAL_STEP);
+      if (keysDown.has('l')) manualPan  = Math.min(PAN_LIMIT,  manualPan  + GIMBAL_STEP);
+      window.ws && window.ws.send('gimbal:' + manualPan.toFixed(1) + ',' + manualTilt.toFixed(1));
+    }
+
+    document.addEventListener('keydown', (ev) => {
+      if (!manualMode || !window.ws) return;
+      const k = ev.key.toLowerCase();
+      if ('wasdqeijkl'.includes(k) && k.length === 1 && !keysDown.has(k)) {
+        keysDown.add(k);
+        if ('wasdqe'.includes(k)) window.ws.send(manualVelFromKeys());
+        if ('ijkl'.includes(k))   updateGimbalFromKeys();
+        ev.preventDefault();
+      }
+    });
+    document.addEventListener('keyup', (ev) => {
+      if (!manualMode || !window.ws) return;
+      const k = ev.key.toLowerCase();
+      if ('wasdqeijkl'.includes(k) && k.length === 1) {
+        keysDown.delete(k);
+        if ('wasdqe'.includes(k)) window.ws.send(manualVelFromKeys());
+        ev.preventDefault();
+      }
+    });
+
+    setInterval(() => {
+      if (manualMode && window.ws) {
+        window.ws.send(manualVelFromKeys());
+        updateGimbalFromKeys();
+      }
+    }, 100);
+
+    window.addEventListener('blur', () => {
+      if (manualMode && keysDown.size > 0) {
+        keysDown.clear();
+        window.ws && window.ws.send(manualVelFromKeys());
+      }
+    });
+
+    function sendManual() {
+      manualMode = true;
+      document.getElementById('manual-hint-ov').style.color = '#0af';
+      window.ws && window.ws.send('manual');
+    }
+    function sendAuto() {
+      manualMode = false;
+      keysDown.clear();
+      document.getElementById('manual-hint-ov').style.color = '#555';
+      window.ws && window.ws.send('auto');
     }
 
     // Depth map stream (port 8081).
@@ -982,9 +1084,14 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
         try {
           const msg = JSON.parse(ev.data);
           switch (msg.topic) {
-            case 'executive/state':
-              document.getElementById('mode').textContent = stateLabel(msg.data);
+            case 'executive/state': {
+              const lbl = stateLabel(msg.data);
+              document.getElementById('mode').textContent = lbl;
+              manualMode = (lbl === 'ManualDrive');
+              if (!manualMode) keysDown.clear();
+              document.getElementById('manual-hint-ov').style.color = manualMode ? '#0af' : '#555';
               break;
+            }
             case 'sensor/ultrasonic': {
               const cm = msg.data && msg.data.range_cm;
               const el = document.getElementById('us');
@@ -1007,9 +1114,11 @@ const OVERLAY_HTML: &str = r#"<!DOCTYPE html>
               document.getElementById('hdg').textContent  = rad != null ? (rad * 180 / Math.PI).toFixed(1) : '--';
               break;
             case 'gimbal/pan':
+              if (!manualMode) manualPan = msg.data || 0;
               document.getElementById('pan').textContent = fmt(msg.data, 1);
               break;
             case 'gimbal/tilt':
+              if (!manualMode) manualTilt = (msg.data != null) ? msg.data : 30;
               document.getElementById('tilt').textContent = fmt(msg.data, 1);
               break;
             case 'sim/start_time':
@@ -1390,7 +1499,7 @@ pub async fn start(bus: Arc<bus::Bus>, cfg: UiBridgeConfig) -> Result<()> {
                                 }
                             }
                         }
-                        tokio::spawn(handle_client(stream, rx, initial, bus_listener.bridge_cmd.clone(), bus_listener.manual_cmd_vel.clone()));
+                        tokio::spawn(handle_client(stream, rx, initial, bus_listener.bridge_cmd.clone(), bus_listener.manual_cmd_vel.clone(), bus_listener.manual_gimbal_cmd.clone()));
 
                         let status = BridgeStatus {
                             t_ms: 0,
@@ -1459,6 +1568,7 @@ async fn handle_client(
     initial: Vec<Arc<String>>,
     cmd_tx: watch::Sender<BridgeCommand>,
     manual_vel_tx: watch::Sender<CmdVel>,
+    manual_gimbal_tx: watch::Sender<(f32, f32)>,
 ) {
     let ws = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
@@ -1486,6 +1596,14 @@ async fn handle_client(
                         if parts.len() == 3 {
                             let vel = CmdVel { t_ms: 0, vx: parts[0], vy: parts[1], omega: parts[2] };
                             let _ = manual_vel_tx.send(vel);
+                        }
+                    }
+                    _ if txt.starts_with("gimbal:") => {
+                        let parts: Vec<f32> = txt[7..].split(',')
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if parts.len() == 2 {
+                            let _ = manual_gimbal_tx.send((parts[0], parts[1]));
                         }
                     }
                     _ => {}

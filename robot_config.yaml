@@ -17,6 +17,18 @@ kinematics:
   forward_speed_m_s: 1.61      # measured 0.484 m/s @ 30% → 1.61 m/s @ 100%
   rotation_rate_rad_s: 13.7    # measured 4.103 rad/s @ 30% → 13.7 rad/s @ 100% (wheels on floor)
 
+  # ── Control command scales ────────────────────────────────────────────
+  # These two values are the only things to update when swapping motors.
+  # max_vx     : maximum CmdVel.vx the pure-pursuit outputs (normalised by
+  #              cmdvel_to_motor → max_motor_duty).  Set ≤ actual top speed;
+  #              lower = smoother but slower navigation.
+  # max_omega_rad_s: cap on CmdVel.omega.  Best set to
+  #              rotation_rate_rad_s × max_motor_duty / 100  (≈ physical peak
+  #              at max duty), or lower to reduce spin aggression.
+  # Half-speed motors → halve both values; double-speed → double both.
+  max_vx: 0.3             # normalised forward speed cap  (current motors: 0.3)
+  max_omega_rad_s: 4.0    # angular rate cap rad/s        (current motors: 4.0 ≈ 13.7×0.35)
+
 # ── Hardware Abstraction Layer ────────────────────────────────────
 hal:
   motor:
@@ -53,7 +65,7 @@ hal:
     tilt_range: [-30, 30]
     tilt_neutral: 30           # raw servo angle (0-180) that points camera level (tune to ~28)
     move_speed_deg_s: 120      # max angular velocity (software-limited)
-    tilt_home_deg: 25          # camera tilt at startup (degrees, positive=up); tune until horizon is ~upper 40% of frame
+    tilt_home_deg: 30          # camera tilt at startup (degrees, positive=up); tune until horizon is ~upper 40% of frame
 
   camera:
     # Raspbot V2 ships with a 1MP USB camera on the 2-DOF gimbal.
@@ -82,12 +94,12 @@ hal:
     ranging_mode: 1        # 1=short ≤135 cm (fastest, 5 ms budget), 2=long ≤400 cm
     integration_time_ms: 5 # measurement time budget (5 ms → up to 60 Hz)
     # Row range for per-column minimum (0=top zone, 7=bottom zone in ST layout).
-    # Row 7 (~20° below horizontal) and row 6 (~14° below) see the floor at
-    # 35–50 cm on a ~12 cm tall robot — within the near-zone threshold.
-    # Excluding them eliminates false "floor = obstacle" stops in open space.
+    # ToF is mounted ON the gimbal above the camera; tilt is always tilt_home_deg.
+    # At tilt_home_deg=30°: row 7 (sensor-relative −19.69°) points at +10.31° above
+    # horizontal — floor is never in view.  All 8 rows are safe to use.
     # If the sensor is mounted upside-down, swap: row_min=2, row_max=7.
     row_min: 0
-    row_max: 5
+    row_max: 7
 
 # ── Perception ────────────────────────────────────────────────────
 perception:
@@ -225,7 +237,8 @@ agent:
   navigation:
     max_consecutive_failures: 15  # planning failures before goal blacklisted
     goal_blacklist_s: 10          # seconds a blacklisted goal stays blocked
-    goal_tolerance_m: 0.25        # waypoint reached threshold (must be ≥ lookahead 0.20 m)
+    goal_tolerance_m: 0.25        # waypoint reached threshold (must be ≥ lookahead_dist_m)
+    lookahead_dist_m: 0.20        # pure-pursuit lookahead; scale proportionally with max_vx
 
   exploration:
     frontier_min_size: 3       # minimum frontier cells to pursue

@@ -351,9 +351,13 @@ pub struct NavigationAgentConfig {
     #[serde(default = "default_goal_blacklist_s")]
     pub goal_blacklist_s: u64,
     /// Distance (m) within which the robot considers a path waypoint reached.
-    /// Must be ≥ lookahead_dist_m (0.20 m) to avoid oscillation.
+    /// Must be ≥ lookahead_dist_m to avoid oscillation at the goal.
     #[serde(default = "default_goal_tolerance_m")]
     pub goal_tolerance_m: f32,
+    /// Pure-pursuit lookahead distance (m).
+    /// Scale proportionally with kinematics.max_vx when swapping motors.
+    #[serde(default = "default_lookahead_dist_m")]
+    pub lookahead_dist_m: f32,
 }
 
 impl Default for NavigationAgentConfig {
@@ -362,6 +366,7 @@ impl Default for NavigationAgentConfig {
             max_consecutive_failures: default_max_consecutive_failures(),
             goal_blacklist_s:         default_goal_blacklist_s(),
             goal_tolerance_m:         default_goal_tolerance_m(),
+            lookahead_dist_m:         default_lookahead_dist_m(),
         }
     }
 }
@@ -369,6 +374,7 @@ impl Default for NavigationAgentConfig {
 fn default_max_consecutive_failures() -> u32  { 15 }
 fn default_goal_blacklist_s()         -> u64  { 10 }
 fn default_goal_tolerance_m()         -> f32  { 0.25 }
+fn default_lookahead_dist_m()         -> f32  { 0.20 }
 
 // ── Sim ───────────────────────────────────────────────────────────────────────
 
@@ -490,6 +496,16 @@ pub struct KinematicsConfig {
     /// Maximum rotation rate at 100% motor duty (rad/s). Measured on real hardware.
     #[serde(default = "default_rotation_rate_rad_s")]
     pub rotation_rate_rad_s: f32,
+    /// Maximum CmdVel.vx output from the pure-pursuit controller (normalised units).
+    /// `cmdvel_to_motor` maps this to `max_motor_duty`.  Scale proportionally when
+    /// swapping motors: half-speed motors → halve this value.
+    #[serde(default = "default_max_vx")]
+    pub max_vx: f32,
+    /// Maximum CmdVel.omega (rad/s) the pure-pursuit is allowed to command.
+    /// Set to `rotation_rate_rad_s × max_motor_duty / 100` for full-range turns,
+    /// or lower to reduce spin aggressiveness.  Scale with motors like `max_vx`.
+    #[serde(default = "default_max_omega_rad_s")]
+    pub max_omega_rad_s: f32,
 }
 
 impl Default for KinematicsConfig {
@@ -497,9 +513,13 @@ impl Default for KinematicsConfig {
         Self {
             forward_speed_m_s:   default_forward_speed_m_s(),
             rotation_rate_rad_s: default_rotation_rate_rad_s(),
+            max_vx:              default_max_vx(),
+            max_omega_rad_s:     default_max_omega_rad_s(),
         }
     }
 }
 
 fn default_forward_speed_m_s()   -> f32 { 1.61 }
 fn default_rotation_rate_rad_s() -> f32 { 13.7 }
+fn default_max_vx()              -> f32 { 0.3  }
+fn default_max_omega_rad_s()     -> f32 { 4.0  }

@@ -117,6 +117,9 @@ pub struct Bus {
     pub manual_cmd_vel:       watch::Sender<CmdVel>,
     /// Velocity actually applied by the motor task (published for SLAM feedforward).
     pub effective_cmd_vel:    watch::Sender<CmdVel>,
+    /// Manual gimbal pan/tilt from the browser (only applied in ManualDrive state).
+    /// Tuple is (pan_deg, tilt_deg) in degrees.
+    pub manual_gimbal_cmd:    watch::Sender<(f32, f32)>,
 
     // ── Decision / planning / control (mpsc senders stored here) ─────────
     pub decision_frontier:    mpsc::Sender<FrontierChoice>,
@@ -167,9 +170,10 @@ impl Bus {
         let (tx_bridge_st,  _) = broadcast::channel(cap);
         let (tx_sim_truth,  _) = broadcast::channel(4);
 
-        let (tx_bridge_cmd, _)  = watch::channel(BridgeCommand::None);
-        let (tx_manual_vel, _)  = watch::channel(DEFAULT_CMDVEL);
-        let (tx_eff_vel,    _)  = watch::channel(DEFAULT_CMDVEL);
+        let (tx_bridge_cmd, _)    = watch::channel(BridgeCommand::None);
+        let (tx_manual_vel, _)    = watch::channel(DEFAULT_CMDVEL);
+        let (tx_eff_vel,    _)    = watch::channel(DEFAULT_CMDVEL);
+        let (tx_manual_gimbal, _) = watch::channel((0.0_f32, 0.0_f32));
 
         let (tx_orientation,   rx_orientation)  = watch::channel(Orientation::default());
         let (tx_pose2d,        rx_pose2d)       = watch::channel(Pose2D::default());
@@ -223,6 +227,7 @@ impl Bus {
             bridge_cmd:          tx_bridge_cmd,
             manual_cmd_vel:      tx_manual_vel,
             effective_cmd_vel:   tx_eff_vel,
+            manual_gimbal_cmd:   tx_manual_gimbal,
             decision_frontier:   tx_decision,
             planner_path:        tx_path,
             controller_cmd_vel:  tx_cmdvel,
