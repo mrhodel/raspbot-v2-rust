@@ -1,8 +1,8 @@
 # Yahboom Raspbot V2 — Autonomous Indoor Exploration (Revised Architecture)
-## Requirements Specification — Version 1.6 (V5.2)
+## Requirements Specification — Version 1.6 (V5.3)
 
-**Status:** Active — Phase 17 (sim-to-real tuning) in progress
-**Last Updated:** 2026-03-12
+**Status:** Active — Phase 17 (sim-to-real tuning) in progress; motor swap 1:48 → 1:90 complete, re-calibration pending
+**Last Updated:** 2026-03-31
 **Authors:** Mike, AI Assistant
 
 ---
@@ -69,7 +69,8 @@ This architecture maximizes reliability while maintaining adaptive behavior.
 | Battery monitor | INA226 — I2C-6, addr 0x40 — **not yet wired** |
 | Ultrasonic | HC-SR04 forward, I2C-1 via Yahboom board (addr 0x2B) |
 | Wheel encoders | Not available — dead reckoning only |
-| Motor stall floor | 30% duty (forward/rotate); 35% (strafe); RL motor is weakest |
+| Motor gear ratio | 1:90 (swapped 2026-03-31; was 1:48) |
+| Motor stall floor | 1:48 measured: ~10% (FR hardwood), ~15% (RL concrete); 1:90 not yet measured |
 
 ## 3.2 Camera Configuration
 
@@ -283,6 +284,21 @@ Sub-modes may include:
 ## 6.4 Deliverable Expectation
 
 A lightweight `calibration/` crate or equivalent module is recommended.
+
+## 6.5 Kinematics Calibration Results
+
+Measured on 2026-03-18 with 1:48 gear ratio motors (wheels on garage floor).
+Theoretical 1:90 values scaled by 48/90 ≈ 0.533 — **re-measure after physical swap**.
+
+| Metric | 1:48 Measured | 1:90 Theoretical | Config key |
+|---|---|---|---|
+| Forward speed @ 30% duty | 0.484 m/s | — | — |
+| Forward speed @ 100% duty | 1.61 m/s | **0.858 m/s** | `kinematics.forward_speed_m_s` |
+| Rotation rate @ 30% duty (wheels-on) | 4.103 rad/s | — | — |
+| Rotation rate @ 100% duty (wheels-on) | 13.7 rad/s | **7.30 rad/s** | `kinematics.rotation_rate_rad_s` |
+| Escape rotation duration (110° @ 35%) | 400 ms | **750 ms** | `safety.escape_rotation_ms` |
+| Navigation forward cap (`max_vx`) | 0.3 m/s | 0.3 m/s (unchanged) | `kinematics.max_vx` |
+| Navigation omega cap (`max_omega_rad_s`) | 4.0 rad/s | 4.0 rad/s (unchanged) | `kinematics.max_omega_rad_s` |
 
 ---
 
@@ -534,7 +550,11 @@ Occupancy grid:
 | Cell size | 5 cm |
 | Grid size | dynamic |
 | Sensor model | raycasting from pseudo-lidar |
-| Decay | slow toward unknown |
+| LOG_ODDS HIT | ±1.4 (tuned 2026-03-18; was ±0.7) |
+| LOG_ODDS MISS | ∓0.70 (tuned 2026-03-18; was ∓0.35) |
+| MIN_CONFIDENCE | 0.02 (tuned 2026-03-18; was 0.1) |
+| Decay rate | 0.01 per step (tuned 2026-03-18; was 0.001 — 10× faster fade) |
+| Sim boundary guard | Max-range MISS rays skip 1 m buffer at arena edge to prevent false frontiers at seeded walls |
 
 Mapping shall consume:
 
@@ -651,12 +671,15 @@ Classical deterministic navigation.
 
 ## 12.3 Recovery
 
-If stuck:
+**Collision recovery** is a two-phase state machine triggered on any collision event:
 
-1. rotate
-2. reverse slightly if safe
-3. select a new frontier
-4. trigger a parallax scan if needed
+1. **BackingUp** — reverse at −0.50 m/s until the forward ultrasonic reads > 0.3 m (exit the safety zone). US interlock does not block reverse motion.
+2. **Spinning** — spin at ±1.5 rad/s for 750 ms, direction chosen away from `nearest_obstacle_angle` (obstacle on left → spin CW; obstacle on right → spin CCW). Breaks heading deadlock.
+3. **Recovery complete** — clear path flag set, replanning requested.
+
+**Collision cascade suppression:** duplicate collision events within a 500 ms window are ignored to prevent the robot re-triggering recovery while still in contact with the wall.
+
+**Tight-corridor hard-blacklisting:** if the planner used its clearance=5 fallback (tight corridor) and the robot still made no progress toward the goal, the goal is hard-blacklisted for 10× the normal blacklist duration. Prevents repeated navigation into bottlenecks the robot cannot traverse at safe clearance.
 
 ---
 
@@ -975,6 +998,10 @@ Response:
 
 The safety subsystem shall also publish a machine-readable event to `safety/event`.
 
+**US interlock is forward-only:** the ultrasonic proximity stop does not block reverse motion, allowing collision recovery to back away from an obstacle unimpeded.
+
+**Collision cascade suppression:** a 500 ms cooldown after any collision event suppresses duplicate triggers caused by the robot body still contacting the wall during the backup maneuver.
+
 ## 18.1 Motor Crash-Stop *(implemented)*
 
 `YahboomMotorController` implements `Drop`. On drop (normal shutdown, SIGTERM, panic unwind) all four motors are synchronously zeroed via blocking I2C writes (~40 ms). SIGKILL cannot be caught.
@@ -1047,6 +1074,19 @@ robot/
 | 16 | real robot integration | **Done** (runtime HAL wired, motor safety gates) |
 | 17 | sim-to-real tuning | **In progress** |
 
+### Phase 17 sub-phases
+
+| # | Sub-phase | Status |
+|---|---|---|
+| 14.2.1 | Obstacle maze validation (18-obstacle sim) | **Done** |
+| 14.2.2 | HW safety tests (5 systems) | **Done** |
+| 14.2.3 | Kinematics calibration (forward speed, rotation rate) | **Done** — 1:48 motors measured 2026-03-18 |
+| 14.2.4 | Wheels-on rotation re-measurement | **Done** — 13.7 rad/s confirmed |
+| 14.2.5 | Occupancy grid & collision recovery fixes | **Done** — LOG_ODDS, decay, cascade suppression |
+| 14.2.6 | Runtime modularization (main.rs 2613 → 2123 lines) | **Done** — control/safety/mapping tasks split out |
+| 14.2.7 | Distance-based two-phase collision recovery | **Done** — BackingUp + Spinning state machine |
+| 14.2.8 | Motor swap 1:48 → 1:90; theoretical constants updated | **Done** — re-measure pending physical swap |
+
 ---
 
 # 22. Expected Capabilities
@@ -1088,7 +1128,7 @@ Expected realistic limitations:
 
 ---
 
-# 24. Implementation Gap Analysis *(as of 2026-03-12)*
+# 24. Implementation Gap Analysis *(as of 2026-03-31)*
 
 | § | Feature | Status | Notes |
 |---|---|---|---|
@@ -1115,7 +1155,8 @@ Expected realistic limitations:
 
 1. **Operational mode dispatch** — needed to run `calibrate` and `slam-debug` without the full autonomy stack running
 2. **Micro-SLAM visual pipeline** — IMU-only dead reckoning drifts too fast for useful mapping beyond one room; visual-inertial tracking is the next major subsystem
-3. **HAL I2C priority** — currently acceptable via biased-select; revisit if safety commands are observed to lag during heavy I2C use
+3. **Motor re-calibration (1:90)** — theoretical constants applied; actual measured values required before long autonomous runs
+4. **HAL I2C priority** — currently acceptable via biased-select; revisit if safety commands are observed to lag during heavy I2C use
 
 ### Lower-priority gaps (post Phase 17)
 
@@ -1124,3 +1165,4 @@ Expected realistic limitations:
 - Health telemetry publication (§15.3) — diagnostics during long runs
 - Replay tooling (§15.6) — offline debugging and algorithm comparison
 - sim_vision stub (§13.2) — perception/SLAM validation
+- Motor stall floor re-measurement for 1:90 motors
