@@ -12,8 +12,8 @@ use sim_fast::{FastSim, RoomKind, Action};
 const OLD_SPEED_M_S: f32 = 0.30;
 const OLD_OMEGA_RAD_S: f32 = 1.0;
 
-const NEW_SPEED_M_S: f32 = 1.61;
-const NEW_OMEGA_RAD_S: f32 = 14.3;
+const NEW_SPEED_M_S: f32 = 0.858;
+const NEW_OMEGA_RAD_S: f32 = 7.30;
 
 const FORWARD_DISTANCE_M: f32 = 2.0;
 const ROTATION_DEGREES: f32 = 360.0;

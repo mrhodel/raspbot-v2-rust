@@ -264,7 +264,7 @@ fn default_us_stop_m()         -> f32 { 0.30 }
 fn default_emstop_latch_s()    -> f64 { 5.0 }
 fn default_escape_delay_ms()   -> u64 { 200 }
 fn default_escape_duration_ms()-> u64 { 300 }  // reduced from 600ms — avoids reversing into rear walls (crash 8)
-fn default_escape_rotation_ms()-> u64 { 400 }  // 110° at 35% duty: 35/100 × 13.7 rad/s × 0.4s ≈ 1.9 rad
+fn default_escape_rotation_ms()-> u64 { 750 }  // 110° at 35% duty: 35/100 × 7.30 rad/s × 0.75s ≈ 1.92 rad
 fn default_clear_hold_s()      -> f32 { 0.8 }
 fn default_escape_reverse_spd()-> u8  { 35 }
 
@@ -519,7 +519,7 @@ impl Default for KinematicsConfig {
     }
 }
 
-fn default_forward_speed_m_s()   -> f32 { 1.61 }
-fn default_rotation_rate_rad_s() -> f32 { 13.7 }
+fn default_forward_speed_m_s()   -> f32 { 0.858 }
+fn default_rotation_rate_rad_s() -> f32 { 7.30 }
 fn default_max_vx()              -> f32 { 0.3  }
 fn default_max_omega_rad_s()     -> f32 { 4.0  }

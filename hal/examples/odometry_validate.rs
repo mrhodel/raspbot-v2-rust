@@ -28,8 +28,8 @@ const GYRO_SCALE: f32 = std::f32::consts::PI / 180.0 / 65.5;  // ±500°/s → r
 const SAMPLE_MS: u64 = 50;  // 20 Hz sampling
 
 // Calibrated kinematics (Phase 14.2.4: wheels-on measurement)
-const FORWARD_SPEED_M_S: f32 = 1.61;
-const ROTATION_RATE_RAD_S: f32 = 13.7;  // Updated from 14.3 (wheels-off) to 13.7 (wheels-on floor)
+const FORWARD_SPEED_M_S: f32 = 0.858;   // theoretical 1:90: 1.61 × 48/90 (re-measure after swap)
+const ROTATION_RATE_RAD_S: f32 = 7.30;  // theoretical 1:90: 13.7 × 48/90 (re-measure after swap)
 
 #[derive(Debug, Clone, Copy)]
 struct ImuSample {
