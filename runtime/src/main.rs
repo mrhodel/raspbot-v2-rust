@@ -2042,6 +2042,9 @@ async fn run_sim_mode(
         let mut goal_first_sent_at: Option<Instant> = None;
         let mut consecutive_failures: u32 = 0;
         let mut escape_failures: u32 = 0;
+        // Set when the last planned path required clearance=5 fallback (tight corridor).
+        // Used to hard-BL goals that the robot physically cannot navigate at safe clearance.
+        let mut last_path_was_tight: bool = false;
         // Counts how many times the escape trigger has fired (MAX_CONSECUTIVE_FAILURES
         // reached) regardless of whether escape succeeded.  When this saturates in
         // explore mode it means frontiers pass BFS pre-screen but A* cannot reach
@@ -2464,8 +2467,9 @@ async fn run_sim_mode(
                         now.duration_since(*ref_t).as_secs() >= no_progress_secs
                     }
                 } else {
-                    // New goal — reset checkpoint.
+                    // New goal — reset checkpoint and tight-corridor flag.
                     no_progress_pos = Some(([pose_now.x_m, pose_now.y_m], now));
+                    last_path_was_tight = false;
                     false
                 };
                 if goal_matches_last && path_sent_recently {
@@ -2486,6 +2490,17 @@ async fn run_sim_mode(
                 if path_sent_and_expired || no_progress_timeout {
                     let age = goal_first_sent_at.map_or(0, |t| now.duration_since(t).as_secs());
                     if no_progress_timeout && !path_sent_and_expired {
+                        if last_path_was_tight {
+                            // Tight corridor (clearance=5 path): pure-pursuit cannot safely
+                            // navigate it — repeated obstacle stops without progress.
+                            // Hard-BL so the robot stops cycling back into the same bottleneck.
+                            warn!(x = goal[0], y = goal[1], age_s = age,
+                                  "Sim planning: tight corridor no-progress — hard-blacklisting");
+                            let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS * 10);
+                            hard_blacklist.push((goal, exp));
+                            { let mut s = stats_plan.lock().unwrap(); s.hard_bl_pushes += 1; }
+                            last_path_was_tight = false;
+                        } else {
                         // No-progress: robot was navigating but not closing on the goal —
                         // wrong approach angle or temporary obstacle.  Use soft BL so the
                         // area can be retried when no other frontiers remain (soft BL is
@@ -2496,6 +2511,7 @@ async fn run_sim_mode(
                               "Sim planning: goal unreached — soft-blacklisting (no-progress)");
                         let exp = now + std::time::Duration::from_secs(GOAL_BLACKLIST_SECS);
                         goal_blacklist.push((goal, exp));
+                        }
                     } else {
                         // Slow navigation: robot was making displacement progress (backup
                         // maneuvers reset the no-progress timer) but didn't reach the goal
@@ -2571,6 +2587,7 @@ async fn run_sim_mode(
                     }).await.unwrap_or((None, true));
                     if result.0.is_some() {
                         info!(x = goal[0], y = goal[1], "Sim planning: clearance=5 tight-corridor fallback succeeded");
+                        last_path_was_tight = true;
                     }
                     result
                 } else {
@@ -2585,6 +2602,9 @@ async fn run_sim_mode(
                         let _ = bus_plan.planner_path.send(path).await;
                         consecutive_failures = 0;
                         escape_cycles = 0;
+                        if !last_path_was_tight {
+                            // Clearance=7 succeeded — corridor is safe.
+                        }
                         break 'planning;
                     }
                     None => {

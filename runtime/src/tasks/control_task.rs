@@ -299,41 +299,54 @@ pub fn spawn_control_task(
                             let stuck_since = cam_obstacle_stopped_since
                                 .get_or_insert_with(std::time::Instant::now);
                             if stuck_since.elapsed() >= Duration::from_millis(800) {
-                                // Rotate away from the nearest obstacle during backup.
-                                // Obstacle on left (angle > 0) → spin right (omega < 0).
-                                // Only spin when obstacle is clearly to one side (> 20°).
-                                // Near-center obstacles (±20°): back up straight — spinning
-                                // sweeps the robot body into the same wall (crashes 6, 7).
+                                // Escape strategy depends on where the obstacle is:
                                 //
-                                // Proximity guard: block spin only when the obstacle is
-                                // near-forward (≤ 20°) AND the robot is too close for the
-                                // body to rotate safely (crash 9: shoulder swept into wall).
-                                // For SIDE obstacles (> 20°) spin is always safe — rotating
-                                // away from a flank obstacle curves the backup arc away from it
-                                // and prevents reversing straight into a rear wall (ep80: robot
-                                // spawned 13cm from 45° obstacle, straight backup → rear crash).
+                                // SIDE obstacle (|angle| > 20°): rotate in place only — no
+                                //   backward motion.  Reason: side obstacles (e.g. a wall at the
+                                //   edge of the lidar FOV) are typically walls adjacent to the
+                                //   robot's current heading.  Backing up with any lateral heading
+                                //   component arcs the robot INTO those walls (ep80 and overnight
+                                //   run: 41/77 crashes were backup-into-adjacent-wall events).
+                                //   Pure rotation turns the heading away from the side obstacle
+                                //   so the subsequent replan routes around it.
+                                //
+                                // FORWARD obstacle (|angle| ≤ 20°, safe_to_spin): back up straight
+                                //   at full speed so the robot physically clears the stop zone.
+                                //   Add no spin — spinning near a close forward wall sweeps the
+                                //   shoulder into it (crashes 6, 7).
+                                //
+                                // FORWARD obstacle (|angle| ≤ 20°, too close to spin): tight
+                                //   half-speed backup; no spin.
                                 const SPIN_THRESHOLD_RAD: f32 = 0.35; // ~20°
                                 const SAFE_SPIN_CLEARANCE_M: f32 = 0.20;
                                 let obstacle_is_side = nearest_angle.abs() > SPIN_THRESHOLD_RAD;
                                 let safe_to_spin = obstacle_is_side
                                     || nearest >= obstacle_stop_m + SAFE_SPIN_CLEARANCE_M;
                                 backup_escape_omega = if nearest_angle > SPIN_THRESHOLD_RAD {
-                                    -1.0 // obstacle left → spin right
+                                    -1.5 // obstacle left → spin right (faster for pure-rotate)
                                 } else if nearest_angle < -SPIN_THRESHOLD_RAD {
-                                    1.0  // obstacle right → spin left
-                                } else if safe_to_spin {
-                                    0.0  // center obstacle with clearance — straight backup
+                                    1.5  // obstacle right → spin left (faster for pure-rotate)
                                 } else {
-                                    0.0  // center obstacle, too close — straight backup
+                                    0.0  // forward obstacle — straight backup, no spin
                                 };
-                                // Proximity zone backup must clear clear_hysteresis_m = 2×stop_m.
-                                // Worst case: nearest = obstacle_stop_m at backup start.
-                                // clear_hysteresis = 2×stop → need travel > stop_m to clear.
-                                // At -0.20 m/s for 900 ms = 0.18 m: from nearest=0.15 m (sim)
-                                // or 0.25 m (real), final nearest = 0.33–0.43 m → above
-                                // clear_hysteresis (0.30 m sim / 0.50 m real).
-                                backup_escape_vx = if safe_to_spin { backup_vx_full } else { backup_vx_tight };
-                                let backup_ms = if safe_to_spin { 1200 } else { 900 };
+                                // Side obstacle: rotate in place (vx=0) to reorient without
+                                // moving laterally into adjacent walls.  800 ms at ±1.5 rad/s
+                                // rotates ~69° — enough to face away and let A* replan.
+                                // Forward obstacle: back up to physically clear the stop zone.
+                                backup_escape_vx = if obstacle_is_side {
+                                    0.0  // pure rotation — no backward motion near side walls
+                                } else if safe_to_spin {
+                                    backup_vx_full
+                                } else {
+                                    backup_vx_tight
+                                };
+                                let backup_ms = if obstacle_is_side {
+                                    800
+                                } else if safe_to_spin {
+                                    1200
+                                } else {
+                                    900
+                                };
                                 warn!(
                                     nearest_m = nearest,
                                     nearest_angle_deg = nearest_angle.to_degrees(),

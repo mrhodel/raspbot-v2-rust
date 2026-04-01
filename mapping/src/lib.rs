@@ -272,6 +272,25 @@ impl Mapper {
                 } else if !hit_endpoints.contains(&(cx, cy)) {
                     // Free cell: either an intermediate cell on any ray, or the
                     // endpoint of a max-range ray (open space, no obstacle).
+                    //
+                    // For max-range rays in sim, skip cells near the arena boundary.
+                    // Without this guard the MISS trace reaches all the way to the
+                    // seeded wall, marks those cells free, and creates frontiers
+                    // right at the wall edge — the robot then navigates into the wall.
+                    // Leave a NEAR_WALL_MARGIN-cell buffer unknown; the robot will
+                    // free those cells when it physically approaches with sub-max-range
+                    // rays.
+                    const NEAR_WALL_MARGIN: i32 = 20; // 1.00 m at 0.05 m/cell
+                    if is_max_range {
+                        if let Some(sz) = self.arena_cells {
+                            if cx < NEAR_WALL_MARGIN || cy < NEAR_WALL_MARGIN
+                                || cx >= sz - NEAR_WALL_MARGIN
+                                || cy >= sz - NEAR_WALL_MARGIN
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     self.grid.apply(cx, cy, LOG_ODDS_MISS);
                     touched.insert((cx, cy), ());
                 }
