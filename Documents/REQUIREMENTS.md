@@ -1,8 +1,8 @@
 # Yahboom Raspbot V2 — Autonomous Indoor Exploration (Revised Architecture)
-## Requirements Specification — Version 1.6 (V5.3)
+## Requirements Specification — Version 1.6 (V5.4)
 
-**Status:** Active — Phase 17 (sim-to-real tuning) in progress; motor swap 1:48 → 1:90 complete, re-calibration pending
-**Last Updated:** 2026-03-31
+**Status:** Active — Phase 17 (sim-to-real tuning) in progress; motor swap 1:48 → 1:90 complete
+**Last Updated:** 2026-04-03
 **Authors:** Mike, AI Assistant
 
 ---
@@ -68,6 +68,7 @@ This architecture maximizes reliability while maintaining adaptive behavior.
 | IMU config | ±8g accel (ACCEL_CONFIG=0x10), ±500°/s gyro (GYRO_CONFIG=0x08) |
 | Battery monitor | INA226 — I2C-6, addr 0x40 — **not yet wired** |
 | Ultrasonic | HC-SR04 forward, I2C-1 via Yahboom board (addr 0x2B) |
+| ToF depth sensor | VL53L8CX (Pololu #3419) — I2C-2 (GPIO 4=SDA, GPIO 5=SCL), addr 0x29 |
 | Wheel encoders | Not available — dead reckoning only |
 | Motor gear ratio | 1:90 (swapped 2026-03-31; was 1:48) |
 | Motor stall floor | 1:48 measured: ~10% (FR hardwood), ~15% (RL concrete); 1:90 not yet measured |
@@ -76,17 +77,19 @@ This architecture maximizes reliability while maintaining adaptive behavior.
 
 Default tilt:
 
-- **−15° downward**
+- **+30° upward** (`tilt_home_deg: 30` in config; positive = up)
 
 Allowed range:
 
-- −25° to −5°
+- −30° to +30° (servo-limited; tilt_neutral raw servo value = 30 points level)
 
-Benefits:
+**Note on servo convention:** The tilt servo is mounted inverted — higher raw servo value = camera up. `tilt_home_deg` is expressed in physical degrees where positive = upward tilt.
 
-- better floor visibility
-- earlier obstacle detection
-- improved mapping stability
+Rationale for +30° up:
+
+- The ToF sensor is mounted above the camera on the gimbal; tilting up keeps the ToF field of view above the floor, preventing false floor detections
+- Horizon placed in the upper ~40% of the camera frame, giving the perception pipeline a useful mix of forward scene and near-floor view
+- Obstacle detection relies primarily on the ToF and pseudo-lidar pipeline, not floor-plane geometry
 
 ## 3.3 Yahboom Expansion Board / HAL Assumption
 
@@ -101,7 +104,46 @@ Implications:
 
 may all be implemented through a shared Yahboom I2C protocol.
 
-**Implementation note:** the official vendor Python library is expected to be the reference for reverse-engineering register writes / command format. Capturing and documenting this protocol is an explicit deliverable of the HAL phase.
+**Motor I2C protocol (captured and documented):**
+
+| Field | Value |
+|---|---|
+| I2C address | 0x2B |
+| Register | 0x01 |
+| Write format | `[motor_id, direction, speed]` (3 bytes) |
+| motor_id | 0=FL, 1=RL, 2=FR, 3=RR |
+| direction | 0=forward, 1=backward |
+| speed | 0–255 (duty% × 255 / 100) |
+| Inter-write delay | ~10 ms between successive motor writes |
+
+Duty-cycle conversion: if duty ≥ 0 → dir=0, speed=duty×255/100; if duty < 0 → dir=1, speed=|duty|×255/100.
+
+Example: FL forward 30% → `[0, 0, 77]`; FL backward 30% → `[0, 1, 77]`
+
+**Mecanum forward kinematics:** all four motors same sign = translate; FL+RL positive, FR+RR negative = rotate CW.
+
+## 3.4 ToF Sensor Specification
+
+The VL53L8CX is a 64-zone (8×8) time-of-flight ranging sensor used as the primary near-field obstacle detector.
+
+| Parameter | Value |
+|---|---|
+| Model | VL53L8CX (Pololu carrier board #3419) |
+| I2C bus | 2 (`/dev/i2c-2`, GPIO 4=SDA, GPIO 5=SCL) |
+| I2C address | 0x29 (7-bit) |
+| Ranging mode | 1 (short range, ≤135 cm) |
+| Integration time | 5 ms |
+| Max scan rate | Up to 60 Hz |
+| Output format | 8 rays spanning ±19.69° horizontal (5.625° column spacing) |
+| Row filtering | Rows 0–7 (all rows) used at 30° tilt; configurable via `row_min`/`row_max` to exclude floor-facing zones |
+| Safety cone | Inner 6 of 8 columns (±14.06°) used for nearest-obstacle detection |
+| Per-ray value | Column minimum across used rows |
+| Runtime output | `nearest_obstacle_m` (scalar) and 8-ray pseudo-lidar scan to mapper |
+
+**Why ToF instead of relying solely on camera depth:**
+The VL53L8CX provides metric ranging independent of lighting and texture — essential for safety-critical near-field detection where MiDaS monocular depth is unreliable at close range.
+
+**Row filtering rationale:** At +30° camera/gimbal tilt, lower rows of the ToF FOV point toward the floor. `row_min`/`row_max` clip floor-facing rows to prevent the floor from registering as a close obstacle.
 
 ---
 
@@ -170,9 +212,16 @@ Depth inference occurs only when:
 - parallax scan executes
 - exploration state changes
 
-Expected reduction in neural-network inference:
+Expected reduction in neural-network inference: **70–85%**
 
-**70–85%**
+**EventGate parameters:**
+
+| Parameter | Value |
+|---|---|
+| Frame difference threshold | 8.0 (mean absolute pixel difference) |
+| Max suppressed frames | 10 (force re-inference after 10 consecutive skips) |
+
+When the gate returns false, the previous depth map is reused unchanged.
 
 ## 5.2 Initial Depth Model and Runtime
 
@@ -190,6 +239,17 @@ Initial runtime assumption:
 - ONNX Runtime (`ort` crate) is the preferred first choice
 - alternative runtimes may be used later if deployment friction or performance requires it
 
+**Model and runtime details:**
+
+| Parameter | Value |
+|---|---|
+| Model file | `models/midas_small.onnx` |
+| Input spatial size | **256×256 pixels** (bilinear resize from camera frame) |
+| Input normalisation | ImageNet mean `[0.485, 0.456, 0.406]`, std `[0.229, 0.224, 0.225]` |
+| Output size | Configurable (`depth_out_width` × `depth_out_height`); typical 32×32 for RL |
+| Runtime | ONNX Runtime (`ort` crate) |
+| Export script | `scripts/export_midas.py` (MiDaS v3.1 small-class) |
+
 Performance target:
 
 - raw depth inference on Pi 5 CPU is expected to be modest
@@ -197,35 +257,39 @@ Performance target:
 
 ## 5.3 Pseudo-Lidar Extraction
 
-Depth image → lidar-like rays.
-
-Typical configuration:
+Depth image → 48 lidar-like rays for occupancy mapping.
 
 | Parameter | Value |
 |---|---|
-| Depth resolution | 192×192 to 256×256 |
-| Lidar rays | 48 |
-| Max range | 3 m |
-| Update rate | 5–10 Hz effective |
-| Projection style | nearest-obstacle ray extraction |
+| Ray count | 48 (hardcoded) |
+| Horizontal FOV | 110° (camera spec) → ~2.29° per ray |
+| Max range | 3.0 m |
+| Min range | 0.20 m (clips floor artefacts and very close dark objects) |
+| Update rate | 5–10 Hz effective (EventGate-limited) |
+| Detection method | Contrast-based: ray obstacle only if depth exceeds scene mean by ≥ 0.10 (contrast threshold) |
+| Row usage | Top 75% of depth frame; bottom 25% excluded to suppress floor returns |
+| Per-ray extraction | Column minimum across used rows |
+
+**Detection rationale:** A simple nearest-depth rule incorrectly triggers on the floor in front of the robot. The contrast threshold (`depth > scene_mean + 0.10`) rejects near-uniform-depth scenes (open floor, blank walls) and only flags genuine foreground obstacles.
 
 Advantages:
 
-- robust mapping
-- reduced noise
+- robust mapping independent of texture
+- reduced false positives from floor and ceiling
 - fast occupancy updates
-- compatibility with classical robotics algorithms
+- compatible with classical robotics planning algorithms
 
 ## 5.4 Floor-Plane Anchoring
 
-Where practical, the perception stack should use known geometry to improve metric consistency:
+**Status: Not implemented** (post-Phase-17 gap).
 
-- camera height above floor
-- camera tilt angle
+Where practical, the perception stack could use known geometry to improve metric consistency:
+
+- camera height above floor (~10 cm)
+- camera tilt angle (+30° up)
 - estimated floor plane
 
-This geometric information may be used to anchor or scale pseudo-depth estimates, especially near the floor region.
-This does not eliminate monocular ambiguity, but it provides a useful metric constraint.
+**Note:** With the camera tilted +30° upward and the bottom 25% of the depth frame excluded (§5.3), floor-plane anchoring is lower priority than originally planned. The ToF sensor (§3.4) provides reliable metric near-field ranging independently of depth model geometry.
 
 ## 5.5 Parallax Scans
 
@@ -550,11 +614,14 @@ Occupancy grid:
 | Cell size | 5 cm |
 | Grid size | dynamic |
 | Sensor model | raycasting from pseudo-lidar |
-| LOG_ODDS HIT | ±1.4 (tuned 2026-03-18; was ±0.7) |
-| LOG_ODDS MISS | ∓0.70 (tuned 2026-03-18; was ∓0.35) |
-| MIN_CONFIDENCE | 0.02 (tuned 2026-03-18; was 0.1) |
-| Decay rate | 0.01 per step (tuned 2026-03-18; was 0.001 — 10× faster fade) |
-| Sim boundary guard | Max-range MISS rays skip 1 m buffer at arena edge to prevent false frontiers at seeded walls |
+| LOG_ODDS HIT | +1.4 (tuned 2026-03-18; was +0.7) |
+| LOG_ODDS MISS | −0.70 (tuned 2026-03-18; was −0.35) |
+| MIN_CONFIDENCE | 0.02 — minimum ray confidence required to update a cell (tuned 2026-03-18; was 0.1) |
+| Decay rate | 0.01 per step (robot_config.yaml; was 0.001 — 10× faster fade of false obstacles) |
+| Free threshold | −0.5 log-odds (cell considered navigable) |
+| Occupied threshold | +0.5 log-odds (cell considered obstacle) |
+| Log-odds clamp | [−3.0, +3.0] (prevents saturation) |
+| Sim boundary guard | Max-range MISS rays skip a 1 m (20-cell) buffer at arena edge to prevent false frontiers at seeded walls |
 
 Mapping shall consume:
 
@@ -663,11 +730,31 @@ Classical deterministic navigation.
 
 ## 12.1 Planner
 
-- A*
+A* on the occupancy grid with configurable clearance inflation.
+
+| Parameter | Value |
+|---|---|
+| Default clearance | 7 cells (35 cm) — safe navigation in open space |
+| Tight-corridor fallback | 5 cells (25 cm) — attempted when clearance=7 finds no path |
+| Max node budget | 50,000 nodes per A* call |
+| Waypoint downsampling | Every 8 cells (40 cm) along path |
+| Goal BFS pre-screen | Reachability checked before A* to avoid wasted planning |
+
+If clearance=7 fails and clearance=5 succeeds, the path is flagged as `tight`. If the robot makes no progress on a tight-corridor path, the goal is hard-blacklisted for 10× the normal duration.
 
 ## 12.2 Controller
 
-- pure pursuit
+Pure pursuit with heading-error speed scaling.
+
+| Parameter | Value | Config key |
+|---|---|---|
+| Lookahead distance | 0.20 m | `kinematics.lookahead_dist_m` |
+| Max forward speed | 0.3 m/s | `kinematics.max_vx` |
+| Max angular velocity | 2.2 rad/s (1:90 motors) | `kinematics.max_omega_rad_s` |
+| Heading proportional gain | 2.0 rad/s per radian | hardcoded |
+| US slow zone | 0.70 m — reduce speed | `kinematics.us_slow_m` |
+| US stop zone | 0.30 m — stop forward motion | `kinematics.us_stop_m` |
+| Speed scaling range | Linear over ±120° heading error | hardcoded |
 
 ## 12.3 Recovery
 
@@ -680,6 +767,17 @@ Classical deterministic navigation.
 **Collision cascade suppression:** duplicate collision events within a 500 ms window are ignored to prevent the robot re-triggering recovery while still in contact with the wall.
 
 **Tight-corridor hard-blacklisting:** if the planner used its clearance=5 fallback (tight corridor) and the robot still made no progress toward the goal, the goal is hard-blacklisted for 10× the normal blacklist duration. Prevents repeated navigation into bottlenecks the robot cannot traverse at safe clearance.
+
+**Safety-task escape sequence** (triggered by US emergency stop):
+
+| Phase | Duration | Config key |
+|---|---|---|
+| Stop (latch) | 5.0 s total latch | `safety.emstop_latch_s` |
+| Delay before reverse | 200 ms | `safety.escape_delay_ms` |
+| Reverse | 300 ms at 35% duty | `safety.escape_duration_ms` / `escape_reverse_spd` |
+| Rotate away from obstacle | 870 ms at 35% duty | `safety.escape_rotation_ms` |
+
+Rotation direction is chosen away from `nearest_obstacle_angle_rad`: obstacle on left → rotate CW; obstacle on right → rotate CCW. Motor commands sent every 50 ms during escape phases.
 
 ---
 
@@ -828,11 +926,11 @@ imu/raw
 imu/orientation
 vision/depth
 vision/pseudo_lidar
-vision/features
-vision/tracks
-slam/visual_delta
+vision/features          (defined; unused until visual SLAM implemented)
+vision/tracks            (defined; unused until visual SLAM implemented)
+slam/visual_delta        (defined; unused until visual SLAM implemented)
 slam/pose2d
-slam/keyframe_event
+slam/keyframe_event      (defined; unused until visual SLAM implemented)
 map/grid_delta
 map/frontiers
 map/explored_stats
@@ -842,6 +940,14 @@ controller/cmd_vel
 motor/command
 executive/state
 safety/event
+safety/nearest_obstacle_m        (ToF scalar nearest range)
+safety/nearest_obstacle_angle    (ToF bearing to nearest obstacle, rad)
+safety/estop_count               (cumulative emergency stop counter)
+safety/collision_count           (cumulative IMU crash spike counter)
+gimbal/pan_deg
+gimbal/tilt_deg
+ui/manual_cmd_vel                (joystick velocity from UI bridge)
+ui/manual_gimbal_cmd             (pan/tilt command from UI bridge)
 telemetry/event_marker
 health/runtime
 ui/bridge_status
@@ -984,16 +1090,31 @@ An internal HAL queue or scheduler is recommended so that urgent commands are no
 
 Hardware safety is independent of AI.
 
+**Safety thresholds:**
+
+| Threshold | Value | Config key |
+|---|---|---|
+| US emergency stop | 20 cm | `safety.emergency_stop_cm` |
+| US slow zone | 0.70 m — controller reduces speed | `kinematics.us_slow_m` |
+| US stop zone | 0.30 m — controller halts forward motion | `kinematics.us_stop_m` |
+| EmStop latch duration | 5.0 s | `safety.emstop_latch_s` |
+| Motor watchdog timeout | 500 ms | `motor.watchdog_ms` |
+| Crash accel threshold | 15.0 m/s² (IMU horizontal) | `agent.crash.accel_threshold_m_s2` |
+| Crash debounce | 2000 ms | `agent.crash.debounce_ms` |
+
+**Note on emergency stop distance:** 20 cm accounts for gimbal protrusion (~5 cm), giving ~15 cm of physical clearance at the robot body.
+
 Triggers:
 
-- ultrasonic < 15 cm
+- ultrasonic < 20 cm
 - watchdog timeout (500 ms without a US reading)
-- explicit emergency stop
-- invalid pose / control sanity failure
+- IMU crash spike > 15 m/s²
+- explicit emergency stop (executive command)
 
 Response:
 
 - immediate motor halt via `MotorCommand::stop()` on priority channel
+- escape sequence executes (§12.3)
 - executive transitions to `SafetyStopped` (blocks all further CmdVel)
 
 The safety subsystem shall also publish a machine-readable event to `safety/event`.
@@ -1014,15 +1135,17 @@ The motor execution task sends a zero command if no motor command (safety or Cmd
 
 # 19. Operational Modes
 
-| Mode | Purpose |
-|---|---|
-| hw-test | test hardware components |
-| calibrate | run calibration routines |
-| sim-train | RL training |
-| sim-run | policy evaluation |
-| robot-run | autonomous operation |
-| robot-debug | autonomous run with heavy telemetry |
-| slam-debug | camera/IMU localization validation |
+| Mode | Purpose | Status |
+|---|---|---|
+| hw-test | test individual hardware components | **Not implemented** |
+| calibrate | IMU bias collection | **Partial** (IMU only; no camera/extrinsics) |
+| sim-train | RL training (Python-based, separate pipeline) | **Not in runtime** |
+| sim | Fast 2D simulator with exploration | **Implemented** |
+| robot-run | autonomous operation | **Implemented** |
+| robot-debug | autonomous run with heavy telemetry | **Same as robot-run** |
+| slam-debug | camera/IMU localization validation, no autonomy | **Implemented** |
+
+Mode is selected via first CLI argument: `./robot <mode>`. Unknown modes fall through to `robot-run`.
 
 ---
 
@@ -1128,41 +1251,41 @@ Expected realistic limitations:
 
 ---
 
-# 24. Implementation Gap Analysis *(as of 2026-03-31)*
+# 24. Implementation Gap Analysis *(as of 2026-04-03)*
 
 | § | Feature | Status | Notes |
 |---|---|---|---|
-| 5.1 | Event-driven depth (EventGate) | **Done** | |
-| 5.3 | Pseudo-lidar extraction (48-ray) | **Done** | |
-| 5.4 | Floor-plane anchoring | **Missing** | No camera-height/tilt geometry used to anchor depth |
+| 3.4 | ToF sensor (VL53L8CX) | **Done** | 8-ray, ±19.69°, I2C-2/0x29, safety + mapping |
+| 5.1 | Event-driven depth (EventGate) | **Done** | Threshold=8.0, max suppressed=10 |
+| 5.3 | Pseudo-lidar extraction (48-ray) | **Done** | 110° FOV, contrast-based, 0.20m min range |
+| 5.4 | Floor-plane anchoring | **Deprioritised** | Camera tilted up +30°; ToF handles near-field metric ranging |
 | 5.5 | Parallax scans | **Missing** | No strafe-scan logic in perception or runtime |
-| 6 | Calibration subsystem | **Partial** | `calibration/` crate has CalibrationManager (load/save JSON); no interactive calibration routines |
-| 6.3 | `calibrate` operational mode | **Missing** | Mode listed in docs but no CLI dispatch; binary always runs full pipeline |
+| 6 | Calibration subsystem | **Partial** | IMU bias calibration implemented; no camera intrinsics or extrinsics routines |
+| 6.3 | `calibrate` operational mode | **Partial** | Mode dispatch implemented; IMU bias only |
 | 7 | Executive state machine | **Done** | arm/disarm via SIGUSR1 (§7.5) |
-| 8 | Micro-SLAM (visual-inertial) | **Partial** | `ImuDeadReckon` (gyro-only, confidence fixed 0.3); feature detection / optical flow / keyframes not implemented |
+| 8 | Micro-SLAM (visual-inertial) | **Partial** | `ImuDeadReckon` (gyro+cmdvel feedforward, confidence fixed 0.3); feature detection / optical flow / keyframes not implemented |
 | 9 | Mapping + frontier detection | **Done** | |
-| 10 | A* planner + pure pursuit | **Done** | |
+| 10 | A* planner + pure pursuit | **Done** | Clearance=7 normal, clearance=5 tight fallback |
 | 11 | RL frontier selector | **Done** | AWR training + classical fallback |
-| 13.1 | sim_fast (2D fast simulator) | **Done** | |
-| 13.2 | sim_vision (3D visual simulator) | **Missing** | Crate exists as pure stub (`pub struct VisualSim;`) |
-| 14 | Network / GUI bridge | **Done** | WebSocket, live map/pose/frontier visualization |
+| 13.1 | sim_fast (2D fast simulator) | **Done** | RoomKind: Empty / Random(N) / SingleBox |
+| 13.2 | sim_vision (3D visual simulator) | **Missing** | Crate exists as pure stub |
+| 14 | Network / GUI bridge | **Done** | WebSocket, live map/pose/frontier/manual-drive |
 | 15.3 | Health telemetry (Pi temp, CPU, battery) | **Partial** | `HealthMetrics` struct defined; no publishing task; INA226 not wired |
-| 15.6 | Replay tooling | **Partial** | NDJSON log writer done; step-by-step replay / offline comparison not implemented |
-| 17 | HAL I2C priority queue | **Missing** | No bus arbiter; each HAL driver makes independent I2C calls; safety priority enforced by tokio biased-select in runtime only |
-| 19 | Operational modes (`calibrate`, `slam-debug`, etc.) | **Missing** | All modes documented but no `std::env::args()` dispatch; binary always runs exploration loop |
+| 15.6 | Replay tooling | **Partial** | NDJSON log writer done; step-by-step replay not implemented |
+| 17 | HAL I2C priority queue | **Missing** | Safety priority enforced by tokio biased-select only; no explicit bus arbiter |
+| 19 | hw-test mode | **Missing** | Not implemented |
 
 ### Gaps blocking Phase 17 (sim-to-real tuning)
 
-1. **Operational mode dispatch** — needed to run `calibrate` and `slam-debug` without the full autonomy stack running
-2. **Micro-SLAM visual pipeline** — IMU-only dead reckoning drifts too fast for useful mapping beyond one room; visual-inertial tracking is the next major subsystem
-3. **Motor re-calibration (1:90)** — theoretical constants applied; actual measured values required before long autonomous runs
-4. **HAL I2C priority** — currently acceptable via biased-select; revisit if safety commands are observed to lag during heavy I2C use
+1. **Micro-SLAM visual pipeline** — IMU+cmdvel dead reckoning drifts too fast for useful mapping beyond one room; visual-inertial tracking is the next major subsystem
+2. **HAL I2C priority** — currently acceptable via biased-select; revisit if safety commands lag during heavy I2C use
 
 ### Lower-priority gaps (post Phase 17)
 
-- Floor-plane anchoring (§5.4) — metric consistency near floor
 - Parallax scans (§5.5) — depth confidence in ambiguous scenes
 - Health telemetry publication (§15.3) — diagnostics during long runs
 - Replay tooling (§15.6) — offline debugging and algorithm comparison
 - sim_vision stub (§13.2) — perception/SLAM validation
 - Motor stall floor re-measurement for 1:90 motors
+- hw-test operational mode (§19)
+- Camera intrinsics and extrinsics calibration routines (§6)
