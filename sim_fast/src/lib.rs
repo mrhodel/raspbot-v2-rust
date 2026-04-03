@@ -55,12 +55,12 @@ const MAX_RANGE_M: f32 = 3.0;
 const RAY_STEP_M: f32 = 0.01;
 
 /// Robot forward speed (m/s equivalent).
-/// Theoretical 1:90 ratio (from 1:48 calibrated 2026-03-18): 1.61 × 48/90 ≈ 0.858 m/s @ 100%
-const SPEED_M_S: f32 = 0.858;
+/// Measured 2026-04-03: 1.85 m avg (2 runs) @ 30% duty → 1.23 m/s @ 100% (1:90 motors, garage floor)
+const SPEED_M_S: f32 = 1.23;
 
 /// Robot rotation rate (rad/s).
-/// Theoretical 1:90 ratio (from 1:48 calibrated 2026-03-18): 13.7 × 48/90 ≈ 7.30 rad/s @ 100%
-const OMEGA_RAD_S: f32 = 7.30;
+/// Measured 2026-04-03: 1.898 rad/s @ 30% duty → 6.33 rad/s @ 100% (1:90 motors, wheels-on floor)
+const OMEGA_RAD_S: f32 = 6.33;
 
 // ── Motor model ──────────────────────────────────────────────────────────────
 

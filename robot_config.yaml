@@ -14,8 +14,8 @@ robot:
 kinematics:
   # Measured values at 100% motor duty cycle
   # Phase 14.2.3 calibration test results (wheels ON ground)
-  forward_speed_m_s: 0.858     # theoretical 1:90 ratio: 1.61 × 48/90 ≈ 0.858 m/s @ 100% (re-measure after swap)
-  rotation_rate_rad_s: 7.30    # theoretical 1:90 ratio: 13.7 × 48/90 ≈ 7.30 rad/s @ 100% (re-measure after swap)
+  forward_speed_m_s: 1.23      # measured 2026-04-03: 1.85 m avg over 2 runs @ 30% → 1.23 m/s @ 100% (1:90 motors)
+  rotation_rate_rad_s: 6.33    # measured 2026-04-03: 1.898 rad/s @ 30% → 6.33 rad/s @ 100% (1:90 motors, wheels-on)
 
   # ── Control command scales ────────────────────────────────────────────
   # These two values are the only things to update when swapping motors.
@@ -27,7 +27,7 @@ kinematics:
   #              at max duty), or lower to reduce spin aggression.
   # Half-speed motors → halve both values; double-speed → double both.
   max_vx: 0.3             # normalised forward speed cap  (current motors: 0.3)
-  max_omega_rad_s: 4.0    # angular rate cap rad/s        (current motors: 4.0 ≈ 13.7×0.35)
+  max_omega_rad_s: 2.2    # angular rate cap rad/s        (current motors: 2.2 ≈ 6.33×0.35)
 
 # ── Hardware Abstraction Layer ────────────────────────────────────
 hal:
@@ -216,7 +216,7 @@ agent:
     emstop_latch_s: 5.0        # emergency stop latch duration (seconds)
     escape_delay_ms: 200       # pause before escape reverse (ms)
     escape_duration_ms: 300    # escape reverse duration (ms) — reduced from 600ms to avoid rear-wall crashes
-    escape_rotation_ms: 750    # escape rotation duration (ms) — 110° at 35% duty: 35/100 × 7.30 rad/s × 0.75s ≈ 1.92 rad
+    escape_rotation_ms: 870    # escape rotation duration (ms) — 110° at 35% duty: 35/100 × 6.33 rad/s × 0.87s ≈ 1.92 rad
     escape_reverse_spd: 35     # motor duty % for escape reverse/rotate (matches rl.actions.reverse_speed)
     clear_hold_s: 0.8          # hysteresis before clearing obstacle_stopped
 
