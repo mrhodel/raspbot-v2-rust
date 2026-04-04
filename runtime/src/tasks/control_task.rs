@@ -185,9 +185,9 @@ pub fn spawn_control_task(
                             // emergency-stop (i.e. not already reversing for us).
                             if !is_safety_estop {
                                 let now = std::time::Instant::now();
-                                // 500ms backup at full reverse speed (backup_vx_full).
+                                // 250ms backup at full reverse speed (backup_vx_full).
                                 // No spin — planner blacklists the crash goal so new path avoids the area.
-                                backup_until = Some(now + Duration::from_millis(500));
+                                backup_until = Some(now + Duration::from_millis(250));
                             }
                         }
                     }
@@ -258,7 +258,7 @@ pub fn spawn_control_task(
                     // the robot has physically separated from the wall (nearest > 2×stop_m
                     // for 0.8 s).  This lets MiDaS map the obstacle before re-planning,
                     // preventing the planner from routing straight back into the same wall.
-                    // Backup 500ms at -0.30 m/s (≈15 cm clearance) after collision.
+                    // Backup 250ms at -0.30 m/s (≈7.5 cm clearance) after collision.
                     // obstacle_stopped remains true after backup; cleared by hysteresis once
                     // nearest > 2×stop_m for 0.8 s.  Planner blacklists crash goal.
                     if let Some(until) = backup_until {
@@ -330,8 +330,8 @@ pub fn spawn_control_task(
                                     0.0  // forward obstacle — straight backup, no spin
                                 };
                                 // Side obstacle: rotate in place (vx=0) to reorient without
-                                // moving laterally into adjacent walls.  800 ms at ±1.5 rad/s
-                                // rotates ~69° — enough to face away and let A* replan.
+                                // moving laterally into adjacent walls.  400 ms at ±1.5 rad/s
+                                // rotates ~34° — enough to break heading and let A* replan.
                                 // Forward obstacle: back up to physically clear the stop zone.
                                 backup_escape_vx = if obstacle_is_side {
                                     0.0  // pure rotation — no backward motion near side walls
@@ -341,11 +341,11 @@ pub fn spawn_control_task(
                                     backup_vx_tight
                                 };
                                 let backup_ms = if obstacle_is_side {
-                                    800
+                                    400
                                 } else if safe_to_spin {
-                                    1200
+                                    600
                                 } else {
-                                    900
+                                    450
                                 };
                                 warn!(
                                     nearest_m = nearest,

@@ -74,7 +74,7 @@ hal:
     device_path: /dev/v4l/by-id/usb-DHZJ-240229-XH_Integrated_Webcam_HD-video-index0
     width: 640
     height: 480
-    fps: 15
+    fps: 10
     auto_exposure: true
     # In-process MJPEG stream — open http://<robot-ip>:8080/ in a browser or VLC.
     stream_port: 8080

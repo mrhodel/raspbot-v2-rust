@@ -81,7 +81,7 @@ pub fn spawn_safety_task(
                                         let deadline = tokio::time::Instant::now() + reverse_dur;
                                         while tokio::time::Instant::now() < deadline {
                                             let _ = bus_esc.motor_command.try_send(reverse);
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                                         }
                                         // Rotate to break heading deadlock: turn away from the
                                         // nearest-obstacle angle. Positive angle = obstacle to
@@ -98,7 +98,7 @@ pub fn spawn_safety_task(
                                         let deadline = tokio::time::Instant::now() + rotate_dur;
                                         while tokio::time::Instant::now() < deadline {
                                             let _ = bus_esc.motor_command.try_send(rotate);
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                                         }
                                         let _ = bus_esc.motor_command.try_send(MotorCommand::stop(0));
                                         info!("Safety: escape complete");
