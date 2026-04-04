@@ -978,30 +978,60 @@ Recommended pattern:
 
 # 16. Telemetry & Replay System
 
-## 15.1 Goal
+## 16.1 Goal
 
 Every control cycle shall log enough synchronized data to reconstruct and replay robot behavior offline.
 
-## 15.2 Logged Data
+## 16.2 Log Formats
+
+Two distinct logging layers exist:
+
+**Operational log (stdout / log file)**
+- Framework: structured `tracing` (Rust) or `rclpy` logging (ROS2)
+- Levels: INFO, WARN, ERROR with key=value structured fields
+- Destination: stdout + `~/robot_ws/robot.log` on Pi; `/tmp/robot_sim.log` in sim
+- Purpose: real-time diagnostics, crash analysis
+
+**Telemetry log (data recording)**
+- Current format: **NDJSON** (newline-delimited JSON), one record per line
+- ROS2 equivalent: **rosbag2** (replaces the custom NDJSON writer entirely)
+- Purpose: offline replay, algorithm comparison, training data collection
+
+For a ROS2 implementation, `ros2 bag record` and `ros2 bag play` replace the custom telemetry writer and replay tooling described in §16.5.
+
+## 16.3 Logged Data
 
 Telemetry should include:
 
 - frame reference or compressed camera frame
-- depth map and pseudo-lidar
+- depth map and pseudo-lidar scan
 - IMU samples or summaries
 - micro-SLAM pose estimate
 - occupancy map state or deltas
 - frontier candidates
 - chosen frontier strategy or RL decision
 - planner path
-- controller output
+- controller output (CmdVel)
 - motor commands
-- ultrasonic readings
+- ultrasonic and ToF readings
 - executive state transitions
-- event markers
+- event markers (§16.4)
 - confidence / health indicators
 
-## 15.3 Health Telemetry
+## 16.4 Event Markers
+
+The system shall record structured event markers, including at least:
+
+- collision (IMU spike)
+- emergency stop
+- frontier selected
+- frontier reached
+- tracking confidence drop
+- planner failed
+- recovery behavior triggered
+- executive state changed
+
+## 16.5 Health Telemetry
 
 Health telemetry should include, where available:
 
@@ -1011,57 +1041,37 @@ Health telemetry should include, where available:
 - micro-SLAM timing
 - dropped-frame counters
 - I2C error counters
-- battery voltage or supply voltage if measurable
+- battery voltage (INA226, not yet wired)
 - throttle / undervoltage indicators if available
 
-## 15.4 Schema Requirements
+**Status: Not implemented** — `HealthMetrics` struct defined but no publishing task.
+
+## 16.6 Telemetry Record Schema
 
 Each record shall include:
 
-- monotonic timestamp
+- monotonic timestamp (ms)
 - topic name
 - source subsystem
 - payload
 - optional sequence number
 
-### Reference record structure
-
-```rust
-pub struct TelemetryRecord<T> {
-    pub t_ms: u64,
-    pub topic: String,
-    pub source: String,
-    pub seq: u64,
-    pub payload: T,
-}
+```python
+# Python / ROS2 equivalent
+@dataclass
+class TelemetryRecord:
+    t_ms: int
+    topic: str
+    source: str
+    seq: int
+    payload: dict
 ```
 
-A compact binary format is acceptable for runtime logging; a readable export format is recommended for debugging and review.
+## 16.7 Replay
 
-## 15.5 Event Markers
+**Rust implementation:** NDJSON log writer done; step-by-step replay and offline comparison not implemented.
 
-The system shall record structured event markers, including at least:
-
-- collision
-- emergency stop
-- frontier selected
-- frontier reached
-- parallax scan started / completed
-- tracking confidence drop
-- keyframe inserted
-- planner failed
-- recovery behavior triggered
-- calibration completed
-- executive state changed
-
-## 15.6 Replay Requirements
-
-Replay tooling shall support:
-
-- time-synchronized sensor playback
-- step-by-step timeline advance
-- camera/depth/map side-by-side visualization
-- comparison of alternate algorithms against recorded runs
+**ROS2 implementation:** use `ros2 bag record` to capture all topics during a run and `ros2 bag play` for replay. No custom tooling required.
 
 ---
 
@@ -1069,7 +1079,7 @@ Replay tooling shall support:
 
 Because the Yahboom board likely multiplexes control and sensing over I2C, the HAL shall treat bus access as a schedulable shared resource.
 
-## 16.1 Priority Order
+## 17.1 Priority Order
 
 Suggested priority order:
 
@@ -1080,7 +1090,7 @@ Suggested priority order:
 5. ultrasonic reads
 6. low-priority diagnostics / telemetry-only reads
 
-## 16.2 Design Guidance
+## 17.2 Design Guidance
 
 An internal HAL queue or scheduler is recommended so that urgent commands are not delayed by routine sensor polling.
 
